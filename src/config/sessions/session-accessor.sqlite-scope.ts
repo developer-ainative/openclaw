@@ -29,6 +29,7 @@ import {
   runOpenClawAgentWorkerWrite,
   runOpenClawAgentWriteAdmission,
 } from "../../state/openclaw-agent-write-admission.js";
+import { cloneEnvWithPlatformSemantics } from "../config-env-vars.js";
 import { resolveStateDir } from "../paths.js";
 import { formatSqliteSessionFileMarker } from "./legacy-sqlite-marker.js";
 import { resolveSessionArtifactDirectory } from "./paths.js";
@@ -57,7 +58,6 @@ import {
   type ResolvedSqliteStoreTarget,
 } from "./session-sqlite-target.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
-import { captureSessionTranscriptStorageEnvironment } from "./transcript-target-binding.js";
 import type { InternalSessionEntry } from "./types.js";
 
 export {
@@ -516,10 +516,9 @@ export function resolveSqliteWriteAdmissionScope(
 export async function prepareSqliteScope(
   scope: SqliteScopeInput & { sessionKey: string },
 ): Promise<ResolvedSqliteScope> {
-  const captured = {
-    ...scope,
-    env: captureSessionTranscriptStorageEnvironment(scope.env ?? process.env),
-  };
+  const env = cloneEnvWithPlatformSemantics(scope.env ?? process.env);
+  env.OPENCLAW_STATE_DIR = resolveStateDir(env);
+  const captured = { ...scope, env };
   return resolveSqliteScope(captured, undefined, await prepareSqliteScopeTarget(captured));
 }
 
@@ -528,10 +527,9 @@ export function withPreparedSqliteScope<T>(
   scope: SqliteScopeInput & { sessionKey: string },
   run: (resolved: ResolvedSqliteScope) => T | Promise<T>,
 ): T | Promise<T> {
-  const captured = {
-    ...scope,
-    env: captureSessionTranscriptStorageEnvironment(scope.env ?? process.env),
-  };
+  const env = cloneEnvWithPlatformSemantics(scope.env ?? process.env);
+  env.OPENCLAW_STATE_DIR = resolveStateDir(env);
+  const captured = { ...scope, env };
   if (!isMainThread) {
     return run(resolveSqliteScope(captured));
   }
