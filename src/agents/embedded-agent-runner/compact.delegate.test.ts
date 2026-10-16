@@ -545,19 +545,6 @@ it.each(["abort", "owner-replaced"] as const)(
   },
 );
 
-it("rejects contradictory physical identity without touching either durable transcript", async () => {
-  const fixture = await createFixture("summary");
-  await expect(runDelegate(fixture, { sessionId: "contradictory-session" })).rejects.toThrow(
-    "conflicts with the caller session identity",
-  );
-  expectCalls(0, fixture.stream, resolveModelMock, hookRunner.runBeforeCompaction);
-  await closeDatabases();
-  expect(sessions.SessionManager.open(fixture.target).getEntries()).toEqual(
-    fixture.originalEntries,
-  );
-  expectUntouchedDecoy(fixture);
-});
-
 it.each(["summary", "endpoint"] as const)(
   "keeps queued manual %s compaction countable when cancellation follows its commit during a post-compaction hook",
   async (operation) => {

@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
@@ -181,6 +181,15 @@ async function transcriptFixture() {
   return { entryId, request, transcriptBefore: loadTranscriptEventsSync(target()), hooks };
 }
 
+function observeHydration() {
+  const calls = [
+    vi.spyOn(PersistentSessionManager, "openAsync"),
+    vi.spyOn(PersistentSessionManager.prototype, "reloadPersistedTranscriptAsync"),
+  ];
+  onTestFinished(() => calls.forEach((spy) => spy.mockRestore()));
+  return (opens: number) => expect(calls.map((spy) => spy.mock.calls.length)).toEqual([opens, 0]);
+}
+
 beforeEach(async () => {
   workspaceDir = await realpath(tempDirs.make("openclaw-queued-successor-"));
   resetCompactHooksHarnessMocks(workspaceDir);
@@ -229,38 +238,23 @@ it.each(["compact", "maintain"] as const)(
   },
 );
 
-it.each([false, true])(
-  "hydrates post-compaction history only for a requested rewrite (rewrite=%s)",
-  async (rewrite) => {
-    const { request, transcriptBefore } = await transcriptFixture();
-    const open = vi.spyOn(PersistentSessionManager, "openAsync");
-    const reload = vi.spyOn(PersistentSessionManager.prototype, "reloadPersistedTranscriptAsync");
-    contextEngineCompactMock.mockResolvedValueOnce(completed(sessionId));
-    maintain.mockImplementationOnce(async ({ runtimeContext }) =>
-      rewrite ? await runtimeContext!.rewriteTranscriptEntries!(request) : unchangedMaintenance(),
-    );
-    try {
-      await expect(compact(compactParams())).resolves.toMatchObject(success);
-      expect(maintain).toHaveBeenCalledOnce();
-      expect(open).toHaveBeenCalledTimes(rewrite ? 1 : 0);
-      expect(reload).not.toHaveBeenCalled();
-      const transcript = loadTranscriptEventsSync(target());
-      if (rewrite) {
-        expect(transcript).toContainEqual(
-          expect.objectContaining({
-            type: "message",
-            message: { role: "user", content: "rewritten", timestamp: 2 },
-          }),
-        );
-      } else {
-        expect(transcript).toEqual(transcriptBefore);
-      }
-    } finally {
-      open.mockRestore();
-      reload.mockRestore();
-    }
-  },
-);
+it("hydrates post-compaction history only once for a requested rewrite", async () => {
+  const { request } = await transcriptFixture();
+  const expectHydration = observeHydration();
+  contextEngineCompactMock.mockResolvedValueOnce(completed(sessionId));
+  maintain.mockImplementationOnce(
+    async ({ runtimeContext }) => await runtimeContext!.rewriteTranscriptEntries!(request),
+  );
+  await expect(compact(compactParams())).resolves.toMatchObject(success);
+  expect(maintain).toHaveBeenCalledOnce();
+  expectHydration(1);
+  expect(loadTranscriptEventsSync(target())).toContainEqual(
+    expect.objectContaining({
+      type: "message",
+      message: { role: "user", content: "rewritten", timestamp: 2 },
+    }),
+  );
+});
 
 it.each([
   { nativePinned: false, observedHarness: "openclaw" },
@@ -477,8 +471,8 @@ it.each([
     },
   });
 
-  await expect(pending).resolves.toMatchObject(success);
   const result = await pending;
+  expect(result).toMatchObject(success);
   expect(controller.signal.aborted).toBe(true);
   expect(result.result).toMatchObject({
     sessionId: undefined,
@@ -733,6 +727,7 @@ it("does not resolve or adopt successor fields from a failed compaction", async 
 
 it("rejects retained queued maintenance rewrites after normal closure", async () => {
   const { request, transcriptBefore } = await transcriptFixture();
+  const expectHydration = observeHydration();
   const retained: { rewrite?: TranscriptRewrite } = {};
   contextEngineCompactMock.mockResolvedValueOnce(completed(sessionId));
   maintain.mockImplementationOnce(async ({ runtimeContext }) => {
@@ -741,6 +736,9 @@ it("rejects retained queued maintenance rewrites after normal closure", async ()
   });
 
   await expect(compact(compactParams())).resolves.toMatchObject(success);
+  expect(maintain).toHaveBeenCalledOnce();
+  expectHydration(0);
+  expect(loadTranscriptEventsSync(target())).toEqual(transcriptBefore);
   await expect(expectDefined(retained.rewrite, "retained rewrite")(request)).rejects.toThrow();
 
   expect(loadTranscriptEventsSync(target())).toEqual(transcriptBefore);

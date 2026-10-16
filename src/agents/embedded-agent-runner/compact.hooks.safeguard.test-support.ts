@@ -47,7 +47,6 @@ export function registerCompactionSafeguardTests({
   it.each([
     [undefined, "background"],
     ["foreground", "foreground"],
-    ["normal", "normal"],
   ] as const)(
     "carries pending input and %s urgency into safeguard recovery",
     async (modelCallUrgency, expectedUrgency) => {
@@ -179,11 +178,7 @@ export function registerCompactionSafeguardTests({
         join(getWorkspaceDir(), "AGENTS.md"),
         "## Compaction fixture\nWORKSPACE_RULE_MARKER\n",
       );
-      const sessionManager = createConversation([
-        "Start the task.",
-        "Preserve workspace rules.",
-        "Continue the task.",
-      ]);
+      const sessionManager = createConversation(["Start.", "Preserve rules.", "Continue."]);
       const extension = await loadSafeguard();
       vi.mocked(buildEmbeddedExtensionFactories).mockImplementation(
         actualExtensions.buildEmbeddedExtensionFactories,

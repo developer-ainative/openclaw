@@ -7,6 +7,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { withTestTimeout } from "../../../test/helpers/promise.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { validateConfigObjectRaw } from "../../config/validation-core.js";
 import { delegateCompactionToRuntime } from "../../context-engine/delegate.js";
 import { ContextEngineFactoryResources } from "../../context-engine/registry.resources.js";
@@ -601,16 +602,20 @@ module.exports = { id: ${JSON.stringify(providerId)}, register(api) {
             let replacementCache: ReturnType<typeof createPluginCache> | undefined;
             try {
               if (mode.startsWith("reload")) {
-                const publication = { gatewayLifecycle: true, catalogMode: "static" as const };
-                const previousCache = createPluginCache();
-                const previousMetadata = withPluginCache(previousCache, () =>
-                  resolvePluginMetadataSnapshot({ config, workspaceDir: state.workspaceDir }),
-                );
-                setGatewayPluginMetadataSnapshot(previousMetadata, {
-                  config,
-                  workspaceDir: state.workspaceDir,
-                });
-                await refreshPreparedModelRuntimeSnapshots(config, publication);
+                const publish = async (publishedConfig: OpenClawConfig) => {
+                  const context = { config: publishedConfig, workspaceDir: state.workspaceDir };
+                  const cache = createPluginCache();
+                  const metadata = withPluginCache(cache, () =>
+                    resolvePluginMetadataSnapshot(context),
+                  );
+                  setGatewayPluginMetadataSnapshot(metadata, context);
+                  await refreshPreparedModelRuntimeSnapshots(publishedConfig, {
+                    gatewayLifecycle: true,
+                    catalogMode: "static",
+                  });
+                  return { cache, metadata };
+                };
+                const { cache: previousCache, metadata: previousMetadata } = await publish(config);
                 previousLease = await acquireAgentRunPreparedModelRuntime({
                   config,
                   agentId: "main",
@@ -621,22 +626,10 @@ module.exports = { id: ${JSON.stringify(providerId)}, register(api) {
                   previousLease.snapshot,
                   () => new ContextEngineFactoryResources([]),
                 );
-                const replacementConfig = {
+                ({ cache: replacementCache, metadata: replacementMetadata } = await publish({
                   ...config,
                   messages: { responsePrefix: "replacement" },
-                };
-                replacementCache = createPluginCache();
-                replacementMetadata = withPluginCache(replacementCache, () =>
-                  resolvePluginMetadataSnapshot({
-                    config: replacementConfig,
-                    workspaceDir: state.workspaceDir,
-                  }),
-                );
-                setGatewayPluginMetadataSnapshot(replacementMetadata, {
-                  config: replacementConfig,
-                  workspaceDir: state.workspaceDir,
-                });
-                await refreshPreparedModelRuntimeSnapshots(replacementConfig, publication);
+                }));
                 retirement = retirePluginCache(previousCache);
                 expect(() => retainPluginCache(previousCache)).toThrow(
                   "Plugin inventory has retired",
