@@ -219,6 +219,10 @@ it("excludes generated PostgreSQL SQL and captured catalogs while retaining SQLi
       "SELECT value ->> 'id' FROM json_each('{}'::json);",
     );
   }
+  write(
+    "src/state/postgres-schema.generated/state-v25-runtime.ts",
+    "export const previous = { sql: \"SELECT value ->> 'id' FROM items\" };",
+  );
   for (const store of ["state", "agent"]) {
     write(
       `src/state/postgres-schema.generated/sqlite-${store}-catalogs.ts`,

@@ -35,6 +35,7 @@ import { openTrackedStateDatabase } from "./openclaw-state-db-handle.js";
 import { admitStateSchemaFacts } from "./openclaw-state-db-schema-version.js";
 import { writeStateSchemaContentVersion } from "./openclaw-state-schema-publication.js";
 import { statePostgresRuntime as runtime } from "./postgres-schema.generated/runtime.js";
+import { statePostgresV25 } from "./postgres-schema.generated/state-v25-runtime.js";
 
 const recovery =
   "Use the matching OpenClaw version or restore the matching PostgreSQL schema and anchor.";
@@ -156,8 +157,15 @@ export const stateEngineSchema: StoreSchema = {
     {
       version: 25,
       sql: runtime.operatorRecoveryV25Sql,
-      fromSchema: statePostgresSchema,
+      fromSchema: statePostgresV25,
+      schema: statePostgresV25,
+    },
+    {
+      version: 26,
+      sql: runtime.clientCredentialV26Sql,
+      fromSchema: statePostgresV25,
       schema: statePostgresSchema,
+      backup: statePostgresV25.backup,
     },
   ],
 };

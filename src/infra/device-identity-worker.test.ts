@@ -3,7 +3,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import { closeOpenClawStateDatabaseByPathAsync } from "../state/openclaw-state-db.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
   loadChatRequestIdentityKeyAsync,
@@ -22,17 +21,15 @@ async function withIdentityWorkerState(
     layout: "state-only",
     applyEnv: false,
   });
-  const databasePath = state.statePath("state", "openclaw.sqlite");
+  const databasePath = state.statePath("client", "credentials.sqlite");
   try {
     await run({ path: databasePath, env: state.env }, state.stateDir);
   } finally {
-    // Keep the fixture intact if native drainage cannot establish cleanup.
-    await closeOpenClawStateDatabaseByPathAsync(databasePath);
     await state.cleanup();
   }
 }
 
-describe("device identity shared worker", () => {
+describe("device identity local worker", () => {
   it("keeps process identities cached by database path and identity key", async () => {
     await withIdentityWorkerState(async (options, stateDir) => {
       const secondaryOptions = { ...options, identityKey: "secondary" };
@@ -44,7 +41,6 @@ describe("device identity shared worker", () => {
       const claimPath = path.join(stateDir, "identity", "device.json.doctor-importing");
       await fs.mkdir(path.dirname(claimPath), { recursive: true });
       await fs.writeFile(claimPath, "synthetic retired identity");
-      await closeOpenClawStateDatabaseByPathAsync(options.path);
       expect(await loadOrCreateProcessDeviceIdentityAsync(options)).toBe(primary);
       expect(await fs.readFile(claimPath, "utf8")).toBe("synthetic retired identity");
     });
@@ -54,7 +50,7 @@ describe("device identity shared worker", () => {
     await withIdentityWorkerState(async (options) => {
       const directory = path.dirname(options.path);
       await fs.mkdir(directory, { recursive: true });
-      await fs.writeFile(options.path, "", { mode: 0o640 });
+      await fs.writeFile(options.path, "", { mode: 0o600 });
       const artifacts = await fs.readdir(directory);
       const fileMode = (await fs.stat(options.path)).mode;
 
@@ -67,7 +63,7 @@ describe("device identity shared worker", () => {
     });
   });
 
-  it("creates one identity off the host and reuses an existing-only actor for another key", async () => {
+  it("creates one identity off the host and preserves independent identity keys", async () => {
     await withIdentityWorkerState(async (options, stateDir) => {
       const prepare = vi.spyOn(DatabaseSync.prototype, "prepare");
       const exec = vi.spyOn(DatabaseSync.prototype, "exec");
@@ -84,11 +80,9 @@ describe("device identity shared worker", () => {
         expect(
           verifyDeviceSignature(first.publicKeyPem, "synthetic-identity-proof", signature),
         ).toBe(true);
-        await closeOpenClawStateDatabaseByPathAsync(options.path);
         const bytes = await fs.readFile(options.path);
         const fileMode = (await fs.stat(options.path)).mode;
         expect(await loadDeviceIdentityIfPresentAsync(options)).toEqual(first);
-        await closeOpenClawStateDatabaseByPathAsync(options.path);
         expect(await fs.readFile(options.path)).toEqual(bytes);
         expect(statSync(`${options.path}-wal`, { throwIfNoEntry: false })?.size ?? 0).toBe(0);
         expect((await fs.stat(options.path)).mode).toBe(fileMode);
@@ -98,10 +92,8 @@ describe("device identity shared worker", () => {
         const secondary = await loadOrCreateDeviceIdentityAsync(secondaryOptions);
         expect(secondary.deviceId).not.toBe(first.deviceId);
         expect(await loadDeviceIdentityIfPresentAsync(options)).toEqual(first);
-        await closeOpenClawStateDatabaseByPathAsync(options.path);
         expect(await loadDeviceIdentityIfPresentAsync(secondaryOptions)).toEqual(secondary);
         expect(await loadDeviceIdentityIfPresentAsync(options)).toEqual(first);
-        await closeOpenClawStateDatabaseByPathAsync(options.path);
         expect(prepare).not.toHaveBeenCalled();
         expect(exec).not.toHaveBeenCalled();
       } finally {

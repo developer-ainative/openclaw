@@ -5,6 +5,7 @@ import type { DatabasePathIdentity } from "../infra/sqlite-worker-identity.js";
 
 export type OpenClawStateSchemaReadAdmission = (database: DatabaseSync) => (() => void) | undefined;
 
+// v26 moves client credentials and native socket material to the local credential owner.
 // v25 prevents older readers from dropping recovered subagent operator restrictions.
 // v24 replaces retained task indexes with ordered cron history indexes.
 // v23 persists normalized meeting transcript chronology.
@@ -27,7 +28,8 @@ export type OpenClawStateSchemaReadAdmission = (database: DatabaseSync) => (() =
 // v6 makes every committed shared-state table part of the canonical runtime schema.
 // v5 records durable cloud-worker result refs on pending workspace fences.
 export const MEETING_TRANSCRIPT_START_TIME_SCHEMA_VERSION = 23;
-export const OPENCLAW_STATE_SCHEMA_VERSION = 25;
+export const CLIENT_CREDENTIAL_CUTOVER_SCHEMA_VERSION = 26;
+export const OPENCLAW_STATE_SCHEMA_VERSION = 26;
 export const OPENCLAW_STATE_STRICT_SCHEMA_VERSION = 3;
 // Absence records lost history; only Doctor may reconstruct these on existing state.
 export const DOCTOR_OWNED_STATE_TABLES = ["agent_deletion_journal"] as const;
@@ -171,6 +173,7 @@ export const STATE_SCHEMA_MIGRATION_DESCRIPTIONS = {
   "portable-identity-columns-v22": "ACP resume keys and receipt cursors → portable columns",
   "task-run-indexes-v24": "retained task indexes → ordered cron history and runtime/run lookup",
   "subagent-operator-recovery-v25": "subagent recovery → original operator authority required",
+  "local-client-credentials-v26": "client credentials and native socket material → local owner",
   "predicate-columns-v21": "meeting transcripts and delivery retention → derived predicate columns",
   "operator-approvals-system-agent": "operator approvals → OpenClaw system changes",
   "session-watch-cursor-provenance-v4": "session watch cursors → provenance column",

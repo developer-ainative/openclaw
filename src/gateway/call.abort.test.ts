@@ -23,7 +23,6 @@ vi.mock("../infra/device-identity-async.js", async (importOriginal) => ({
 }));
 
 vi.mock("./client.js", () => ({
-  prepareGatewayClientDeviceAuth: async () => {},
   isGatewayConnectAssemblyError: () => false,
   GatewayClient: class {
     constructor(private readonly options: GatewayClientOptions) {

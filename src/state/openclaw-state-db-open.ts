@@ -1,5 +1,10 @@
 import { statSync, type BigIntStats } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
+import {
+  bindFreshClientCredentialStore,
+  prepareClientCredentialMigration,
+  prepareNativeCredentialsForPostgres,
+} from "../infra/client-credential-migration.js";
 import { openEngineStore } from "../infra/database-engine/open.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import {
@@ -36,6 +41,7 @@ import { getStateRuntimeSchemaAdmission } from "./openclaw-state-db-admission.js
 import { openClawStateDatabaseCache } from "./openclaw-state-db-cache.js";
 import {
   OPENCLAW_STATE_SCHEMA_VERSION,
+  CLIENT_CREDENTIAL_CUTOVER_SCHEMA_VERSION,
   type OpenClawStateDatabase,
 } from "./openclaw-state-db-contract.js";
 import {
@@ -57,6 +63,7 @@ import {
   readStateSchemaContentVersion,
 } from "./openclaw-state-db-schema-version.js";
 import { assertOpenClawStateWriteAllowed } from "./openclaw-state-ownership.js";
+import { advanceStateSchemaContentVersion } from "./openclaw-state-schema-publication.js";
 
 const stateDbLog = createSubsystemLogger("state/db");
 
@@ -170,93 +177,120 @@ function openNativeStateDatabase(
     enableNodeSqliteKyselyStatementCache(db);
     setSqliteBusyTimeout(db, busyTimeoutMs);
     admitStateSchemaFacts(db, params.pathname);
-    selected = openEngineStore({
-      anchor: db,
-      schema: stateEngineSchema,
-      input: stateEngineInput(),
-      existingOnly: params.existingSchema,
-      inspectSqlite: () => inspectStateSqlite(db),
-      prepareAnchor: () => {},
-      admitPostgres: admitStatePostgres,
-      closeOnFailure: (connection, error) => {
-        selected = connection;
-        throw error;
-      },
-      openSqlite: () => {
-        assertOpenClawStateWriteAllowed({
-          database: db,
-          databasePath: params.pathname,
-          env: params.env,
-        });
-        if (params.existingSchema) {
-          assertSameFile();
-          params.ensureSchema(db, initialization);
-          assertSameFile();
-          sqlite = {
-            db,
+    const engine = stateEngineInput();
+    const openSelected = () => {
+      if (engine) {
+        prepareNativeCredentialsForPostgres(db, { path: params.pathname, env: params.env });
+      }
+      return openEngineStore({
+        anchor: db,
+        schema: stateEngineSchema,
+        input: engine,
+        existingOnly: params.existingSchema,
+        inspectSqlite: () => inspectStateSqlite(db),
+        prepareAnchor: () => {},
+        onFreshAnchor: (anchor) =>
+          bindFreshClientCredentialStore(anchor, { path: params.pathname, env: params.env }),
+        admitPostgres: (database, fresh) => {
+          admitStatePostgres(database, fresh);
+          if (fresh) {
+            bindFreshClientCredentialStore(database, { path: params.pathname, env: params.env });
+          }
+        },
+        beforeMigrate: (database, fromVersion) => {
+          prepareClientCredentialMigration(database, {
             path: params.pathname,
-            walMaintenance: {
-              checkpoint: () => false,
-              stop: async () => {},
-              close: () => true,
-              reclaimFreePages: createSqliteWalReclamationResult,
-            },
-          };
-          return;
-        }
-        ensureOpenClawStatePermissions(params.pathname, params.env);
-        const maintenance = runWithSqliteBusyTimeout(
-          db,
-          busyTimeoutMs,
-          () => {
-            assertSupportedStateSchemaVersion(db, params.pathname);
-            assertStateDatabaseIntegrityBeforeMutation(db, params.pathname);
-            configureSqlitePreSchemaPragmas(db, { busyTimeoutMs });
-            walMaintenance = configureSqliteConnectionPragmas(db, {
-              busyTimeoutMs,
-              databaseLabel: "openclaw-state",
-              databasePath: params.pathname,
-              onCheckpointError: (error) =>
-                stateDbLog.warn("Shared-state WAL maintenance failed", {
-                  error: formatErrorMessage(error),
-                  path: params.pathname,
-                  checkpoint: walMaintenance?.health,
-                }),
-              runMaintenance: (operation) => {
-                try {
-                  assertStateDatabaseAccessAllowed(params.pathname);
-                } catch (error) {
-                  if (
-                    !(error instanceof StateDatabaseAdmissionPendingError) &&
-                    !(error instanceof StateDatabaseOfflineMaintenanceError)
-                  ) {
-                    throw error;
-                  }
-                  // Another process's offline maintenance refuses this pass; the next tick retries.
-                  stateDbLog.debug(
-                    "Shared-state WAL maintenance deferred during offline maintenance",
-                    {
-                      path: params.pathname,
-                    },
-                  );
-                  return false;
-                }
-                return operation();
-              },
-              isScheduledMaintenanceSuspended: captureSqliteWorkerWalMaintenanceSuspension(),
-              foreignKeys: true,
-              synchronous: "NORMAL",
+            env: params.env,
+            fromVersion,
+          });
+          if (fromVersion === CLIENT_CREDENTIAL_CUTOVER_SCHEMA_VERSION - 1) {
+            advanceStateSchemaContentVersion(database, {
+              fromVersion,
+              toVersion: CLIENT_CREDENTIAL_CUTOVER_SCHEMA_VERSION,
             });
+          }
+        },
+        closeOnFailure: (connection, error) => {
+          selected = connection;
+          throw error;
+        },
+        openSqlite: () => {
+          assertOpenClawStateWriteAllowed({
+            database: db,
+            databasePath: params.pathname,
+            env: params.env,
+          });
+          if (params.existingSchema) {
+            assertSameFile();
             params.ensureSchema(db, initialization);
-            return walMaintenance;
-          },
-          { lockFailureReporting },
-        );
-        ensureOpenClawStatePermissions(params.pathname, params.env);
-        assertSameFile();
-        sqlite = { db, path: params.pathname, walMaintenance: maintenance };
-      },
-    });
+            assertSameFile();
+            sqlite = {
+              db,
+              path: params.pathname,
+              walMaintenance: {
+                checkpoint: () => false,
+                stop: async () => {},
+                close: () => true,
+                reclaimFreePages: createSqliteWalReclamationResult,
+              },
+            };
+            return;
+          }
+          ensureOpenClawStatePermissions(params.pathname, params.env);
+          const maintenance = runWithSqliteBusyTimeout(
+            db,
+            busyTimeoutMs,
+            () => {
+              assertSupportedStateSchemaVersion(db, params.pathname);
+              assertStateDatabaseIntegrityBeforeMutation(db, params.pathname);
+              configureSqlitePreSchemaPragmas(db, { busyTimeoutMs });
+              walMaintenance = configureSqliteConnectionPragmas(db, {
+                busyTimeoutMs,
+                databaseLabel: "openclaw-state",
+                databasePath: params.pathname,
+                onCheckpointError: (error) =>
+                  stateDbLog.warn("Shared-state WAL maintenance failed", {
+                    error: formatErrorMessage(error),
+                    path: params.pathname,
+                    checkpoint: walMaintenance?.health,
+                  }),
+                runMaintenance: (operation) => {
+                  try {
+                    assertStateDatabaseAccessAllowed(params.pathname);
+                  } catch (error) {
+                    if (
+                      !(error instanceof StateDatabaseAdmissionPendingError) &&
+                      !(error instanceof StateDatabaseOfflineMaintenanceError)
+                    ) {
+                      throw error;
+                    }
+                    // Another process's offline maintenance refuses this pass; the next tick retries.
+                    stateDbLog.debug(
+                      "Shared-state WAL maintenance deferred during offline maintenance",
+                      {
+                        path: params.pathname,
+                      },
+                    );
+                    return false;
+                  }
+                  return operation();
+                },
+                isScheduledMaintenanceSuspended: captureSqliteWorkerWalMaintenanceSuspension(),
+                foreignKeys: true,
+                synchronous: "NORMAL",
+              });
+              params.ensureSchema(db, initialization);
+              return walMaintenance;
+            },
+            { lockFailureReporting },
+          );
+          ensureOpenClawStatePermissions(params.pathname, params.env);
+          assertSameFile();
+          sqlite = { db, path: params.pathname, walMaintenance: maintenance };
+        },
+      });
+    };
+    selected = openSelected();
     if (sqlite) {
       return sqlite;
     }

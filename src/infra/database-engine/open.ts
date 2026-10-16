@@ -10,6 +10,7 @@ import {
 } from "../sqlite-database-admission.js";
 import { stageSqliteTransactionState } from "../sqlite-post-commit.js";
 import { runSqliteImmediateTransactionSync } from "../sqlite-transaction.js";
+import { beginUpdatePostgresMigration } from "../update-doctor-migration-attribution.js";
 import { databaseEngineAdapters } from "./adapters.js";
 import type { AdmittedStore, EngineConnection, StoreSchema } from "./contract.js";
 import { observeConnection } from "./observation.js";
@@ -99,7 +100,10 @@ export function openEngineStore(ref: {
   existingOnly?: boolean;
   /** Inspection admits the declared source schema without running its migration. */
   existingVersion?: boolean;
+  /** Bind owner-local state inside the new anchor transaction before connecting. */
+  onFreshAnchor?: (anchor: DatabaseSync) => void;
   admitPostgres?: (db: PostgresSqlConnection, fresh: boolean) => void;
+  beforeMigrate?: (db: EngineConnection, fromVersion: number) => void;
   closeOnFailure?: (db: PostgresSqlConnection, error: unknown) => never;
 }): EngineConnection {
   const { anchor } = ref;
@@ -171,6 +175,7 @@ export function openEngineStore(ref: {
               "INSERT INTO openclaw_engine_anchor (store_id, engine, schema) VALUES (?, 'postgres', ?)",
             )
             .run(storeId, namespace);
+          ref.onFreshAnchor?.(anchor);
           return { storeId, namespace };
         });
   const store: AdmittedStore = { ...ref, input: ref.input, ...identity };
@@ -197,6 +202,7 @@ export function openEngineStore(ref: {
       admitPostgresCapabilities(db);
       // Bootstrap borrows opening custody; ordinary writes still require domain admission.
       // Existing-only forbids creation; an unsealed port still needs writable schema admission.
+      let migration: ReturnType<typeof beginUpdatePostgresMigration>;
       db.runTransaction(
         () => {
           const fresh = !db
@@ -240,6 +246,7 @@ export function openEngineStore(ref: {
                 }
                 schema = { ...schema, ...source, version: Number(meta.version) };
               } else {
+                migration = beginUpdatePostgresMigration(db);
                 invalidateLocalSqliteSchemaAdmissions(db);
                 stageSqliteTransactionState(db, {
                   stage: () => {},
@@ -253,9 +260,15 @@ export function openEngineStore(ref: {
           }
           admit(!meta);
         },
-        undefined,
+        {
+          withCommit(commit) {
+            migration?.beforeCommit();
+            commit();
+          },
+        },
         false,
       );
+      migration?.committed();
     } else {
       admit(false);
     }

@@ -72,6 +72,12 @@ export const STATE_SCHEMA_MIGRATION_READ_TABLES: Record<StateMigrationKind, read
   "portable-identity-columns-v22": ["acp_sessions", ...STATE_CURSOR_TABLES_V22],
   "task-run-indexes-v24": [],
   "subagent-operator-recovery-v25": [],
+  "local-client-credentials-v26": [
+    "device_identities",
+    "device_auth_tokens",
+    "gateway_origin_device_tokens",
+    "exec_approvals_config",
+  ],
   "predicate-columns-v21": [
     "meeting_transcript_sessions",
     "meeting_transcript_summaries",
@@ -446,6 +452,9 @@ export function detectOpenClawStateDatabaseSchemaMigrationsFromDatabase(
   }
   if (userVersion < 25) {
     migrations.push({ kind: "subagent-operator-recovery-v25", path: pathname });
+  }
+  if (userVersion < 26) {
+    migrations.push({ kind: "local-client-credentials-v26", path: pathname });
   }
   if (!hasCanonicalAuditEventsSchema(db)) {
     migrations.push({ kind: "audit-events-v2", path: pathname });

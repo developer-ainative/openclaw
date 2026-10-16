@@ -33,6 +33,7 @@ import {
   closeOpenClawStateDatabaseForTest,
   runOpenClawStateWriteTransaction,
 } from "./openclaw-state-db.js";
+import { statePostgresV25 } from "./postgres-schema.generated/state-v25-runtime.js";
 
 const configured: unknown = getEnvironmentData("openclaw.test.state.conformance.connection");
 const connection = typeof configured === "string" ? configured : undefined;
@@ -96,8 +97,17 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
       namespace = cold.namespace;
       expect(cold.threadId).not.toBe(0);
       await client.query(`SET search_path = "${namespace}"`);
+      const credentialDdl = statePostgresV25.postgres
+        .split("\n\n")
+        .filter((statement) =>
+          /^CREATE (?:TABLE "(?:device_identities|device_auth_tokens|gateway_origin_device_tokens)"|INDEX "idx_device_(?:identities_device|auth_tokens_updated)")/u.test(
+            statement,
+          ),
+        );
+      expect(credentialDdl).toHaveLength(5);
       await client.query(`BEGIN;
-        UPDATE openclaw_schema_meta SET version = 24 WHERE store = 'state';
+        ${credentialDdl.join("\n")}
+        UPDATE openclaw_schema_meta SET version = 24, fingerprint = NULL, ddl_hash = NULL, server_major = NULL WHERE store = 'state';
         UPDATE schema_meta SET schema_version = 24 WHERE meta_key = 'primary';
         UPDATE config_machine_state SET value_json = '24'
           WHERE state_key = 'state.schema.contentVersion';
@@ -115,7 +125,7 @@ describe.skipIf(!connection)("PostgreSQL shared-state owner", () => {
             "SELECT version::int AS version FROM openclaw_schema_meta WHERE store = 'state'",
           )
         ).rows,
-      ).toEqual([{ version: 25 }]);
+      ).toEqual([{ version: OPENCLAW_STATE_SCHEMA_VERSION }]);
       const restart = await run("restart");
       expect(restart.namespace).toBe(cold.namespace);
       expect(restart.admissionId).not.toBe(cold.admissionId);

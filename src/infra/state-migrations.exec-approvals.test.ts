@@ -13,6 +13,7 @@ import {
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
+import { runClientCredentialOperation } from "./client-credential-store.js";
 import { resolveExecApprovalsPath } from "./exec-approvals-config.js";
 import { ExecApprovalsMigrationRequiredError } from "./exec-approvals-migration-gate.js";
 import {
@@ -133,13 +134,20 @@ describe("legacy exec approvals migration", () => {
     const result = await migrate();
 
     expect(result.warnings).toEqual([]);
-    expect(result.changes).toEqual(["Imported legacy exec approvals into shared SQLite state."]);
+    expect(result.changes).toEqual([
+      "Imported legacy exec approvals policy and local socket credentials.",
+    ]);
     expect(result.notices).toEqual([
       "Removed retired exec approvals JSON after recording its migration decision.",
     ]);
     const imported = loadExecApprovals();
     expect(imported.defaults).toMatchObject(expected.defaults);
-    expect(imported.socket).toEqual(expected.socket);
+    expect(imported.socket?.token).toBeUndefined();
+    expect(runClientCredentialOperation(env, { kind: "socket.read" })).toMatchObject({
+      kind: "socket",
+      socket: { socket_path: expected.socket.path, socket_token: expected.socket.token },
+    });
+    expect(readExecApprovalsConfigRow(database())?.raw_json).not.toContain(expected.socket.token);
     expect(imported.agents?.main?.allowlist).toEqual([
       { id: expect.any(String), pattern: "/usr/bin/rg" },
     ]);
@@ -197,7 +205,13 @@ describe("legacy exec approvals migration", () => {
       token: socket?.token?.trim() || undefined,
     };
     if (canonical === "missing" && (expectedSocket.path || expectedSocket.token)) {
-      expect(loadExecApprovals().socket).toEqual(expectedSocket);
+      expect(runClientCredentialOperation(env, { kind: "socket.read" })).toMatchObject({
+        kind: "socket",
+        socket: {
+          socket_path: expectedSocket.path ?? null,
+          socket_token: expectedSocket.token ?? null,
+        },
+      });
     } else {
       expect(readExecApprovalsConfigRow(database())).toEqual(originalRow);
     }

@@ -1,5 +1,6 @@
 import Foundation
 import OpenClawKit
+import OpenClawNativeState
 import SQLite3
 import Testing
 @testable import OpenClaw
@@ -7,11 +8,11 @@ import Testing
 @Suite(.serialized)
 struct ExecApprovalsStoreRefactorTests {
     private var realTemporaryDirectory: URL {
-        let path = FileManager().temporaryDirectory.path
+        let path = ProcessInfo.processInfo.environment["TMPDIR"] ?? FileManager().temporaryDirectory.path
         if path.hasPrefix("/var/") {
             return URL(fileURLWithPath: "/private\(path)", isDirectory: true)
         }
-        return FileManager().temporaryDirectory.resolvingSymlinksInPath()
+        return URL(fileURLWithPath: path).resolvingSymlinksInPath()
     }
 
     private func withTempStateDir(
@@ -31,11 +32,36 @@ struct ExecApprovalsStoreRefactorTests {
     @Test
     func `resolving approvals reuses socket token when unchanged`() async throws {
         try await self.withTempStateDir { _ in
-            let first = ExecApprovalsStore.resolve(agentId: "main").file
-            let second = ExecApprovalsStore.resolve(agentId: "main").file
+            let first = ExecApprovalsStore.resolve(agentId: "main")
+            let second = ExecApprovalsStore.resolve(agentId: "main")
 
-            #expect(first.socket?.token == "test-token")
-            #expect(second.socket?.token == first.socket?.token)
+            #expect(first.token == "test-token")
+            #expect(second.token == first.token)
+            #expect(first.file.socket == nil)
+        }
+    }
+
+    @Test
+    func `missing local socket is unavailable without changing effect-time policy authority`() async throws {
+        try await self.withTempStateDir { root in
+            let credentials = OpenClawClientCredentialStore.databaseURL(rootURL: root)
+            try FileManager.default.moveItem(
+                at: credentials,
+                to: root.appendingPathComponent("saved-credentials.sqlite"))
+            guard case .failure(.unavailable) = ExecApprovalsStore.resolveResult(agentId: "main") else {
+                Issue.record("Missing local credentials must report unavailable")
+                return
+            }
+            let result = ExecApprovalsStore.commitExecution(ExecApprovalExecutionCommit(
+                agentId: "main",
+                command: "printf ok",
+                authorization: .currentPolicy(evaluatedSecurity: .full, evaluatedAsk: .off, basis: nil),
+                uses: []))
+            guard case .success = result else {
+                Issue.record("Shared policy must remain the effect-time authority")
+                return
+            }
+            #expect(!FileManager.default.fileExists(atPath: credentials.path))
         }
     }
 
@@ -965,6 +991,14 @@ extension ExecApprovalsStoreRefactorTests {
             defaults: nil,
             agents: [:])
         try ExecApprovalsSQLiteStore.write(file, stateDirectoryURL: stateDir)
+        let owner = try OpenClawClientCredentialStore(rootURL: stateDir, migration: true)
+        defer { owner.close() }
+        try owner.writeReceipt(ClientCredentialReceipt(sharedFile: .inspect(
+            stateDir.appendingPathComponent("state/openclaw.sqlite"))))
+        _ = try owner.createSocketCredentials(.init(
+            path: stateDir.appendingPathComponent("exec-approvals.sock").path,
+            token: "test-token",
+            updatedAtMs: 1))
     }
 
     private static func replaceRawJSON(_ rawJSON: String) throws {

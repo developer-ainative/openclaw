@@ -55,7 +55,6 @@ vi.mock("../infra/device-auth-store.js", () => ({
   loadDeviceAuthTokenReadOnly: vi.fn(),
   loadOriginDeviceToken: fixture.loadOrigin,
   loadOriginDeviceTokenReadOnly: vi.fn(),
-  prepareDeviceAuthStore: vi.fn(),
   storeDeviceAuthToken: vi.fn(),
   storeOriginDeviceToken: fixture.storeOrigin,
 }));

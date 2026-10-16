@@ -28,7 +28,6 @@ import type {
   SessionGroupCatalogMutation,
   SessionGroupCatalogMutationResult,
 } from "../gateway/session-group-catalog.types.js";
-import type { DeviceIdentity } from "../infra/device-identity-store.js";
 import type { RestartLifecycleWorkerOperations } from "../infra/restart-lifecycle.worker.js";
 import type {
   SqliteWalPeriodicRequest,
@@ -68,15 +67,9 @@ import type { OpenClawStateLeaseLifecycleOperations } from "./openclaw-state-lea
 import type { StateSchemaPublicationBlocker } from "./openclaw-state-schema-publication.js";
 import type { RegisteredStateWorkerOperations } from "./openclaw-state-worker-registry.js";
 import type { UserPreferenceWorkerOperations } from "./user-preferences.types.js";
-import type { WorkerOperations } from "./worker-operation-registry.js";
-
-export type OpenClawStateWorkerOpenPreparation = { type: "deviceIdentity"; identityKey: string };
 
 /** Commands share one physical shared-state actor; bindings belong to commands, not open input. */
 export type OpenClawStateWorkerOperations = RegisteredStateWorkerOperations &
-  WorkerOperations<
-    typeof import("../infra/device-auth-store.worker.js").deviceAuthWorkerOperations
-  > &
   GitHubPublicationSourceOperations &
   RestartLifecycleWorkerOperations &
   SandboxRegistryOperations &
@@ -107,7 +100,6 @@ export type OpenClawStateWorkerOperations = RegisteredStateWorkerOperations &
       input: undefined;
       output: StateSchemaPublicationBlocker | undefined;
     };
-    "deviceIdentity.load": { input: { identityKey: string }; output: DeviceIdentity };
     "sandboxRegistry.insertIfMissing": { input: SandboxRegistryInsert; output: void };
     "workspace.replaceAttestation": {
       input: WorkspaceAttestationInput & Pick<WorkspaceStateGuard, "recoveryHoldPredicate">;
@@ -227,7 +219,6 @@ export type OpenClawStateWorkerRuntimeCommand = Exclude<
       | "agentDatabases.releaseExitedLease"
       | "worktrees.reserveCapacity"
       | keyof RestartLifecycleWorkerOperations
-      | Extract<keyof OpenClawStateWorkerOperations, `deviceAuth.${string}`>
       | keyof CaptureWorkerOperations
       | keyof PluginStateWriteOperations
       | keyof WorktreeTemplateWorkerOperations
@@ -237,7 +228,6 @@ export type OpenClawStateWorkerRuntimeCommand = Exclude<
 
 /** Host-only admission options; never serialized with a worker command. */
 export type OpenClawStateWorkerOperationOptions = {
-  preparation?: OpenClawStateWorkerOpenPreparation;
   existingOnly?: boolean;
   signal?: AbortSignal;
   assertCurrent?: (commandType?: PropertyKey) => void;
