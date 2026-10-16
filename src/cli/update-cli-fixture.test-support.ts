@@ -350,14 +350,7 @@ export function createUpdateCliFixture() {
     ]);
   };
 
-  const {
-    mockNpmPluginOutcomes,
-    mockNoopPostUpdatePluginConvergence,
-    mockPostDoctorSnapshot,
-    configSnapshot,
-    useFileBackedConfig,
-    setupPostCoreConfigFixture,
-  } = createUpdateCliConfigFixtures({
+  const configFixtures = createUpdateCliConfigFixtures({
     baseConfig,
     baseSnapshot,
     readConfigFileSnapshot,
@@ -365,20 +358,6 @@ export function createUpdateCliFixture() {
     updateNpmInstalledPlugins,
     createCaseDir,
   });
-
-  const runPostCoreUpdate = (env: NodeJS.ProcessEnv = {}) => {
-    return withEnvAsync(
-      {
-        OPENCLAW_UPDATE_POST_CORE: "1",
-        OPENCLAW_UPDATE_POST_CORE_CHANNEL: "stable",
-        OPENCLAW_COMPATIBILITY_HOST_VERSION: process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION,
-        ...env,
-      },
-      async () => {
-        await updateCommand({ yes: true, restart: false });
-      },
-    );
-  };
 
   const runPostCoreCommand = (
     options: Parameters<typeof updateCommand>[0],
@@ -396,6 +375,9 @@ export function createUpdateCliFixture() {
       },
     );
   };
+
+  const runPostCoreUpdate = (env: NodeJS.ProcessEnv = {}) =>
+    runPostCoreCommand({ yes: true, restart: false }, env);
 
   const expectFailedManagedGitRestart = (message: string) => {
     const logs = getLogOutput();
@@ -415,19 +397,7 @@ export function createUpdateCliFixture() {
     );
   };
 
-  const {
-    mockNpmGlobalCommands,
-    mockFileBackedPathExists,
-    setupInstalledPackageAtNodeModules,
-    setupInstalledPackageRoot,
-    setupServicePackageAtPrefix,
-    mockPackageGatewayLifecycle,
-    mockServicePackageCommands,
-    mockRunningManagedGateway,
-    mockStoppedManagedGitGateway,
-    mockNpmGlobalRoot,
-    mockGatewayInstallFailure,
-  } = createUpdateCliPackageFixtures({
+  const packageFixtures = createUpdateCliPackageFixtures({
     runCommandWithTimeout,
     serviceStop,
     serviceReadRuntime,
@@ -439,6 +409,12 @@ export function createUpdateCliFixture() {
     mockGatewayHealth,
     mockPackageInstallStatus,
   });
+  const {
+    mockNpmGlobalCommands,
+    mockFileBackedPathExists,
+    setupInstalledPackageRoot,
+    mockGatewayInstallFailure,
+  } = packageFixtures;
 
   const completeChangedPostCorePluginUpdate = (
     overrides: Partial<Parameters<typeof completePostCorePluginUpdate>[0]> = {},
@@ -560,13 +536,14 @@ export function createUpdateCliFixture() {
   };
 
   const fixture = {
+    ...configFixtures,
+    ...packageFixtures,
     baseConfig,
     baseSnapshot,
     clawHubRiskWarning,
     clawHubSuspiciousPayloadWarning,
     clawHubSyncRiskError,
     completeChangedPostCorePluginUpdate,
-    configSnapshot,
     createCaseDir,
     expectFailedManagedGitRestart,
     expectFreshPostUpdateDoctor,
@@ -575,21 +552,10 @@ export function createUpdateCliFixture() {
     globalNpmConfig,
     initializeExistingUpdateProfile,
     mockCurrentProcessFreshDoctor,
-    mockFileBackedPathExists,
     mockGatewayHealth,
-    mockGatewayInstallFailure,
-    mockNoopPostUpdatePluginConvergence,
-    mockNpmGlobalCommands,
-    mockNpmGlobalRoot,
-    mockNpmPluginOutcomes,
     mockOwnedGitService,
-    mockPackageGatewayLifecycle,
     mockPackageInstallAtCaseDir,
     mockPackageInstallStatus,
-    mockPostDoctorSnapshot,
-    mockRunningManagedGateway,
-    mockServicePackageCommands,
-    mockStoppedManagedGitGateway,
     primeNpmChannelTag,
     primeServiceCommand,
     profileStateDir,
@@ -601,18 +567,13 @@ export function createUpdateCliFixture() {
     runWithGatewayServiceEnv,
     setStdoutTty,
     setTty,
-    setupInstalledPackageAtNodeModules,
-    setupInstalledPackageRoot,
     setupManagedGitRootRefresh,
     setupNonInteractiveDowngrade,
     setupNpmUpdatedRootRefresh,
-    setupPostCoreConfigFixture,
-    setupServicePackageAtPrefix,
     setupUpdatedRootRefresh,
     statfsFixture,
     tempDirs,
     tempDirsToCleanup,
-    useFileBackedConfig,
     useNativeScheduledTaskControl,
   };
   registerUpdateCliLifecycle(fixture);

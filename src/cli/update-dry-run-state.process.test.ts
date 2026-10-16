@@ -17,6 +17,44 @@ import { formatCliProcessFailure, runCliProcessChild } from "./cli-process-child
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
+async function createStateFixture(prefix: string, config = "{}\n", stateName = "state") {
+  const root = tempDirs.make(prefix);
+  const configPath = path.join(root, "config", "openclaw.json");
+  const stateDir = path.join(root, stateName);
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.mkdir(stateDir, { recursive: true });
+  await fs.writeFile(configPath, config);
+  return { root, configPath, stateDir };
+}
+
+function runMigrationPlan(
+  root: string,
+  stateDir = path.join(root, "state"),
+  extra: string[] = [],
+  env: NodeJS.ProcessEnv = {},
+) {
+  return runUpdateProcess(
+    root,
+    [
+      "update",
+      "migration-plan",
+      "--snapshot-home",
+      root,
+      "--snapshot-config",
+      path.join(root, "config", "openclaw.json"),
+      "--snapshot-state",
+      stateDir,
+      ...extra,
+      "--json",
+    ],
+    env,
+  );
+}
+
+function runPreview(root: string, command = "update") {
+  return runUpdateProcess(root, [command, "--dry-run", "--no-restart", "--timeout", "1", "--json"]);
+}
+
 async function snapshotTree(root: string): Promise<string[]> {
   const snapshot: string[] = [];
   const walk = async (directory: string, relativeDirectory: string): Promise<void> => {
@@ -190,22 +228,13 @@ setLoggerOverride({ file: ${JSON.stringify(path.join(logs, "openclaw.log"))} });
   );
 
   it("keeps malformed config immutable while producing a best-effort preview", async () => {
-    const root = tempDirs.make("openclaw-update-dry-run-malformed-");
-    const configPath = path.join(root, "config", "openclaw.json");
-    await fs.mkdir(path.dirname(configPath), { recursive: true });
-    await fs.mkdir(path.join(root, "state"), { recursive: true });
-    await fs.writeFile(configPath, "{ definitely-not-json\n");
-    const configBefore = await fs.readFile(configPath);
+    const { root } = await createStateFixture(
+      "openclaw-update-dry-run-malformed-",
+      "{ definitely-not-json\n",
+    );
     const treeBefore = await snapshotTree(root);
 
-    const result = await runUpdateProcess(root, [
-      "update",
-      "--dry-run",
-      "--no-restart",
-      "--timeout",
-      "1",
-      "--json",
-    ]);
+    const result = await runPreview(root);
 
     expect(result.code, result.stderr).toBe(0);
     const preview = JSON.parse(result.stdout);
@@ -214,65 +243,40 @@ setLoggerOverride({ file: ${JSON.stringify(path.join(logs, "openclaw.log"))} });
       dryRun: true,
       actions: expect.arrayContaining([expect.any(String)]),
     });
-    expect(await fs.readFile(configPath)).toEqual(configBefore);
     await expectUnrecordedPreview(root, treeBefore);
   });
 
   it("keeps migration-pending config and SQLite markers immutable for the shorthand", async () => {
-    const root = tempDirs.make("openclaw-update-dry-run-migration-");
-    const configPath = path.join(root, "config", "openclaw.json");
+    const { root } = await createStateFixture(
+      "openclaw-update-dry-run-migration-",
+      '{ "heartbeat": { "model": "anthropic/claude-3-5-haiku-20241022", "every": "30m" } }\n',
+    );
     const tasksDir = path.join(root, "state", "tasks");
     const migrationMarkerPath = path.join(tasksDir, "runs.sqlite.migrated");
     const walPath = path.join(tasksDir, "runs.sqlite-wal");
-    await fs.mkdir(path.dirname(configPath), { recursive: true });
     await fs.mkdir(tasksDir, { recursive: true });
-    await fs.writeFile(
-      configPath,
-      '{ "heartbeat": { "model": "anthropic/claude-3-5-haiku-20241022", "every": "30m" } }\n',
-    );
     await fs.writeFile(migrationMarkerPath, "legacy migration marker\n");
     await fs.writeFile(walPath, "legacy WAL marker\n");
-    const configBefore = await fs.readFile(configPath);
-    const markerHashesBefore = {
-      migration: await sha256File(migrationMarkerPath),
-      wal: await sha256File(walPath),
-    };
     const treeBefore = await snapshotTree(root);
 
-    const result = await runUpdateProcess(root, [
-      "--update",
-      "--dry-run",
-      "--no-restart",
-      "--timeout",
-      "1",
-      "--json",
-    ]);
+    const result = await runPreview(root, "--update");
 
     expect(result.code, result.stderr).toBe(0);
     const preview = JSON.parse(result.stdout);
     expect(preview).toMatchObject({ runId: expect.any(String), dryRun: true });
-    expect(await fs.readFile(configPath)).toEqual(configBefore);
     await expectUnrecordedPreview(root, treeBefore);
-    expect({
-      migration: await sha256File(migrationMarkerPath),
-      wal: await sha256File(walPath),
-    }).toEqual(markerHashesBefore);
   });
 
   it.each([false, true])(
     "describes Doctor migrations but refuses without staged candidate identity (unknownPlugin=%s)",
     async (unknownPlugin) => {
-      const root = tempDirs.make("openclaw-update-migration-plan-");
-      const configPath = path.join(root, "config", "openclaw.json");
-      const stateDir = path.join(root, "state");
-      const execPath = path.join(stateDir, "exec-approvals.json");
-      const tuiPath = path.join(stateDir, "tui", "last-session.json");
-      await fs.mkdir(path.dirname(configPath), { recursive: true });
-      await fs.mkdir(path.dirname(tuiPath), { recursive: true });
-      await fs.writeFile(
-        configPath,
+      const { root, stateDir } = await createStateFixture(
+        "openclaw-update-migration-plan-",
         unknownPlugin ? '{ "plugins": { "entries": { "candidate": {} } } }\n' : "{}\n",
       );
+      const execPath = path.join(stateDir, "exec-approvals.json");
+      const tuiPath = path.join(stateDir, "tui", "last-session.json");
+      await fs.mkdir(path.dirname(tuiPath), { recursive: true });
       await fs.writeFile(
         execPath,
         '{ "version": 1, "defaults": { "security": "allowlist", "ask": "on-miss" } }\n',
@@ -283,31 +287,10 @@ setLoggerOverride({ file: ${JSON.stringify(path.join(logs, "openclaw.log"))} });
       );
       const before = await snapshotTree(root);
 
-      const result = await runUpdateProcess(root, [
-        "update",
-        "migration-plan",
-        "--snapshot-home",
-        root,
-        "--snapshot-config",
-        configPath,
-        "--snapshot-state",
-        stateDir,
-        "--json",
-      ]);
+      const result = await runMigrationPlan(root);
 
       expect(result.code, result.stderr).toBe(1);
-      const plan = JSON.parse(result.stdout) as {
-        mutationAllowed: boolean;
-        outcome: string;
-        refusal: { code: string };
-        candidate: {
-          root: string;
-          version: string;
-          artifact: { outcome: string; refusal: { code: string } };
-        };
-        snapshot: { configDigest: string; stateDigest: string };
-        steps: LegacyStateMigrationPlan["steps"];
-      };
+      const plan = JSON.parse(result.stdout) as LegacyStateMigrationPlan;
       expect(plan).toMatchObject({
         mutationAllowed: false,
         outcome: "refused",
@@ -370,69 +353,37 @@ setLoggerOverride({ file: ${JSON.stringify(path.join(logs, "openclaw.log"))} });
   );
 
   it("preserves snapshot path bytes and rejects blank snapshot paths", async () => {
-    const root = tempDirs.make("openclaw-update-migration-plan-paths-");
-    const configPath = path.join(root, "config", "openclaw.json");
-    const stateDir = path.join(root, " copied state ");
-    await fs.mkdir(path.dirname(configPath), { recursive: true });
-    await fs.mkdir(stateDir, { recursive: true });
-    await fs.writeFile(configPath, "{}\n");
+    const { root, stateDir } = await createStateFixture(
+      "openclaw-update-migration-plan-paths-",
+      "{}\n",
+      " copied state ",
+    );
     const before = await snapshotTree(root);
 
-    const runPlan = (snapshotState: string) =>
-      runUpdateProcess(
-        root,
-        [
-          "update",
-          "migration-plan",
-          "--snapshot-home",
-          root,
-          "--snapshot-config",
-          configPath,
-          "--snapshot-state",
-          snapshotState,
-          "--json",
-        ],
-        { OPENCLAW_STATE_DIR: snapshotState },
-      );
-
-    const valid = await runPlan(stateDir);
+    const valid = await runMigrationPlan(root, stateDir, [], { OPENCLAW_STATE_DIR: stateDir });
     expect(valid.code, valid.stderr).toBe(1);
     expect(JSON.parse(valid.stdout)).toMatchObject({
       outcome: "refused",
       snapshot: { stateDir },
     });
 
-    const blank = await runPlan(" \t ");
+    const blank = await runMigrationPlan(root, " \t ", [], { OPENCLAW_STATE_DIR: " \t " });
     expect(blank.code).toBe(1);
     expect(blank.stderr).toContain("--snapshot-state must not be blank");
     expect(await snapshotTree(root)).toEqual(before);
   });
 
   it("refuses configured session stores outside the copied state snapshot", async () => {
-    const root = tempDirs.make("openclaw-update-migration-plan-session-root-");
-    const configPath = path.join(root, "config", "openclaw.json");
-    const stateDir = path.join(root, "state");
+    const { root, configPath, stateDir } = await createStateFixture(
+      "openclaw-update-migration-plan-session-root-",
+    );
     const externalStore = path.join(root, "external", "sessions.json");
-    await fs.mkdir(path.dirname(configPath), { recursive: true });
-    await fs.mkdir(stateDir, { recursive: true });
     await fs.mkdir(path.dirname(externalStore), { recursive: true });
     await fs.writeFile(externalStore, "{}\n");
-    const runPlan = () =>
-      runUpdateProcess(root, [
-        "update",
-        "migration-plan",
-        "--snapshot-home",
-        root,
-        "--snapshot-config",
-        configPath,
-        "--snapshot-state",
-        stateDir,
-        "--json",
-      ]);
 
     await fs.writeFile(configPath, `${JSON.stringify({ session: { store: externalStore } })}\n`);
     const externalBefore = await snapshotTree(root);
-    const external = await runPlan();
+    const external = await runMigrationPlan(root);
     expect(external.code, external.stderr).toBe(1);
     const externalPlan = JSON.parse(external.stdout) as LegacyStateMigrationPlan;
     expect(externalPlan).toMatchObject({
@@ -464,7 +415,7 @@ setLoggerOverride({ file: ${JSON.stringify(path.join(logs, "openclaw.log"))} });
     await fs.writeFile(copiedStore, "{}\n");
     await fs.writeFile(configPath, `${JSON.stringify({ session: { store: copiedStore } })}\n`);
     const copiedBefore = await snapshotTree(root);
-    const copied = await runPlan();
+    const copied = await runMigrationPlan(root);
     expect(copied.code, copied.stderr).toBe(1);
     const copiedPlan = JSON.parse(copied.stdout) as LegacyStateMigrationPlan;
     expect(copiedPlan).toMatchObject({
@@ -478,26 +429,12 @@ setLoggerOverride({ file: ${JSON.stringify(path.join(logs, "openclaw.log"))} });
   });
 
   it("rejects caller-supplied snapshot identity without touching the copy", async () => {
-    const root = tempDirs.make("openclaw-update-migration-plan-identity-");
-    const configPath = path.join(root, "config", "openclaw.json");
-    const stateDir = path.join(root, "state");
-    await fs.mkdir(path.dirname(configPath), { recursive: true });
-    await fs.mkdir(stateDir, { recursive: true });
-    await fs.writeFile(configPath, "{}\n");
+    const { root } = await createStateFixture("openclaw-update-migration-plan-identity-");
     const before = await snapshotTree(root);
 
-    const result = await runUpdateProcess(root, [
-      "update",
-      "migration-plan",
-      "--snapshot-home",
-      root,
-      "--snapshot-config",
-      configPath,
-      "--snapshot-state",
-      stateDir,
+    const result = await runMigrationPlan(root, undefined, [
       "--config-digest",
       "sha256:caller-claim",
-      "--json",
     ]);
 
     expect(result.signal).toBeNull();
@@ -507,26 +444,12 @@ setLoggerOverride({ file: ${JSON.stringify(path.join(logs, "openclaw.log"))} });
   });
 
   it("refuses a copied state path that is not a directory", async () => {
-    const root = tempDirs.make("openclaw-update-migration-plan-unbound-");
-    const configPath = path.join(root, "config", "openclaw.json");
+    const { root } = await createStateFixture("openclaw-update-migration-plan-unbound-");
     const stateDir = path.join(root, "copied-state-file");
-    await fs.mkdir(path.dirname(configPath), { recursive: true });
-    await fs.mkdir(path.join(root, "state"));
-    await fs.writeFile(configPath, "{}\n");
     await fs.writeFile(stateDir, "not a state directory\n");
     const before = await snapshotTree(root);
 
-    const result = await runUpdateProcess(root, [
-      "update",
-      "migration-plan",
-      "--snapshot-home",
-      root,
-      "--snapshot-config",
-      configPath,
-      "--snapshot-state",
-      stateDir,
-      "--json",
-    ]);
+    const result = await runMigrationPlan(root, stateDir);
 
     expect(result.code).toBe(1);
     expect(JSON.parse(result.stdout)).toMatchObject({

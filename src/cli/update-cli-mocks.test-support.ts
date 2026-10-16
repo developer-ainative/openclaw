@@ -13,7 +13,7 @@ import type { RetainUpdateRuntime } from "../infra/update-retained-runtime.js";
 import { captureEnv } from "../test-utils/env.js";
 import { createCliRuntimeCapture } from "./test-runtime-capture.js";
 
-const commandTransport = vi.hoisted(() => ({
+export const commandTransport = vi.hoisted(() => ({
   run: vi.fn<typeof import("../process/exec.js").runCommandWithTimeout>(),
   exec: vi.fn<typeof import("../process/exec.js").runExec>(async () => ({
     stdout: "",
@@ -45,49 +45,49 @@ const isPlistStdinConversion = vi.hoisted(
     args[5] === "-",
 );
 
-const existingHostUri = nodeSqlite.resolveExistingSqliteFileUri;
-const immutableHostUri = nodeSqlite.resolveImmutableSqliteFileUri;
+export const existingHostUri = nodeSqlite.resolveExistingSqliteFileUri;
+export const immutableHostUri = nodeSqlite.resolveImmutableSqliteFileUri;
 
-const confirm = vi.fn();
-const select = vi.fn();
+export const confirm = vi.fn();
+export const select = vi.fn();
 const text = vi.fn();
 const spinner = vi.fn(() => ({ start: vi.fn(), stop: vi.fn(), clear: vi.fn() }));
-const triageCommand = vi.fn<typeof import("../commands/triage.js").triageCommand>();
-const triageAfterFailure =
+export const triageCommand = vi.fn<typeof import("../commands/triage.js").triageCommand>();
+export const triageAfterFailure =
   vi.fn<typeof import("../commands/triage-failure.js").triageAfterFailure>();
-const updateFailureActionMocks = vi.hoisted(() => ({
+export const updateFailureActionMocks = vi.hoisted(() => ({
   runInteractiveUpdateFailureAction: vi.fn(),
 }));
 
-const readPackageName = vi.fn();
-const readPackageVersion = vi.fn();
-const resolveGlobalManager = vi.fn();
-const serviceLoaded = vi.fn();
-const serviceEnabled = vi.fn();
-const serviceDefinitionMutationCapability = vi.fn();
-const serviceStart = vi.fn();
-const serviceStop = vi.fn();
-const serviceRestart = vi.fn();
+export const readPackageName = vi.fn();
+export const readPackageVersion = vi.fn();
+export const resolveGlobalManager = vi.fn();
+export const serviceLoaded = vi.fn();
+export const serviceEnabled = vi.fn();
+export const serviceDefinitionMutationCapability = vi.fn();
+export const serviceStart = vi.fn();
+export const serviceStop = vi.fn();
+export const serviceRestart = vi.fn();
 // A fixed Gateway PID can collide with the updater and trigger its self-stop safeguard.
-const gatewayFixturePid = process.pid + 1;
-const unrelatedGatewayFixturePid = process.pid + 2;
+export const gatewayFixturePid = process.pid + 1;
+export const unrelatedGatewayFixturePid = process.pid + 2;
 
-const suspendScheduledTaskAutoStartForUpdate = vi.fn();
-const resumeScheduledTaskAutoStartAfterUpdate = vi.fn();
-const managedUpdateHandoff = vi.hoisted(() => ({
+export const suspendScheduledTaskAutoStartForUpdate = vi.fn();
+export const resumeScheduledTaskAutoStartAfterUpdate = vi.fn();
+export const managedUpdateHandoff = vi.hoisted(() => ({
   start: vi.fn(),
   transfer: vi.fn(),
   cancel: vi.fn(),
 }));
-const candidateValidation = vi.hoisted(() => vi.fn());
-const retainUpdateRuntime = vi.hoisted(() => vi.fn<RetainUpdateRuntime>());
-const systemdPolicy = vi.hoisted(() =>
+export const candidateValidation = vi.hoisted(() => vi.fn());
+export const retainUpdateRuntime = vi.hoisted(() => vi.fn<RetainUpdateRuntime>());
+export const systemdPolicy = vi.hoisted(() =>
   vi.fn<typeof import("../daemon/systemd-maintenance.js").prepareSystemdGatewayMaintenance>(),
 );
-const sourceRuntimeCompletion = vi.hoisted(() =>
+export const sourceRuntimeCompletion = vi.hoisted(() =>
   vi.fn<typeof import("./update-cli/update-command-runtime.js").completeSourceUpdateRuntime>(),
 );
-const pluginAvailabilityPreflight = vi.hoisted(() => vi.fn());
+export const pluginAvailabilityPreflight = vi.hoisted(() => vi.fn());
 vi.mock("../daemon/service-process-membership.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/service-process-membership.js")>()),
   inspectServiceProcessMembershipSync: vi.fn(() => "outside"),
@@ -96,55 +96,55 @@ vi.mock("../daemon/service-process-membership.js", async (importOriginal) => ({
 vi.mock("./update-cli/update-command-plugin-preflight.js", () => ({
   preflightConfiguredNpmPluginTargets: pluginAvailabilityPreflight,
 }));
-const inferenceRepair = vi.hoisted(() =>
+export const inferenceRepair = vi.hoisted(() =>
   vi.fn<typeof import("../infra/update-repair-agent.js").runUpdateRepairLoop>(),
 );
-const httpReadiness = vi.hoisted(() => vi.fn());
-const stateSchemaVersions = vi.hoisted(() => vi.fn());
+export const httpReadiness = vi.hoisted(() => vi.fn());
+export const stateSchemaVersions = vi.hoisted(() => vi.fn());
 const mockedRunDaemonInstall = vi.fn();
-const serviceReadCommand = vi.fn();
-const serviceReadRuntime = vi.fn();
-const serviceFixtureState = { absentServicePort: 0 };
-const mockGetSelfAndAncestorPidsSync = vi.fn(() => new Set<number>([process.pid, 1]));
-const terminateStaleGatewayPids = vi.fn();
-const inspectPortUsage = vi.fn();
-const probePortUsage = vi.fn();
-const classifyPortListener = vi.fn();
-const formatPortDiagnostics = vi.fn();
-const callGateway = vi.fn<(opts: CallGatewayOptions) => Promise<unknown>>();
-const pathExists = vi.fn();
-const syncPluginsForUpdateChannel = vi.fn();
-const updateNpmInstalledPlugins = vi.fn();
-const loadInstalledPluginIndexInstallRecords = vi.fn(
+export const serviceReadCommand = vi.fn();
+export const serviceReadRuntime = vi.fn();
+export const serviceFixtureState = { absentServicePort: 0 };
+export const mockGetSelfAndAncestorPidsSync = vi.fn(() => new Set<number>([process.pid, 1]));
+export const terminateStaleGatewayPids = vi.fn();
+export const inspectPortUsage = vi.fn();
+export const probePortUsage = vi.fn();
+export const classifyPortListener = vi.fn();
+export const formatPortDiagnostics = vi.fn();
+export const callGateway = vi.fn<(opts: CallGatewayOptions) => Promise<unknown>>();
+export const pathExists = vi.fn();
+export const syncPluginsForUpdateChannel = vi.fn();
+export const updateNpmInstalledPlugins = vi.fn();
+export const loadInstalledPluginIndexInstallRecords = vi.fn(
   async (params: { config?: OpenClawConfig; env?: NodeJS.ProcessEnv } = {}) =>
     params.config?.plugins?.installs ?? {},
 );
-const readPersistedInstalledPluginIndex = vi.fn(async () => null);
-const restorePersistedInstalledPluginIndexIfCurrent = vi.fn<
+export const readPersistedInstalledPluginIndex = vi.fn(async () => null);
+export const restorePersistedInstalledPluginIndexIfCurrent = vi.fn<
   typeof import("../plugins/installed-plugin-index-store-write.js").restorePersistedInstalledPluginIndexIfCurrent
 >(async () => true);
-const writePersistedInstalledPluginIndexInstallRecordsWithLease = vi.fn(async () => ({
+export const writePersistedInstalledPluginIndexInstallRecordsWithLease = vi.fn(async () => ({
   previous: null,
   revision: 1,
 }));
-const checkShellCompletionStatus = vi.fn();
-const ensureCompletionCacheExists = vi.fn();
-const installCompletion = vi.fn();
-const createPreUpdateConfigSnapshotMock = vi.fn();
-const legacyConfigRepairMocks = vi.hoisted(() => ({
+export const checkShellCompletionStatus = vi.fn();
+export const ensureCompletionCacheExists = vi.fn();
+export const installCompletion = vi.fn();
+export const createPreUpdateConfigSnapshotMock = vi.fn();
+export const legacyConfigRepairMocks = vi.hoisted(() => ({
   repairLegacyConfigForUpdateChannel:
     vi.fn<
       typeof import("../commands/doctor/legacy-config-repair.js").repairLegacyConfigForUpdateChannel
     >(),
 }));
-const launchdUpdateCleanupMocks = vi.hoisted(() => ({
+export const launchdUpdateCleanupMocks = vi.hoisted(() => ({
   disableCurrentOpenClawUpdateLaunchdJob: vi.fn(async () => false),
 }));
-const windowsOfflineProbe = vi.hoisted(() => vi.fn(async () => null));
-const databasePreflightMocks = vi.hoisted(() => ({
+export const windowsOfflineProbe = vi.hoisted(() => vi.fn(async () => null));
+export const databasePreflightMocks = vi.hoisted(() => ({
   preflightOpenClawDatabaseSchemas: vi.fn(),
 }));
-const restartHealthTestControl = vi.hoisted(() => ({
+export const restartHealthTestControl = vi.hoisted(() => ({
   snapshot: undefined as unknown,
 }));
 const { nodeVersionSatisfiesEngine, resolveNodeRuntimeInfo, execFile, spawn } = await vi.hoisted(
@@ -152,7 +152,7 @@ const { nodeVersionSatisfiesEngine, resolveNodeRuntimeInfo, execFile, spawn } = 
     (await import("./update-cli/update-cli-process-mocks.test-support.js")).updateCliProcessMocks,
 );
 const { defaultRuntime: runtimeCapture, resetRuntimeCapture } = createCliRuntimeCapture();
-const fixtureEnvSnapshot = captureEnv([
+export const fixtureEnvSnapshot = captureEnv([
   ...SUPERVISOR_HINT_ENV_VARS,
   "OPENCLAW_COMPATIBILITY_HOST_VERSION",
   "OPENCLAW_BUNDLED_PLUGINS_DIR",
@@ -699,66 +699,9 @@ vi.mock("../commands/triage-failure.js", () => ({ triageAfterFailure }));
 vi.mock("./update-cli/update-command-report.js", () => updateFailureActionMocks);
 
 export {
-  callGateway,
-  candidateValidation,
-  checkShellCompletionStatus,
-  classifyPortListener,
-  commandTransport,
-  confirm,
-  createPreUpdateConfigSnapshotMock,
-  databasePreflightMocks,
-  ensureCompletionCacheExists,
-  existingHostUri,
-  fixtureEnvSnapshot,
-  formatPortDiagnostics,
-  gatewayFixturePid,
-  httpReadiness,
-  immutableHostUri,
-  inferenceRepair,
-  inspectPortUsage,
-  installCompletion,
-  launchdUpdateCleanupMocks,
-  legacyConfigRepairMocks,
-  loadInstalledPluginIndexInstallRecords,
-  managedUpdateHandoff,
-  mockGetSelfAndAncestorPidsSync,
   nodeVersionSatisfiesEngine,
-  pathExists,
-  pluginAvailabilityPreflight,
-  probePortUsage,
-  readPackageName,
-  readPackageVersion,
-  readPersistedInstalledPluginIndex,
   resetRuntimeCapture,
-  resolveGlobalManager,
   resolveNodeRuntimeInfo,
-  restartHealthTestControl,
-  restorePersistedInstalledPluginIndexIfCurrent,
-  resumeScheduledTaskAutoStartAfterUpdate,
-  retainUpdateRuntime,
   runtimeCapture,
-  select,
-  serviceDefinitionMutationCapability,
-  serviceEnabled,
-  serviceFixtureState,
-  serviceLoaded,
-  serviceReadCommand,
-  serviceReadRuntime,
-  serviceRestart,
-  serviceStart,
-  serviceStop,
-  sourceRuntimeCompletion,
   spawn,
-  stateSchemaVersions,
-  suspendScheduledTaskAutoStartForUpdate,
-  syncPluginsForUpdateChannel,
-  systemdPolicy,
-  terminateStaleGatewayPids,
-  triageAfterFailure,
-  triageCommand,
-  unrelatedGatewayFixturePid,
-  updateFailureActionMocks,
-  updateNpmInstalledPlugins,
-  windowsOfflineProbe,
-  writePersistedInstalledPluginIndexInstallRecordsWithLease,
 };
