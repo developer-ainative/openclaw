@@ -18,11 +18,7 @@ import {
 } from "./config-state.js";
 
 function normalizeVoiceCallEntry(entry: Record<string, unknown>) {
-  return normalizePluginsConfig({
-    entries: {
-      "voice-call": entry,
-    },
-  }).entries["voice-call"];
+  return normalizePluginsConfig({ entries: { "voice-call": entry } }).entries["voice-call"];
 }
 
 type ActivationProvenance = Pick<
@@ -62,6 +58,15 @@ function expectNormalizedEnableState(params: {
     params.expected,
     params.provenance,
   );
+}
+
+function activation(
+  enabled: boolean,
+  explicitlyEnabled: boolean,
+  source: ActivationProvenance["source"],
+  reason: string | undefined,
+) {
+  return { enabled, activated: enabled, explicitlyEnabled, source, reason };
 }
 
 describe("normalizePluginsConfig", () => {
@@ -231,13 +236,7 @@ describe("resolveEffectiveEnableState", () => {
       id: "telegram",
       origin: "config",
       config: normalized,
-      rootConfig: {
-        channels: {
-          telegram: {
-            enabled: true,
-          },
-        },
-      },
+      rootConfig: { channels: { telegram: { enabled: true } } },
     });
   }
 
@@ -307,49 +306,25 @@ describe("resolveEffectivePluginActivationState", () => {
       params: { id: "telegram", origin: "bundled", autoEnabledReason: "telegram configured" },
       rawConfig: { channels: { telegram: { botToken: "x" } } },
       effectiveConfig: { channels: { telegram: { botToken: "x", enabled: true } } },
-      expected: {
-        enabled: true,
-        activated: true,
-        explicitlyEnabled: false,
-        source: "auto",
-        reason: "telegram configured",
-      },
+      expected: activation(true, false, "auto", "telegram configured"),
     },
     {
       name: "preserves explicit selection even when plugins are globally disabled",
       params: { id: "browser", origin: "bundled" },
       rawConfig: { plugins: { enabled: false, entries: { browser: { enabled: true } } } },
-      expected: {
-        enabled: false,
-        activated: false,
-        explicitlyEnabled: true,
-        source: "disabled",
-        reason: "plugins disabled",
-      },
+      expected: activation(false, true, "disabled", "plugins disabled"),
     },
     {
       name: "marks bundled default-enabled plugins as default activation",
       params: { id: "openai", origin: "bundled", enabledByDefault: true },
       rawConfig: {},
-      expected: {
-        enabled: true,
-        activated: true,
-        explicitlyEnabled: false,
-        source: "default",
-        reason: "bundled default enablement",
-      },
+      expected: activation(true, false, "default", "bundled default enablement"),
     },
     {
       name: "keeps allowlists authoritative over explicit bundled plugin enablement",
       params: { id: "telegram", origin: "bundled" },
       rawConfig: { plugins: { allow: ["browser"], entries: { telegram: { enabled: true } } } },
-      expected: {
-        enabled: false,
-        activated: false,
-        explicitlyEnabled: true,
-        source: "disabled",
-        reason: "not in allowlist",
-      },
+      expected: activation(false, true, "disabled", "not in allowlist"),
     },
     {
       name: "lets explicit bundled channel activation bypass the allowlist",
@@ -358,13 +333,7 @@ describe("resolveEffectivePluginActivationState", () => {
         channels: { telegram: { enabled: true } },
         plugins: { allow: ["browser"] },
       },
-      expected: {
-        enabled: true,
-        activated: true,
-        explicitlyEnabled: true,
-        source: "explicit",
-        reason: "channel enabled in config",
-      },
+      expected: activation(true, true, "explicit", "channel enabled in config"),
     },
     {
       name: "keeps denylist authoritative over explicit bundled channel activation",
@@ -373,39 +342,21 @@ describe("resolveEffectivePluginActivationState", () => {
         channels: { telegram: { enabled: true } },
         plugins: { deny: ["telegram"] },
       },
-      expected: {
-        enabled: false,
-        activated: false,
-        explicitlyEnabled: true,
-        source: "disabled",
-        reason: "blocked by denylist",
-      },
+      expected: activation(false, true, "disabled", "blocked by denylist"),
     },
     {
       name: "preserves activation when only the effective config enables a bundled plugin",
       params: { id: "openai", origin: "bundled" },
       rawConfig: { plugins: {} },
       effectiveConfig: { plugins: { entries: { openai: { enabled: true } } } },
-      expected: {
-        enabled: true,
-        activated: true,
-        explicitlyEnabled: false,
-        source: "auto",
-        reason: "enabled by effective config",
-      },
+      expected: activation(true, false, "auto", "enabled by effective config"),
     },
     {
       name: "marks a channel enabled only in effective config as auto activation without an override reason",
       params: { id: "telegram", origin: "bundled" },
       rawConfig: {},
       effectiveConfig: { channels: { telegram: { enabled: true } } },
-      expected: {
-        enabled: true,
-        activated: true,
-        explicitlyEnabled: false,
-        source: "auto",
-        reason: "channel configured",
-      },
+      expected: activation(true, false, "auto", "channel configured"),
     },
     {
       name: "resolves an explicit channel disable through manifest-owned channel ids",
@@ -416,24 +367,12 @@ describe("resolveEffectivePluginActivationState", () => {
         channels: { demo: { enabled: false } },
         plugins: { entries: { "openclaw-demo": { enabled: true } } },
       },
-      expected: {
-        enabled: false,
-        activated: false,
-        explicitlyEnabled: true,
-        source: "disabled",
-        reason: "channel disabled in config",
-      },
+      expected: activation(false, true, "disabled", "channel disabled in config"),
     },
     {
       name: "keeps a global plugin default-enabled without inventing explicit selection or a reason",
       params: { id: "global-helper", origin: "global" },
-      expected: {
-        enabled: true,
-        activated: true,
-        explicitlyEnabled: false,
-        source: "default",
-        reason: undefined,
-      },
+      expected: activation(true, false, "default", undefined),
     },
   ])("$name", ({ params, rawConfig, effectiveConfig = rawConfig, expected }) => {
     const catalog = vi.spyOn(bundledChannelCatalog, "listBundledChannelCatalogEntries");
@@ -502,11 +441,7 @@ describe("resolveEnableState", () => {
       config: {
         allow: ["telegram"],
         slots: { memory: "memory-core" },
-        entries: {
-          "memory-core": {
-            enabled: false,
-          },
-        },
+        entries: { "memory-core": { enabled: false } },
       },
       expected: { enabled: false, reason: "disabled in config" },
       provenance: {
@@ -534,25 +469,12 @@ describe("resolveEnableState", () => {
       { explicitlyEnabled: true, source: "explicit", reason: "selected in allowlist" },
     ],
     [
-      normalizePluginsConfig({
-        entries: {
-          "workspace-helper": {
-            enabled: true,
-          },
-        },
-      }),
+      normalizePluginsConfig({ entries: { "workspace-helper": { enabled: true } } }),
       { enabled: true },
       { explicitlyEnabled: true, source: "explicit", reason: "enabled in config" },
     ],
   ] as const)("resolves workspace-helper enable state for %o", (config, expected, provenance) => {
-    expect(resolveEnableState("workspace-helper", "workspace", config)).toEqual(expected);
-    expect(
-      resolveEffectivePluginActivationState({
-        id: "workspace-helper",
-        origin: "workspace",
-        config,
-      }),
-    ).toEqual({ enabled: expected.enabled, activated: expected.enabled, ...provenance });
+    expectResolvedEnableState(["workspace-helper", "workspace", config], expected, provenance);
   });
 
   it("does not let the default memory slot auto-enable an untrusted workspace plugin", () => {
@@ -590,55 +512,31 @@ describe("resolveEnableState", () => {
 });
 
 describe("resolveMemorySlotDecision", () => {
+  const decide = (kind: "memory" | ("memory" | "context-engine")[], slot: string | null) =>
+    resolveMemorySlotDecision({ id: "memory-plugin", kind, slot, selectedId: null });
+
   it("disables a memory-only plugin when slot points elsewhere", () => {
-    const result = resolveMemorySlotDecision({
-      id: "old-memory",
-      kind: "memory",
-      slot: "new-memory",
-      selectedId: null,
-    });
-    expect(result.enabled).toBe(false);
+    expect(decide("memory", "new-memory").enabled).toBe(false);
   });
 
   it("keeps a dual-kind plugin enabled when memory slot points elsewhere", () => {
-    const result = resolveMemorySlotDecision({
-      id: "dual-plugin",
-      kind: ["memory", "context-engine"],
-      slot: "new-memory",
-      selectedId: null,
-    });
+    const result = decide(["memory", "context-engine"], "new-memory");
     expect(result.enabled).toBe(true);
     expect(result.selected).toBeUndefined();
   });
 
   it("selects a dual-kind plugin when it owns the memory slot", () => {
-    const result = resolveMemorySlotDecision({
-      id: "dual-plugin",
-      kind: ["memory", "context-engine"],
-      slot: "dual-plugin",
-      selectedId: null,
+    expect(decide(["memory", "context-engine"], "memory-plugin")).toMatchObject({
+      enabled: true,
+      selected: true,
     });
-    expect(result.enabled).toBe(true);
-    expect(result.selected).toBe(true);
   });
 
   it("keeps a dual-kind plugin enabled when memory slot is null", () => {
-    const result = resolveMemorySlotDecision({
-      id: "dual-plugin",
-      kind: ["memory", "context-engine"],
-      slot: null,
-      selectedId: null,
-    });
-    expect(result.enabled).toBe(true);
+    expect(decide(["memory", "context-engine"], null).enabled).toBe(true);
   });
 
   it("disables a memory-only plugin when memory slot is null", () => {
-    const result = resolveMemorySlotDecision({
-      id: "old-memory",
-      kind: "memory",
-      slot: null,
-      selectedId: null,
-    });
-    expect(result.enabled).toBe(false);
+    expect(decide("memory", null).enabled).toBe(false);
   });
 });

@@ -47,6 +47,9 @@ async function importCommandsModule(cacheBust: string): Promise<CommandsModule> 
   return (await import(`${commandsModuleUrl}?t=${cacheBust}`)) as CommandsModule;
 }
 
+type CommandHandler = Parameters<typeof registerPluginCommand>[1]["handler"];
+const okHandler = () => vi.fn<CommandHandler>(async () => ({ text: "ok" }));
+
 function createVoiceCommand(overrides: Partial<Parameters<typeof registerPluginCommand>[1]> = {}) {
   return {
     name: "voice",
@@ -56,19 +59,42 @@ function createVoiceCommand(overrides: Partial<Parameters<typeof registerPluginC
   };
 }
 
-function registerHostTrustedReservedCommandForTest(
-  command: Parameters<typeof registerPluginCommand>[1],
-) {
-  const pluginRegistry = createPluginRegistry({
-    logger: {
-      info() {},
-      warn() {},
-      error() {},
-      debug() {},
+type ExecutionParams = Parameters<typeof executePluginCommand>[0];
+
+function executeCommand({
+  command,
+  ...params
+}: Partial<Omit<ExecutionParams, "command">> & {
+  command: Partial<ExecutionParams["command"]> &
+    Pick<ExecutionParams["command"], "name" | "handler">;
+}) {
+  return executePluginCommand({
+    channel: "telegram",
+    isAuthorizedSender: true,
+    config: {},
+    commandBody: `/${command.name}`,
+    ...params,
+    command: {
+      description: "Demo command",
+      pluginId: "demo-plugin",
+      acceptsArgs: false,
+      ...command,
     },
+  });
+}
+
+function createCommandRegistry() {
+  return createPluginRegistry({
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
     runtime: {} as PluginRuntime,
     activateGlobalSideEffects: true,
   });
+}
+
+function registerHostTrustedReservedCommandForTest(
+  command: Parameters<typeof registerPluginCommand>[1],
+) {
+  const pluginRegistry = createCommandRegistry();
   pluginRegistry.registerCommand(createBundledPluginRecord(command.name), command);
   setActivePluginRegistry(pluginRegistry.registry);
 }
@@ -83,10 +109,10 @@ function expectCommandMatch(
   commandBody: string,
   params: { name: string; pluginId: string; args: string },
 ) {
-  const match = requirePluginCommandMatch(commandBody);
-  expect(match.command.name).toBe(params.name);
-  expect(match.command.pluginId).toBe(params.pluginId);
-  expect(match.args).toBe(params.args);
+  expect(requirePluginCommandMatch(commandBody)).toMatchObject({
+    command: { name: params.name, pluginId: params.pluginId },
+    args: params.args,
+  });
 }
 
 function requirePluginCommandMatch(commandBody: string) {
@@ -184,31 +210,7 @@ beforeEach(() => {
           },
           bindings: {
             selfParentConversationByDefault: true,
-            resolveCommandConversation: ({
-              threadId,
-              originatingTo,
-              commandTo,
-              fallbackTo,
-            }: {
-              threadId?: string;
-              originatingTo?: string;
-              commandTo?: string;
-              fallbackTo?: string;
-            }) => {
-              const rawTarget = [commandTo, originatingTo, fallbackTo].find(Boolean)?.trim();
-              if (!rawTarget || rawTarget.startsWith("slash:")) {
-                return null;
-              }
-              const normalized = rawTarget.replace(/^telegram:/i, "");
-              const topicMatch = /^(.*?):topic:(\d+)$/i.exec(normalized);
-              if (topicMatch?.[1]) {
-                return {
-                  conversationId: `${topicMatch[1]}:topic:${threadId ?? topicMatch[2]}`,
-                  parentConversationId: topicMatch[1],
-                };
-              }
-              return { conversationId: normalized };
-            },
+            resolveCommandConversation: () => null,
           },
         },
       },
@@ -221,42 +223,7 @@ beforeEach(() => {
             nativeCommandsAutoEnabled: true,
           },
           bindings: {
-            resolveCommandConversation: ({
-              threadId,
-              threadParentId,
-              originatingTo,
-              commandTo,
-              fallbackTo,
-            }: {
-              threadId?: string;
-              threadParentId?: string;
-              originatingTo?: string;
-              commandTo?: string;
-              fallbackTo?: string;
-            }) => {
-              const rawTarget = [originatingTo, commandTo, fallbackTo].find(Boolean)?.trim();
-              if (!rawTarget || rawTarget.startsWith("slash:")) {
-                return null;
-              }
-              const normalized = rawTarget.replace(/^discord:/i, "");
-              if (/^\d+$/.test(normalized)) {
-                return { conversationId: `user:${normalized}` };
-              }
-              if (threadId) {
-                const baseConversationId =
-                  originatingTo?.trim()?.replace(/^discord:/i, "") ||
-                  commandTo?.trim()?.replace(/^discord:/i, "") ||
-                  fallbackTo?.trim()?.replace(/^discord:/i, "");
-                return {
-                  conversationId: baseConversationId || threadId,
-                  ...(threadParentId ? { parentConversationId: threadParentId } : {}),
-                };
-              }
-              if (normalized.startsWith("channel:") || normalized.startsWith("user:")) {
-                return { conversationId: normalized };
-              }
-              return null;
-            },
+            resolveCommandConversation: () => null,
           },
         },
       },
@@ -267,12 +234,6 @@ beforeEach(() => {
           ...createChannelTestPluginBase({ id: "signal", label: "Signal" }),
           commands: {
             nativeCommandsAutoEnabled: true,
-          },
-          bindings: {
-            resolveCommandConversation: ({ senderId }: { senderId?: string }) => {
-              const normalizedSenderId = senderId?.trim();
-              return normalizedSenderId ? { conversationId: `dm:${normalizedSenderId}` } : null;
-            },
           },
         },
       },
@@ -295,6 +256,11 @@ afterEach(() => {
   clearPluginCommands();
 });
 
+const completeDraft: CommandHandler = async (ctx) => {
+  await ctx.runtimeContext?.llm?.complete({ messages: [{ role: "user", content: "draft" }] });
+  return { text: "ok" };
+};
+
 describe("registerPluginCommand", () => {
   it("writes direct registrations into the synchronous builder context", () => {
     const active = createEmptyPluginRegistry();
@@ -314,85 +280,45 @@ describe("registerPluginCommand", () => {
   it.each([
     {
       name: "rejects invalid command names",
-      command: {
-        // Runtime plugin payloads are untyped; guard at boundary.
-        name: undefined as unknown as string,
-      },
-      expected: {
-        ok: false,
-        error: "Command name must be a string",
-      },
+      // Runtime plugin payloads are untyped; guard at boundary.
+      command: { name: undefined as unknown as string },
+      error: "Command name must be a string",
     },
     {
       name: "rejects invalid command descriptions",
-      command: {
-        description: undefined as unknown as string,
-      },
-      expected: {
-        ok: false,
-        error: "Command description must be a string",
-      },
+      command: { description: undefined as unknown as string },
+      error: "Command description must be a string",
     },
     {
       name: "rejects invalid agent prompt guidance",
-      command: {
-        agentPromptGuidance: "use /demo" as unknown as string[],
-      },
-      expected: {
-        ok: false,
-        error: "Agent prompt guidance must be an array of strings or objects",
-      },
+      command: { agentPromptGuidance: "use /demo" as unknown as string[] },
+      error: "Agent prompt guidance must be an array of strings or objects",
     },
     {
       name: "rejects invalid structured agent prompt guidance",
-      command: {
-        agentPromptGuidance: [{ text: "Use /demo.", surfaces: ["nope"] }] as never,
-      },
-      expected: {
-        ok: false,
-        error:
-          "Agent prompt guidance 1 surface 1 must be one of: openclaw_main, pi_main, codex_app_server, cli_backend, acp_backend, subagent",
-      },
+      command: { agentPromptGuidance: [{ text: "Use /demo.", surfaces: ["nope"] }] as never },
+      error:
+        "Agent prompt guidance 1 surface 1 must be one of: openclaw_main, pi_main, codex_app_server, cli_backend, acp_backend, subagent",
     },
     {
       name: "rejects empty structured agent prompt guidance surfaces",
-      command: {
-        agentPromptGuidance: [{ text: "Use /demo.", surfaces: [] }] as never,
-      },
-      expected: {
-        ok: false,
-        error: "Agent prompt guidance 1 surfaces cannot be empty",
-      },
+      command: { agentPromptGuidance: [{ text: "Use /demo.", surfaces: [] }] as never },
+      error: "Agent prompt guidance 1 surfaces cannot be empty",
     },
     {
       name: "rejects invalid channel scopes",
-      command: {
-        channels: ["telegram", "   "],
-      },
-      expected: {
-        ok: false,
-        error: "Command channel 2 cannot be empty",
-      },
+      command: { channels: ["telegram", "   "] },
+      error: "Command channel 2 cannot be empty",
     },
     {
       name: "rejects primitive native command metadata",
-      command: {
-        nativeNames: "demo-native",
-      },
-      expected: {
-        ok: false,
-        error: "Command nativeNames must be an object",
-      },
+      command: { nativeNames: "demo-native" },
+      error: "Command nativeNames must be an object",
     },
     {
       name: "rejects primitive client presentation metadata",
-      command: {
-        clientPresentation: "device-pairing",
-      },
-      expected: {
-        ok: false,
-        error: "Command clientPresentation must be an object",
-      },
+      command: { clientPresentation: "device-pairing" },
+      error: "Command clientPresentation must be an object",
     },
     {
       name: "rejects unknown client presentation actions",
@@ -402,10 +328,7 @@ describe("registerPluginCommand", () => {
           action: { kind: "open-route" },
         },
       },
-      expected: {
-        ok: false,
-        error: "Command clientPresentation action kind is not supported",
-      },
+      error: "Command clientPresentation action kind is not supported",
     },
     {
       name: "rejects additional client presentation fields",
@@ -416,10 +339,7 @@ describe("registerPluginCommand", () => {
           route: "/settings/devices",
         },
       },
-      expected: {
-        ok: false,
-        error: "Command clientPresentation must contain only when and action",
-      },
+      error: "Command clientPresentation must contain only when and action",
     },
     {
       name: "rejects additional client presentation action fields",
@@ -429,15 +349,13 @@ describe("registerPluginCommand", () => {
           action: { kind: "device-pairing", callback: "run" },
         },
       },
-      expected: {
-        ok: false,
-        error: "Command clientPresentation action must contain only kind",
-      },
+      error: "Command clientPresentation action must contain only kind",
     },
-  ] as const)("$name", ({ command, expected }) => {
-    expect(registerPluginCommand("demo-plugin", createVoiceCommand(command as never))).toEqual(
-      expected,
-    );
+  ] as const)("$name", ({ command, error }) => {
+    expect(registerPluginCommand("demo-plugin", createVoiceCommand(command as never))).toEqual({
+      ok: false,
+      error,
+    });
   });
 
   it("normalizes command metadata for downstream consumers", () => {
@@ -449,7 +367,7 @@ describe("registerPluginCommand", () => {
         when: "no-arguments",
         action: { kind: "device-pairing" },
       },
-      handler: async () => ({ text: "ok" }),
+      handler: okHandler(),
     });
     expect(result).toEqual({ ok: true });
     expect(listPluginCommands()).toEqual([
@@ -510,13 +428,10 @@ describe("registerPluginCommand", () => {
       expect(listRegisteredPluginAgentPromptGuidance()).toEqual(["Scoped guidance"]);
       const match = matchPluginCommand("/same");
       expect(match?.command.pluginId).toBe("scoped");
-      await executePluginCommand({
+      await executeCommand({
         command: match!.command,
         senderId: "user-1",
-        channel: "telegram",
-        isAuthorizedSender: true,
         commandBody: "/same",
-        config: {},
       });
     });
 
@@ -537,7 +452,7 @@ describe("registerPluginCommand", () => {
             agentPromptGuidance: alpha
               ? ["Use /alpha_cmd first.", "Then finish the alpha workflow."]
               : ["Use /zeta_cmd for zeta routing."],
-            handler: async () => ({ text: "ok" }),
+            handler: okHandler(),
           }),
         ).toEqual({ ok: true });
       }
@@ -565,7 +480,7 @@ describe("registerPluginCommand", () => {
           surfaces: ["subagent"],
         },
       ],
-      handler: async () => ({ text: "ok" }),
+      handler: okHandler(),
     });
     expect(result).toEqual({ ok: true });
 
@@ -599,7 +514,7 @@ describe("registerPluginCommand", () => {
       name: "active-memory",
       description: "Active Memory command",
       acceptsArgs: true,
-      handler: async () => ({ text: "ok" }),
+      handler: okHandler(),
     });
 
     expectCommandMatch("/active_memory status", {
@@ -622,7 +537,7 @@ describe("registerPluginCommand", () => {
             name: commandName,
             description: "Exact spelling selection",
             acceptsArgs,
-            handler: async () => ({ text: "ok" }),
+            handler: okHandler(),
           }),
         ).toEqual({ ok: true });
       }
@@ -636,7 +551,7 @@ describe("registerPluginCommand", () => {
       name: "pair",
       description: "Pair command",
       acceptsArgs: true,
-      handler: async () => ({ text: "ok" }),
+      handler: okHandler(),
     });
 
     expectCommandMatch("/ pair qr", {
@@ -772,7 +687,7 @@ describe("registerPluginCommand", () => {
     const result = registerPluginCommand("demo-plugin", {
       name: "codex",
       description: "Fake Codex command",
-      handler: async () => ({ text: "ok" }),
+      handler: okHandler(),
     });
 
     expect(result).toEqual({
@@ -792,55 +707,37 @@ describe("registerPluginCommand", () => {
     });
     const match = requirePluginCommandMatch(`/voice \0${"a".repeat(4094)}😀tail`);
 
-    await executePluginCommand({
+    await executeCommand({
       command: match.command,
       args: match.args,
-      channel: "telegram",
-      isAuthorizedSender: true,
       commandBody: "/voice",
-      config: {},
     });
 
     expect(observedArgs).toBe("a".repeat(4094));
   });
 
   it("ignores owner status opt-in from direct plugin command registration", async () => {
-    let observedOwnerStatus: boolean | undefined;
+    const handler = okHandler();
     registerPluginCommand("demo-plugin", {
       name: "voice",
       description: "Voice command",
       exposeSenderIsOwner: true,
-      handler: async (ctx) => {
-        observedOwnerStatus = ctx.senderIsOwner;
-        return { text: "ok" };
-      },
+      handler,
     });
     const match = requirePluginCommandMatch("/voice");
 
-    await executePluginCommand({
+    await executeCommand({
       command: match.command,
-      channel: "telegram",
-      isAuthorizedSender: true,
       senderIsOwner: true,
       commandBody: "/voice",
-      config: {},
     });
 
-    expect(observedOwnerStatus).toBeUndefined();
+    expect(handler.mock.calls[0]?.[0].senderIsOwner).toBeUndefined();
   });
 
   it("ignores owner status opt-in from external plugin registry commands", async () => {
-    const pluginRegistry = createPluginRegistry({
-      logger: {
-        info() {},
-        warn() {},
-        error() {},
-        debug() {},
-      },
-      runtime: {} as PluginRuntime,
-      activateGlobalSideEffects: true,
-    });
-    let observedOwnerStatus: boolean | undefined;
+    const pluginRegistry = createCommandRegistry();
+    const handler = okHandler();
     pluginRegistry.registerCommand(
       {
         ...createBundledPluginRecord("external-plugin"),
@@ -852,61 +749,40 @@ describe("registerPluginCommand", () => {
         name: "external",
         description: "External command",
         exposeSenderIsOwner: true,
-        handler: async (ctx) => {
-          observedOwnerStatus = ctx.senderIsOwner;
-          return { text: "ok" };
-        },
+        handler,
       },
     );
     setActivePluginRegistry(pluginRegistry.registry);
     const match = requirePluginCommandMatch("/external");
 
-    await executePluginCommand({
+    await executeCommand({
       command: match.command,
-      channel: "telegram",
-      isAuthorizedSender: true,
       senderIsOwner: true,
       commandBody: "/external",
-      config: {},
     });
 
-    expect(observedOwnerStatus).toBeUndefined();
+    expect(handler.mock.calls[0]?.[0].senderIsOwner).toBeUndefined();
   });
 
   it("exposes owner status to trusted bundled plugin commands that opt in", async () => {
-    const pluginRegistry = createPluginRegistry({
-      logger: {
-        info() {},
-        warn() {},
-        error() {},
-        debug() {},
-      },
-      runtime: {} as PluginRuntime,
-      activateGlobalSideEffects: true,
-    });
-    let observedOwnerStatus: boolean | undefined;
+    const pluginRegistry = createCommandRegistry();
+    const handler = okHandler();
     pluginRegistry.registerCommand(createBundledPluginRecord("device-pair"), {
       name: "pair_test",
       description: "Pair test command",
       exposeSenderIsOwner: true,
-      handler: async (ctx) => {
-        observedOwnerStatus = ctx.senderIsOwner;
-        return { text: "ok" };
-      },
+      handler,
     });
     setActivePluginRegistry(pluginRegistry.registry);
     const match = requirePluginCommandMatch("/pair_test");
 
-    await executePluginCommand({
+    await executeCommand({
       command: match.command,
-      channel: "telegram",
-      isAuthorizedSender: true,
       senderIsOwner: true,
       commandBody: "/pair_test",
-      config: {},
     });
 
-    expect(observedOwnerStatus).toBe(true);
+    expect(handler.mock.calls[0]?.[0].senderIsOwner).toBe(true);
   });
 
   it("skips direct plugin command execution on unsupported channels", async () => {
@@ -916,18 +792,15 @@ describe("registerPluginCommand", () => {
       return { text: "ok" };
     };
 
-    const result = await executePluginCommand({
+    const result = await executeCommand({
       command: {
         name: "voice",
         description: "Voice command",
         channels: ["qqbot"],
         handler,
-        pluginId: "demo-plugin",
       },
       channel: "discord",
-      isAuthorizedSender: true,
       commandBody: "/voice",
-      config: {},
     });
 
     expect(result).toEqual({ continueAgent: true });
@@ -941,7 +814,7 @@ describe("registerPluginCommand", () => {
         name: "codex",
         description: "Codex command",
         ownership: "reserved",
-        handler: async () => ({ text: "ok" }),
+        handler: okHandler(),
       },
       { allowReservedCommandNames: true },
     );
@@ -954,46 +827,31 @@ describe("registerPluginCommand", () => {
   });
 
   it("exposes owner status only to host-trusted reserved command owners", async () => {
-    let observedOwnerStatus: boolean | undefined;
+    const handler = okHandler();
     registerHostTrustedReservedCommandForTest({
       name: "codex",
       description: "Codex command",
       ownership: "reserved",
-      handler: async (ctx) => {
-        observedOwnerStatus = ctx.senderIsOwner;
-        return { text: "ok" };
-      },
+      handler,
     });
     const match = requirePluginCommandMatch("/codex");
 
-    await executePluginCommand({
+    await executeCommand({
       command: match.command,
-      channel: "telegram",
-      isAuthorizedSender: true,
       senderIsOwner: true,
       commandBody: "/codex",
-      config: {},
     });
 
-    expect(observedOwnerStatus).toBe(true);
+    expect(handler.mock.calls[0]?.[0].senderIsOwner).toBe(true);
   });
 
   it("rejects mismatched reserved command owners", () => {
-    const pluginRegistry = createPluginRegistry({
-      logger: {
-        info() {},
-        warn() {},
-        error() {},
-        debug() {},
-      },
-      runtime: {} as PluginRuntime,
-      activateGlobalSideEffects: true,
-    });
+    const pluginRegistry = createCommandRegistry();
     pluginRegistry.registerCommand(createBundledPluginRecord("bundled-plugin"), {
       name: "codex",
       description: "Codex command",
       ownership: "reserved",
-      handler: async () => ({ text: "ok" }),
+      handler: okHandler(),
     });
 
     const diagnostic = pluginRegistry.registry.diagnostics.find(
@@ -1081,7 +939,7 @@ describe("registerPluginCommand", () => {
           telegram: "pair_device",
         },
         description: "Pair command",
-        handler: async () => ({ text: "ok" }),
+        handler: okHandler(),
       },
       expected: {
         ok: false,
@@ -1094,22 +952,14 @@ describe("registerPluginCommand", () => {
   });
 
   it("does not expose binding APIs to plugin commands on unsupported channels", async () => {
-    const handler = async (ctx: {
-      requestConversationBinding: (params: { summary: string }) => Promise<unknown>;
-      getCurrentConversationBinding: () => Promise<unknown>;
-      detachConversationBinding: () => Promise<unknown>;
-    }) => {
+    const handler: CommandHandler = async (ctx) => {
       const requested = await ctx.requestConversationBinding({
         summary: "Bind this conversation.",
       });
       const current = await ctx.getCurrentConversationBinding();
       const detached = await ctx.detachConversationBinding();
       return {
-        text: JSON.stringify({
-          requested,
-          current,
-          detached,
-        }),
+        text: JSON.stringify({ requested, current, detached }),
       };
     };
     registerPluginCommand(
@@ -1123,20 +973,14 @@ describe("registerPluginCommand", () => {
       { pluginRoot: "/plugins/demo-plugin" },
     );
 
-    const result = await executePluginCommand({
+    const result = await executeCommand({
       command: {
         name: "bindcheck",
-        description: "Demo command",
-        acceptsArgs: false,
         handler,
-        pluginId: "demo-plugin",
         pluginRoot: "/plugins/demo-plugin",
       },
       channel: "slack",
       senderId: "U123",
-      isAuthorizedSender: true,
-      commandBody: "/bindcheck",
-      config: {} as never,
       from: "slack:U123",
       to: "C456",
       accountId: "default",
@@ -1161,19 +1005,14 @@ describe("registerPluginCommand", () => {
     );
     const handler = vi.fn(async () => ({ text: "ok" }));
 
-    await executePluginCommand({
+    await executeCommand({
       command: {
         name: "control",
         description: "Control a binding",
-        acceptsArgs: false,
         handler,
-        pluginId: "demo-plugin",
       },
       channel: "slack",
       senderId: "U123",
-      isAuthorizedSender: true,
-      commandBody: "/control",
-      config: {} as never,
       from: "slack:U123",
       to: "changed-runtime-target",
       originatingTo: "user:U123",
@@ -1189,32 +1028,22 @@ describe("registerPluginCommand", () => {
   });
 
   it("passes host session identity through to the plugin command context", async () => {
-    let receivedCtx:
-      | {
-          sessionKey?: string;
-          sessionId?: string;
-        }
-      | undefined;
-    const handler = async (ctx: { sessionKey?: string; sessionId?: string }) => {
+    let receivedCtx: Parameters<CommandHandler>[0] | undefined;
+    const handler: CommandHandler = async (ctx) => {
       receivedCtx = ctx;
       return { text: "ok" };
     };
 
-    const result = await executePluginCommand({
+    const result = await executeCommand({
       command: {
         name: "sessioncheck",
-        description: "Demo command",
-        acceptsArgs: false,
         handler,
-        pluginId: "demo-plugin",
       },
       channel: "whatsapp",
       senderId: "U123",
-      isAuthorizedSender: true,
       sessionKey: "agent:main:whatsapp:direct:123",
       sessionId: "session-123",
       commandBody: "/sessioncheck",
-      config: {} as never,
     });
 
     expect(result).toEqual({ text: "ok" });
@@ -1223,34 +1052,13 @@ describe("registerPluginCommand", () => {
   });
 
   it("binds legacy main session plugin llm runtime to the default agent", async () => {
-    const handler = async (ctx: {
-      runtimeContext?: {
-        llm?: {
-          complete: (params: {
-            messages: Array<{ role: "user"; content: string }>;
-          }) => Promise<unknown>;
-        };
-      };
-    }) => {
-      await ctx.runtimeContext?.llm?.complete({
-        messages: [{ role: "user", content: "draft" }],
-      });
-      return { text: "ok" };
-    };
-
-    await executePluginCommand({
+    await executeCommand({
       command: {
         name: "runtimecheck",
-        description: "Demo command",
-        acceptsArgs: false,
-        handler,
-        pluginId: "demo-plugin",
+        handler: completeDraft,
       },
-      channel: "telegram",
       senderId: "U123",
-      isAuthorizedSender: true,
       sessionKey: "main",
-      commandBody: "/runtimecheck",
       config: {
         agents: {
           entries: { ops: {} },
@@ -1272,37 +1080,17 @@ describe("registerPluginCommand", () => {
   });
 
   it("binds plugin-owned command sessions to the host-resolved agent", async () => {
-    const handler = async (ctx: {
-      runtimeContext?: {
-        llm?: {
-          complete: (params: {
-            messages: Array<{ role: "user"; content: string }>;
-          }) => Promise<unknown>;
-        };
-      };
-    }) => {
-      await ctx.runtimeContext?.llm?.complete({
-        messages: [{ role: "user", content: "summarize" }],
-      });
-      return { text: "ok" };
-    };
-
-    await executePluginCommand({
+    await executeCommand({
       command: {
         name: "runtimecheck",
-        description: "Demo command",
-        acceptsArgs: false,
-        handler,
-        pluginId: "demo-plugin",
+        handler: completeDraft,
       },
       channel: "discord",
       senderId: "U123",
-      isAuthorizedSender: true,
       agentId: "codex",
       sessionKey: "plugin-binding:openclaw-codex-app-server:dm",
       authProfileId: "openai:owner@example.com",
       commandBody: "/runtimecheck",
-      config: {} as never,
     });
 
     expect(completionMocks.acquireSimpleCompletionModelForAgent).toHaveBeenCalledWith(
@@ -1316,19 +1104,13 @@ describe("registerPluginCommand", () => {
   it("normalizes undefined plugin command handler results to an empty reply payload", async () => {
     const handler = async () => undefined as never;
 
-    const result = await executePluginCommand({
+    const result = await executeCommand({
       command: {
         name: "silentcheck",
-        description: "Demo command",
-        acceptsArgs: false,
         handler,
-        pluginId: "demo-plugin",
       },
-      channel: "telegram",
       senderId: "U123",
-      isAuthorizedSender: true,
       commandBody: "/silentcheck",
-      config: {} as never,
     });
 
     expect(result).toStrictEqual({});
@@ -1374,29 +1156,19 @@ describe("registerPluginCommand", () => {
       ]),
     );
 
-    let receivedCtx:
-      | {
-          accountId?: string;
-        }
-      | undefined;
-    const handler = async (ctx: { accountId?: string }) => {
+    let receivedCtx: Parameters<CommandHandler>[0] | undefined;
+    const handler: CommandHandler = async (ctx) => {
       receivedCtx = ctx;
       return { text: "ok" };
     };
 
-    const result = await executePluginCommand({
+    const result = await executeCommand({
       command: {
         name: "accountcheck",
-        description: "Demo command",
-        acceptsArgs: false,
         handler,
-        pluginId: "demo-plugin",
       },
       channel: "line",
       senderId: "U123",
-      isAuthorizedSender: true,
-      commandBody: "/accountcheck",
-      config: {} as never,
       from: "line:user:U1234567890abcdef1234567890abcdef",
     });
 

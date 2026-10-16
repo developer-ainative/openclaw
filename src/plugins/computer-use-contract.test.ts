@@ -45,26 +45,35 @@ function registerProvider(
   return commands;
 }
 
+const firstId = "123e4567-e89b-42d3-a456-426614174000";
+const nextId = "223e4567-e89b-42d3-a456-426614174000";
+const browserTarget = {
+  browserRef: "browser-1",
+  pageRef: "page-1",
+  observationId: "observation-1",
+  elementRef: "element-1",
+};
+const envelope = (executionId: string, action?: string) => JSON.stringify({ executionId, action });
+const activeWork = (commands: OpenClawPluginNodeHostCommand[]) =>
+  commands.map((command) => command.hasActiveWork?.());
+const openMock = (close: Awaited<ReturnType<ComputerUseProvider["openExecution"]>>["close"]) =>
+  vi.fn<ComputerUseProvider["openExecution"]>(async () => ({
+    snapshot: async () => "snapshot",
+    act: async () => "act",
+    close,
+  }));
+
 describe("Computer Use wire contract", () => {
   it("projects the canonical screen.snapshot result", () => {
-    expect(
-      parseScreenSnapshotResult({
-        format: "jpeg",
-        base64: "aGk=",
-        displayFrameId: "frame-1",
-        width: 100,
-        height: 50,
-        capturedAtMs: 42,
-        ignored: true,
-      }),
-    ).toEqual({
+    const result = {
       format: "jpeg",
       base64: "aGk=",
       displayFrameId: "frame-1",
       width: 100,
       height: 50,
       capturedAtMs: 42,
-    });
+    };
+    expect(parseScreenSnapshotResult({ ...result, ignored: true })).toEqual(result);
   });
 
   it("accepts the portable recording family without native path or helper inputs", () => {
@@ -76,18 +85,12 @@ describe("Computer Use wire contract", () => {
       { action: "replay_trajectory", resourceHandle, delayMs: 25, stopOnError: false },
       {
         action: "browser_set_input_files",
-        browserRef: "browser-1",
-        pageRef: "page-1",
-        observationId: "observation-1",
-        elementRef: "element-1",
+        ...browserTarget,
         resourceHandles: [resourceHandle],
       },
       {
         action: "browser_download",
-        browserRef: "browser-1",
-        pageRef: "page-1",
-        observationId: "observation-1",
-        elementRef: "element-1",
+        ...browserTarget,
       },
     ]) {
       expect(parseComputerActParamsJSON(JSON.stringify(input))).toEqual(input);
@@ -105,18 +108,12 @@ describe("Computer Use wire contract", () => {
       { providerTool: "click", arguments: { x: 1, y: 2 } },
       {
         action: "browser_set_input_files",
-        browserRef: "browser-1",
-        pageRef: "page-1",
-        observationId: "observation-1",
-        elementRef: "element-1",
+        ...browserTarget,
         files: ["/tmp/input.txt"],
       },
       {
         action: "browser_download",
-        browserRef: "browser-1",
-        pageRef: "page-1",
-        observationId: "observation-1",
-        elementRef: "element-1",
+        ...browserTarget,
         destinationRoot: "/tmp/downloads",
       },
     ]) {
@@ -178,8 +175,6 @@ describe("Computer Use provider registration", () => {
   it.each(["same", "different", "same-close", "different-close"] as const)(
     "preserves queued acquisition and close order for %s",
     async (laterOwner) => {
-      const firstId = "123e4567-e89b-42d3-a456-426614174000";
-      const nextId = "223e4567-e89b-42d3-a456-426614174000";
       const laterId = laterOwner.startsWith("same")
         ? nextId
         : "323e4567-e89b-42d3-a456-426614174000";
@@ -190,27 +185,19 @@ describe("Computer Use provider registration", () => {
         .fn(async () => {})
         .mockImplementationOnce(() => firstClose.promise)
         .mockImplementationOnce(() => nextClose.promise);
-      const openExecution = vi.fn(async () => ({
-        snapshot: async () => "snapshot",
-        act: async () => "act",
-        close,
-      }));
+      const openExecution = openMock(close);
       const commands = registerProvider(openExecution);
       const snapshot = commands[0]!;
       const computer = commands[1]!;
-      expect(commands.map((command) => command.hasActiveWork?.())).toEqual([false, false]);
-      await snapshot.handle(JSON.stringify({ executionId: firstId }));
-      expect(commands.map((command) => command.hasActiveWork?.())).toEqual([true, true]);
-      const retiringFirst = computer.handle(
-        JSON.stringify({ executionId: firstId, action: "__close_execution" }),
-      );
-      const openingNext = snapshot.handle(JSON.stringify({ executionId: nextId }));
-      const retiringNext = computer.handle(
-        JSON.stringify({ executionId: nextId, action: "__close_execution" }),
-      );
-      const laterSnapshot = snapshot.handle(JSON.stringify({ executionId: laterId }));
+      expect(activeWork(commands)).toEqual([false, false]);
+      await snapshot.handle(envelope(firstId));
+      expect(activeWork(commands)).toEqual([true, true]);
+      const retiringFirst = computer.handle(envelope(firstId, "__close_execution"));
+      const openingNext = snapshot.handle(envelope(nextId));
+      const retiringNext = computer.handle(envelope(nextId, "__close_execution"));
+      const laterSnapshot = snapshot.handle(envelope(laterId));
       const retiringLater = closeLater
-        ? computer.handle(JSON.stringify({ executionId: laterId, action: "__close_execution" }))
+        ? computer.handle(envelope(laterId, "__close_execution"))
         : undefined;
       const laterSettled = vi.fn();
       const observedLater = laterSnapshot.then(laterSettled, laterSettled);
@@ -230,7 +217,7 @@ describe("Computer Use provider registration", () => {
         });
         expect(openExecution).toHaveBeenCalledTimes(2);
         expect(close).toHaveBeenCalledTimes(2);
-        expect(commands.map((command) => command.hasActiveWork?.())).toEqual([true, true]);
+        expect(activeWork(commands)).toEqual([true, true]);
         expect(laterSettled).not.toHaveBeenCalled();
         expect(laterCloseSettled).not.toHaveBeenCalled();
         nextClose.resolve();
@@ -243,10 +230,7 @@ describe("Computer Use provider registration", () => {
         ]);
         expect(openExecution).toHaveBeenCalledTimes(3);
         expect(close).toHaveBeenCalledTimes(closeLater ? 3 : 2);
-        expect(commands.map((command) => command.hasActiveWork?.())).toEqual([
-          !closeLater,
-          !closeLater,
-        ]);
+        expect(activeWork(commands)).toEqual([!closeLater, !closeLater]);
       } finally {
         firstClose.resolve();
         nextClose.resolve();
@@ -254,14 +238,14 @@ describe("Computer Use provider registration", () => {
         await observedLater;
         await observedLaterClose;
         await snapshot.onDisconnect?.();
-        expect(commands.map((command) => command.hasActiveWork?.())).toEqual([false, false]);
+        expect(activeWork(commands)).toEqual([false, false]);
       }
     },
   );
 
   it("retains terminal close failure without confusing it with failed-open recovery", async () => {
-    const executionId = "123e4567-e89b-42d3-a456-426614174000";
-    const otherId = "223e4567-e89b-42d3-a456-426614174000";
+    const executionId = firstId;
+    const otherId = nextId;
     const openFailure = new Error("native driver startup failed");
     const closeFailure = new Error("native driver shutdown failed");
     const failedOpening =
@@ -271,47 +255,39 @@ describe("Computer Use provider registration", () => {
     });
     let terminalClose: Promise<void> | undefined;
     const close = vi.fn(() => (terminalClose ??= physicalClose()));
-    const openExecution = vi
-      .fn<ComputerUseProvider["openExecution"]>(async () => ({
-        snapshot: async () => "snapshot",
-        act: async () => "act",
-        close,
-      }))
-      .mockImplementationOnce(() => failedOpening.promise);
+    const openExecution = openMock(close).mockImplementationOnce(() => failedOpening.promise);
     const commands = registerProvider(openExecution);
     const snapshot = commands[0]!;
     const computer = commands[1]!;
-    const params = JSON.stringify({ executionId });
+    const params = envelope(executionId);
     const closeParams = JSON.stringify({ executionId, action: "__close_execution" });
     const opening = snapshot.handle(params);
     const closingFailedOpen = computer.handle(closeParams);
-    expect(commands.map((command) => command.hasActiveWork?.())).toEqual([true, true]);
+    expect(activeWork(commands)).toEqual([true, true]);
     const failedOpenResults = Promise.allSettled([opening, closingFailedOpen]);
     failedOpening.reject(openFailure);
     expect(await failedOpenResults).toEqual([
       { status: "rejected", reason: openFailure },
       { status: "rejected", reason: openFailure },
     ]);
-    expect(commands.map((command) => command.hasActiveWork?.())).toEqual([false, false]);
+    expect(activeWork(commands)).toEqual([false, false]);
     await expect(snapshot.handle(params)).resolves.toBe("snapshot");
     await expect(computer.handle(closeParams)).rejects.toBe(closeFailure);
-    expect(commands.map((command) => command.hasActiveWork?.())).toEqual([true, true]);
-    await expect(
-      computer.handle(JSON.stringify({ executionId: otherId, action: "__close_execution" })),
-    ).resolves.toBe('{"ok":true}');
+    expect(activeWork(commands)).toEqual([true, true]);
+    await expect(computer.handle(envelope(otherId, "__close_execution"))).resolves.toBe(
+      '{"ok":true}',
+    );
     expect(close).toHaveBeenCalledOnce();
 
     await expect(computer.handle(closeParams)).rejects.toBe(closeFailure);
-    await expect(snapshot.handle(JSON.stringify({ executionId: otherId }))).rejects.toBe(
-      closeFailure,
-    );
+    await expect(snapshot.handle(envelope(otherId))).rejects.toBe(closeFailure);
     expect(openExecution).toHaveBeenCalledTimes(2);
     expect(close).toHaveBeenCalledTimes(2);
     expect(physicalClose).toHaveBeenCalledOnce();
   });
 
   it("registers one command pair and dispatches both through one execution", async () => {
-    const executionId = "123e4567-e89b-42d3-a456-426614174000";
+    const executionId = firstId;
     const snapshot = vi.fn(async () => "snapshot");
     const act = vi.fn(async () => "act");
     const executionRetiring = createDeferredCore();
@@ -336,7 +312,7 @@ describe("Computer Use provider registration", () => {
 
     const signal = new AbortController().signal;
     const context = { sendNodeEvent: vi.fn(), sessionKey: "session-1", signal };
-    const paramsJSON = JSON.stringify({ executionId });
+    const paramsJSON = envelope(executionId);
     await expect(commands[0]!.handle(paramsJSON, undefined, context)).resolves.toBe("snapshot");
     await expect(commands[1]!.handle(paramsJSON, undefined, context)).resolves.toBe("act");
     expect(openExecution).toHaveBeenCalledOnce();
@@ -376,16 +352,11 @@ describe("Computer Use provider registration", () => {
   });
 
   it("refuses a second mutating execution and closes only the exact host execution", async () => {
-    const firstId = "123e4567-e89b-42d3-a456-426614174000";
-    const secondId = "223e4567-e89b-42d3-a456-426614174000";
+    const secondId = nextId;
     const closes: string[] = [];
-    const openExecution = vi.fn(async () => ({
-      snapshot: vi.fn(async () => "snapshot"),
-      act: vi.fn(async () => "act"),
-      close: vi.fn(async (reason: string) => {
-        closes.push(reason);
-      }),
-    }));
+    const openExecution = openMock(async (reason) => {
+      closes.push(reason);
+    });
     const commands = registerProvider(openExecution, {
       capabilities: () => ({
         ...capabilityDescriptor(["start_recording", "stop_recording"]),
