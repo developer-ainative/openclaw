@@ -168,7 +168,7 @@ it.for([
               },
               { once: true },
             );
-            track(async () => {
+            void track(async () => {
               await stopFactory.promise;
               values.push(db.prepare("SELECT value FROM answer").get()?.value);
             });
@@ -245,7 +245,7 @@ it.for([
               disposalContextMatches =
                 getPluginRuntimeGatewayRequestScope()?.pluginRegistry ===
                 selectedRegistry?.pluginRegistry;
-              track(async () => {
+              void track(async () => {
                 cleanupTailEntered.resolve();
                 await finishDisposal.promise;
                 values.push(db.prepare("SELECT value FROM answer").get()?.value);

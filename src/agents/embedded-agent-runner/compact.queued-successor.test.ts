@@ -474,11 +474,9 @@ it.each([
   const result = await pending;
   expect(result).toMatchObject(success);
   expect(controller.signal.aborted).toBe(true);
-  expect(result.result).toMatchObject({
-    sessionId: undefined,
-    sessionFile: undefined,
-    tokensAfter: scenario.tokensAfter,
-  });
+  expect(result.result?.sessionId).toBeUndefined();
+  expect(result.result?.sessionFile).toBeUndefined();
+  expect(result.result?.tokensAfter).toBe(scenario.tokensAfter);
   expect(onCommitted).not.toHaveBeenCalled();
   expect(loadSessionEntry(target())).toMatchObject(owner);
   expectPostCompactionCalls();
@@ -497,11 +495,8 @@ it.each([
         })
       : undefined;
   expect(count).toBe(1);
-  expect(loadSessionEntry(target())).toMatchObject({
-    ...owner,
-    compactionCount: 1,
-    totalTokens: scenario.tokensAfter,
-  });
+  expect(loadSessionEntry(target())).toMatchObject({ ...owner, compactionCount: 1 });
+  expect(loadSessionEntry(target())?.totalTokens).toBe(scenario.tokensAfter);
 });
 
 it("rejects an owner changed while compaction awaited", async () => {

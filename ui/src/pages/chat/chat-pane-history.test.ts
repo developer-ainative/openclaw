@@ -104,7 +104,9 @@ function installHistoryObserver(intersect = true) {
     }
   }
   vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
-  onTestFinished(() => vi.unstubAllGlobals());
+  onTestFinished(() => {
+    vi.unstubAllGlobals();
+  });
   return { observe, disconnect, construct, rootMargin: () => rootMargin };
 }
 
