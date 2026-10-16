@@ -1,6 +1,6 @@
 // The non-isolated runner resets modules between files but preserves customElements.
 // A dedicated jsdom context keeps the registered pane class on this file's module graph.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 /* @vitest-environment jsdom */
 /* @vitest-environment-options {"url":"http://chat-pane-lifecycle.test/"} */
 import type {
@@ -75,14 +75,12 @@ function runtimePane(sessionKey: string, context = createInitializationContext()
 
 function stopAtAttach(pane: TestChatPane) {
   const error = new Error("stop after attach");
-  let state: ChatPageHost | undefined;
-  vi.spyOn(pane.chatState, "attach").mockImplementation((attached) => {
-    state = attached;
+  const attach = vi.spyOn(pane.chatState, "attach").mockImplementation(() => {
     throw error;
   });
   return () => {
     expect(() => getPaneTestRuntime(pane).connectedCallback()).toThrow(error);
-    return state;
+    return attach.mock.calls[0]?.[0];
   };
 }
 
@@ -258,255 +256,251 @@ it.each(["absent", "open"] as const)(
   },
 );
 
-describe("chat pane session suggestion lifecycle", () => {
-  function createSuggestionPane(request = vi.fn()) {
-    const fixture = barePane(request);
-    fixture.pane.presencePayload = {
-      presence: [{ user: { id: "owner" } }, { user: { id: "alice" } }],
-    };
-    return fixture;
-  }
+function createSuggestionPane(request = vi.fn()) {
+  const fixture = barePane(request);
+  fixture.pane.presencePayload = {
+    presence: [{ user: { id: "owner" } }, { user: { id: "alice" } }],
+  };
+  return fixture;
+}
 
-  it("does not let a stale add completion clear a newer session operation", async () => {
-    const { first, second, request } = deferredPair<{ suggestion: SessionSuggestion }>();
-    const { pane, state } = createSuggestionPane(request);
-    state.chatAttachments = [];
+it("does not let a stale add completion clear a newer session operation", async () => {
+  const { first, second, request } = deferredPair<{ suggestion: SessionSuggestion }>();
+  const { pane, state } = createSuggestionPane(request);
+  state.chatAttachments = [];
 
-    state.chatMessage = "first";
-    const firstPending = pane.addCurrentSessionSuggestion();
-    pane.resetSessionSuggestions();
-    state.chatMessage = "second";
-    const secondPending = pane.addCurrentSessionSuggestion();
+  state.chatMessage = "first";
+  const firstPending = pane.addCurrentSessionSuggestion();
+  pane.resetSessionSuggestions();
+  state.chatMessage = "second";
+  const secondPending = pane.addCurrentSessionSuggestion();
 
-    first.resolve({ suggestion: pendingSuggestion(state, "first") });
-    await firstPending;
-    expect(pane.sessionSuggestionAddOperation).toBeDefined();
-    expect(pane.sessionSuggestions.some((suggestion) => suggestion.id === "first")).toBe(false);
-    second.resolve({ suggestion: pendingSuggestion(state, "second") });
-    await secondPending;
-    expect(pane.sessionSuggestionAddOperation).toBeUndefined();
-  });
-
-  it.each(["attachments", "mentions"] as const)(
-    "rejects suggestion submission while %s remain",
-    async (content) => {
-      const request = vi.fn();
-      const { pane, state } = createSuggestionPane(request);
-      state.chatMessage = "@Alex text only";
-      state.chatAttachments =
-        content === "attachments"
-          ? [{ id: "attachment", mimeType: "image/png", dataUrl: "data:image/png;base64,AAA" }]
-          : [];
-      state.chatMentions =
-        content === "mentions" ? [{ profileId: "alex-profile", start: 0, end: 5 }] : [];
-
-      await pane.addCurrentSessionSuggestion();
-      expect(request).not.toHaveBeenCalled();
-      expect(state.chatError).toBe(
-        t(
-          content === "mentions"
-            ? "chat.mentions.unsupported"
-            : "chat.sessionSuggestions.attachmentsUnsupported",
-        ),
-      );
-      expect(state.chatMessage).toBe("@Alex text only");
-    },
-  );
-
-  it("coalesces overlapping refreshes and applies the event-invalidated follow-up", async () => {
-    const { first, second, request } = deferredPair<SessionSuggestionsListResult>();
-    const { pane, state } = createSuggestionPane(request);
-    selectSuggestionRows(state, { ...suggestionRow(state), sharingRole: "viewer" });
-    const eventSuggestion = pendingSuggestion(state, "event");
-    const existingSuggestion: SessionSuggestion = {
-      ...eventSuggestion,
-      id: "existing",
-      createdAt: 0,
-    };
-
-    const pending = pane.refreshSessionSuggestions();
-    const overlapping = pane.refreshSessionSuggestions();
-    expect(request).toHaveBeenCalledTimes(1);
-    pane.handleSessionSuggestionEvent({ action: "added", suggestion: eventSuggestion });
-    first.resolve({ suggestions: [existingSuggestion], role: "viewer" });
-    await Promise.all([pending, overlapping]);
-    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(2));
-    second.resolve({ suggestions: [existingSuggestion, eventSuggestion], role: "viewer" });
-    await vi.waitFor(() =>
-      expect(pane.sessionSuggestions).toEqual([existingSuggestion, eventSuggestion]),
-    );
-    expect(pane.sessionSuggestionRole).toBe("viewer");
-    await Promise.resolve();
-    expect(request).toHaveBeenCalledTimes(2);
-  });
-
-  it("clears cached suggestions until a rotated session instance list resolves", async () => {
-    const listed = createDeferred<SessionSuggestionsListResult>();
-    const request = vi.fn(() => listed.promise);
-    const { pane, state } = createSuggestionPane(request);
-    const row = (sessionId: string) => suggestionRow(state, sessionId);
-    const stale = pendingSuggestion(state, "stale");
-    const fresh = pendingSuggestion(state, "fresh");
-
-    pane.syncSessionSuggestionTarget("main", row("session-a"));
-    await pane.refreshSessionSuggestions();
-    pane.sessionSuggestions = [stale];
-    state.sessionsResultAgentId = "main";
-    selectSuggestionRows(state, row("session-b"));
-
-    pane.syncSessionSuggestionTarget("main", row("session-b"));
-
-    expect(pane.sessionSuggestions).toEqual([]);
-    expect(request).toHaveBeenCalledTimes(1);
-    listed.resolve({ suggestions: [fresh], role: "owner" });
-    await vi.waitFor(() => expect(pane.sessionSuggestions).toEqual([fresh]));
-  });
-
-  it("clears displayed typing actors when the session instance rotates", () => {
-    const { pane, state } = createSuggestionPane();
-    const row = (sessionId: string) => suggestionRow(state, sessionId);
-    const sessionA = row("session-a");
-    selectSuggestionRows(state, sessionA);
-    pane.syncSessionSuggestionTarget("main", sessionA);
-    pane.handleSessionTypingEvent({
-      sessionKey: state.sessionKey,
-      sessionId: "session-a",
-      agentId: "main",
-      actor: { type: "human", id: "alice", label: "Alice" },
-      typing: true,
-      ts: 1,
-    });
-    expect(pane.typingActors.size).toBe(1);
-
-    const sessionB = row("session-b");
-    selectSuggestionRows(state, sessionB);
-    pane.syncSessionSuggestionTarget("main", sessionB);
-
-    expect(pane.typingActors.size).toBe(0);
-  });
-
-  it("keeps an owner's self-authored resolved suggestion through the following list", async () => {
-    const listed = createDeferred<SessionSuggestionsListResult>();
-    const resolvedResponse = createDeferred<{ suggestion: SessionSuggestion }>();
-    const request = vi.fn((method: string) => {
-      if (method === "session.suggestions.resolve") {
-        return resolvedResponse.promise;
-      }
-      if (method === "session.suggestions.list") {
-        return listed.promise;
-      }
-      throw new Error(`unexpected method: ${method}`);
-    });
-    const { pane, state } = createSuggestionPane(request);
-    pane.context.gateway.snapshot.selfUser = { id: "owner" } as never;
-    selectSuggestionRows(state, suggestionRow(state));
-    const pending = pendingSuggestion(state, "owner", "resolved suggestion", suggestionOwner);
-    const resolved = { ...pending, state: "accepted" as const };
-    pane.sessionSuggestionRole = "owner";
-    pane.sessionSuggestions = [pending];
-
-    const resolving = pane.resolveCurrentSessionSuggestion(pending, "queue");
-    expect(request).toHaveBeenCalledTimes(1);
-    pane.handleSessionSuggestionEvent({ action: "resolved", suggestion: resolved });
-    expect(pane.sessionSuggestions).toEqual([resolved]);
-    expect(request).toHaveBeenCalledTimes(2);
-
-    listed.resolve({ suggestions: [resolved], role: "owner" });
-    await vi.waitFor(() => expect(pane.sessionSuggestions).toEqual([resolved]));
-    resolvedResponse.resolve({ suggestion: resolved });
-    await resolving;
-
-    expect(pane.sessionSuggestions).toEqual([resolved]);
-    expect(pane.sessionSuggestionRole).toBe("owner");
-  });
-
-  it("drops a resolve completion after the same session key rotates instances", async () => {
-    const response = createDeferred<{ suggestion: SessionSuggestion }>();
-    const { pane, state } = barePane(vi.fn(() => response.promise));
-    const session = (sessionId: string) => suggestionRow(state, sessionId);
-    const suggestion = pendingSuggestion(state, "old", "old suggestion", suggestionOwner);
-    pane.context.gateway.snapshot.selfUser = { id: "owner" } as never;
-    pane.syncSessionSuggestionTarget("main", session("session-a"));
-    pane.sessionSuggestions = [suggestion];
-
-    const resolving = pane.resolveCurrentSessionSuggestion(suggestion, "queue");
-    pane.syncSessionSuggestionTarget("main", session("session-b"));
-    response.resolve({ suggestion: { ...suggestion, state: "accepted" } });
-    await resolving;
-
-    expect(pane.sessionSuggestions).toEqual([]);
-    expect(state.chatError).toBeNull();
-  });
-
-  it("does not apply an edit failure after the same session key rotates instances", async () => {
-    const deferred = createDeferred<never>();
-    const { pane, state } = editablePane(vi.fn(() => deferred.promise));
-    const suggestion = pendingSuggestion(state, "edit", "suggested text");
-    pane.sessionSuggestionTargetSignature = "main\0agent:main:current\0session-a";
-    state.chatMessage = "original";
-    const pending = pane.resolveCurrentSessionSuggestion(suggestion, "edit");
-    pane.sessionSuggestionTargetSignature = "main\0agent:main:current\0session-b";
-    pane.resetSessionSuggestions();
-    state.chatMessage = "new session draft";
-    deferred.reject(new Error("old request failed"));
-
-    await pending;
-    expect(state.chatMessage).toBe("new session draft");
-    expect(state.chatError).not.toBe("old request failed");
-  });
-
-  it.each([false, true])(
-    "restores only an untouched owner draft after an edit rejection (reselected=%s)",
-    async (reselected) => {
-      const deferred = createDeferred<never>();
-      const { pane, state } = barePane(vi.fn(() => deferred.promise));
-      const suggestion = pendingSuggestion(state, "edit-rejected", "@Alex rejected suggestion");
-      state.handleChatDraftChange = (next, mentions) =>
-        handleChatDraftChange(state, next, mentions);
-      state.chatMessage = "@Alex owner draft";
-      state.chatMentions = [{ profileId: "original-profile", start: 0, end: 5 }];
-
-      const resolving = pane.resolveCurrentSessionSuggestion(suggestion, "edit");
-      expect(state.chatMentions).toEqual([]);
-      if (reselected) {
-        state.handleChatDraftChange(suggestion.text, [
-          { profileId: "replacement-profile", start: 0, end: 5 },
-        ]);
-      }
-      deferred.reject(rejectedSuggestion("suggestion already resolved"));
-      await resolving;
-
-      expect(state.chatMessage).toBe(reselected ? suggestion.text : "@Alex owner draft");
-      expect(state.chatMentions).toEqual([
-        { profileId: reselected ? "replacement-profile" : "original-profile", start: 0, end: 5 },
-      ]);
-      expect(state.chatError).toBe("suggestion already resolved");
-    },
-  );
-
-  it("serializes edit resolutions so rejected suggestions cannot snapshot each other", async () => {
-    const { first, second, request } = deferredPair<never>();
-    const { pane, state } = editablePane(request);
-    const suggestion = (id: string) => pendingSuggestion(state, id);
-    state.chatMessage = "owner draft";
-
-    const firstPending = pane.resolveCurrentSessionSuggestion(suggestion("first"), "edit");
-    await pane.resolveCurrentSessionSuggestion(suggestion("second"), "edit");
-    expect(request).toHaveBeenCalledTimes(1);
-    expect(state.chatMessage).toBe("first");
-
-    first.reject(rejectedSuggestion("first was rejected"));
-    await firstPending;
-    expect(state.chatMessage).toBe("owner draft");
-
-    const secondPending = pane.resolveCurrentSessionSuggestion(suggestion("second"), "edit");
-    second.reject(rejectedSuggestion("second was rejected"));
-    await secondPending;
-    expect(request).toHaveBeenCalledTimes(2);
-    expect(state.chatMessage).toBe("owner draft");
-  });
+  first.resolve({ suggestion: pendingSuggestion(state, "first") });
+  await firstPending;
+  expect(pane.sessionSuggestionAddOperation).toBeDefined();
+  expect(pane.sessionSuggestions.some((suggestion) => suggestion.id === "first")).toBe(false);
+  second.resolve({ suggestion: pendingSuggestion(state, "second") });
+  await secondPending;
+  expect(pane.sessionSuggestionAddOperation).toBeUndefined();
 });
 
+it.each(["attachments", "mentions"] as const)(
+  "rejects suggestion submission while %s remain",
+  async (content) => {
+    const request = vi.fn();
+    const { pane, state } = createSuggestionPane(request);
+    state.chatMessage = "@Alex text only";
+    state.chatAttachments =
+      content === "attachments"
+        ? [{ id: "attachment", mimeType: "image/png", dataUrl: "data:image/png;base64,AAA" }]
+        : [];
+    state.chatMentions =
+      content === "mentions" ? [{ profileId: "alex-profile", start: 0, end: 5 }] : [];
+
+    await pane.addCurrentSessionSuggestion();
+    expect(request).not.toHaveBeenCalled();
+    expect(state.chatError).toBe(
+      t(
+        content === "mentions"
+          ? "chat.mentions.unsupported"
+          : "chat.sessionSuggestions.attachmentsUnsupported",
+      ),
+    );
+    expect(state.chatMessage).toBe("@Alex text only");
+  },
+);
+
+it("coalesces overlapping refreshes and applies the event-invalidated follow-up", async () => {
+  const { first, second, request } = deferredPair<SessionSuggestionsListResult>();
+  const { pane, state } = createSuggestionPane(request);
+  selectSuggestionRows(state, { ...suggestionRow(state), sharingRole: "viewer" });
+  const eventSuggestion = pendingSuggestion(state, "event");
+  const existingSuggestion: SessionSuggestion = {
+    ...eventSuggestion,
+    id: "existing",
+    createdAt: 0,
+  };
+
+  const pending = pane.refreshSessionSuggestions();
+  const overlapping = pane.refreshSessionSuggestions();
+  expect(request).toHaveBeenCalledTimes(1);
+  pane.handleSessionSuggestionEvent({ action: "added", suggestion: eventSuggestion });
+  first.resolve({ suggestions: [existingSuggestion], role: "viewer" });
+  await Promise.all([pending, overlapping]);
+  await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(2));
+  second.resolve({ suggestions: [existingSuggestion, eventSuggestion], role: "viewer" });
+  await vi.waitFor(() =>
+    expect(pane.sessionSuggestions).toEqual([existingSuggestion, eventSuggestion]),
+  );
+  expect(pane.sessionSuggestionRole).toBe("viewer");
+  await Promise.resolve();
+  expect(request).toHaveBeenCalledTimes(2);
+});
+
+it("clears cached suggestions until a rotated session instance list resolves", async () => {
+  const listed = createDeferred<SessionSuggestionsListResult>();
+  const request = vi.fn(() => listed.promise);
+  const { pane, state } = createSuggestionPane(request);
+  const row = (sessionId: string) => suggestionRow(state, sessionId);
+  const stale = pendingSuggestion(state, "stale");
+  const fresh = pendingSuggestion(state, "fresh");
+
+  pane.syncSessionSuggestionTarget("main", row("session-a"));
+  await pane.refreshSessionSuggestions();
+  pane.sessionSuggestions = [stale];
+  state.sessionsResultAgentId = "main";
+  selectSuggestionRows(state, row("session-b"));
+
+  pane.syncSessionSuggestionTarget("main", row("session-b"));
+
+  expect(pane.sessionSuggestions).toEqual([]);
+  expect(request).toHaveBeenCalledTimes(1);
+  listed.resolve({ suggestions: [fresh], role: "owner" });
+  await vi.waitFor(() => expect(pane.sessionSuggestions).toEqual([fresh]));
+});
+
+it("clears displayed typing actors when the session instance rotates", () => {
+  const { pane, state } = createSuggestionPane();
+  const row = (sessionId: string) => suggestionRow(state, sessionId);
+  const sessionA = row("session-a");
+  selectSuggestionRows(state, sessionA);
+  pane.syncSessionSuggestionTarget("main", sessionA);
+  pane.handleSessionTypingEvent({
+    sessionKey: state.sessionKey,
+    sessionId: "session-a",
+    agentId: "main",
+    actor: { type: "human", id: "alice", label: "Alice" },
+    typing: true,
+    ts: 1,
+  });
+  expect(pane.typingActors.size).toBe(1);
+
+  const sessionB = row("session-b");
+  selectSuggestionRows(state, sessionB);
+  pane.syncSessionSuggestionTarget("main", sessionB);
+
+  expect(pane.typingActors.size).toBe(0);
+});
+
+it("keeps an owner's self-authored resolved suggestion through the following list", async () => {
+  const listed = createDeferred<SessionSuggestionsListResult>();
+  const resolvedResponse = createDeferred<{ suggestion: SessionSuggestion }>();
+  const request = vi.fn((method: string) => {
+    if (method === "session.suggestions.resolve") {
+      return resolvedResponse.promise;
+    }
+    if (method === "session.suggestions.list") {
+      return listed.promise;
+    }
+    throw new Error(`unexpected method: ${method}`);
+  });
+  const { pane, state } = createSuggestionPane(request);
+  pane.context.gateway.snapshot.selfUser = { id: "owner" } as never;
+  selectSuggestionRows(state, suggestionRow(state));
+  const pending = pendingSuggestion(state, "owner", "resolved suggestion", suggestionOwner);
+  const resolved = { ...pending, state: "accepted" as const };
+  pane.sessionSuggestionRole = "owner";
+  pane.sessionSuggestions = [pending];
+
+  const resolving = pane.resolveCurrentSessionSuggestion(pending, "queue");
+  expect(request).toHaveBeenCalledTimes(1);
+  pane.handleSessionSuggestionEvent({ action: "resolved", suggestion: resolved });
+  expect(pane.sessionSuggestions).toEqual([resolved]);
+  expect(request).toHaveBeenCalledTimes(2);
+
+  listed.resolve({ suggestions: [resolved], role: "owner" });
+  await vi.waitFor(() => expect(pane.sessionSuggestions).toEqual([resolved]));
+  resolvedResponse.resolve({ suggestion: resolved });
+  await resolving;
+
+  expect(pane.sessionSuggestions).toEqual([resolved]);
+  expect(pane.sessionSuggestionRole).toBe("owner");
+});
+
+it("drops a resolve completion after the same session key rotates instances", async () => {
+  const response = createDeferred<{ suggestion: SessionSuggestion }>();
+  const { pane, state } = barePane(vi.fn(() => response.promise));
+  const session = (sessionId: string) => suggestionRow(state, sessionId);
+  const suggestion = pendingSuggestion(state, "old", "old suggestion", suggestionOwner);
+  pane.context.gateway.snapshot.selfUser = { id: "owner" } as never;
+  pane.syncSessionSuggestionTarget("main", session("session-a"));
+  pane.sessionSuggestions = [suggestion];
+
+  const resolving = pane.resolveCurrentSessionSuggestion(suggestion, "queue");
+  pane.syncSessionSuggestionTarget("main", session("session-b"));
+  response.resolve({ suggestion: { ...suggestion, state: "accepted" } });
+  await resolving;
+
+  expect(pane.sessionSuggestions).toEqual([]);
+  expect(state.chatError).toBeNull();
+});
+
+it("does not apply an edit failure after the same session key rotates instances", async () => {
+  const deferred = createDeferred<never>();
+  const { pane, state } = editablePane(vi.fn(() => deferred.promise));
+  const suggestion = pendingSuggestion(state, "edit", "suggested text");
+  pane.sessionSuggestionTargetSignature = "main\0agent:main:current\0session-a";
+  state.chatMessage = "original";
+  const pending = pane.resolveCurrentSessionSuggestion(suggestion, "edit");
+  pane.sessionSuggestionTargetSignature = "main\0agent:main:current\0session-b";
+  pane.resetSessionSuggestions();
+  state.chatMessage = "new session draft";
+  deferred.reject(new Error("old request failed"));
+
+  await pending;
+  expect(state.chatMessage).toBe("new session draft");
+  expect(state.chatError).not.toBe("old request failed");
+});
+
+it.each([false, true])(
+  "restores only an untouched owner draft after an edit rejection (reselected=%s)",
+  async (reselected) => {
+    const deferred = createDeferred<never>();
+    const { pane, state } = barePane(vi.fn(() => deferred.promise));
+    const suggestion = pendingSuggestion(state, "edit-rejected", "@Alex rejected suggestion");
+    state.handleChatDraftChange = (next, mentions) => handleChatDraftChange(state, next, mentions);
+    state.chatMessage = "@Alex owner draft";
+    state.chatMentions = [{ profileId: "original-profile", start: 0, end: 5 }];
+
+    const resolving = pane.resolveCurrentSessionSuggestion(suggestion, "edit");
+    expect(state.chatMentions).toEqual([]);
+    if (reselected) {
+      state.handleChatDraftChange(suggestion.text, [
+        { profileId: "replacement-profile", start: 0, end: 5 },
+      ]);
+    }
+    deferred.reject(rejectedSuggestion("suggestion already resolved"));
+    await resolving;
+
+    expect(state.chatMessage).toBe(reselected ? suggestion.text : "@Alex owner draft");
+    expect(state.chatMentions).toEqual([
+      { profileId: reselected ? "replacement-profile" : "original-profile", start: 0, end: 5 },
+    ]);
+    expect(state.chatError).toBe("suggestion already resolved");
+  },
+);
+
+it("serializes edit resolutions so rejected suggestions cannot snapshot each other", async () => {
+  const { first, second, request } = deferredPair<never>();
+  const { pane, state } = editablePane(request);
+  const suggestion = (id: string) => pendingSuggestion(state, id);
+  state.chatMessage = "owner draft";
+
+  const firstPending = pane.resolveCurrentSessionSuggestion(suggestion("first"), "edit");
+  await pane.resolveCurrentSessionSuggestion(suggestion("second"), "edit");
+  expect(request).toHaveBeenCalledTimes(1);
+  expect(state.chatMessage).toBe("first");
+
+  first.reject(rejectedSuggestion("first was rejected"));
+  await firstPending;
+  expect(state.chatMessage).toBe("owner draft");
+
+  const secondPending = pane.resolveCurrentSessionSuggestion(suggestion("second"), "edit");
+  second.reject(rejectedSuggestion("second was rejected"));
+  await secondPending;
+  expect(request).toHaveBeenCalledTimes(2);
+  expect(state.chatMessage).toBe("owner draft");
+});
 function createConfirmationOwner() {
   const owner = document.createElement("span");
   owner.className = "chat-confirm-wrap";
@@ -518,6 +512,21 @@ function createConfirmationOwner() {
   const popover = [...document.querySelectorAll<HTMLElement>(".chat-confirm-popover")].at(-1);
   expect(popover).toBeInstanceOf(HTMLElement);
   return { owner, popover: popover! };
+}
+
+function watchCapture(target: Document | Window, type: "click" | "keydown") {
+  const add = vi.spyOn(target, "addEventListener");
+  const remove = vi.spyOn(target, "removeEventListener");
+  return () => {
+    const captured = add.mock.calls.flatMap(([event, listener, options]) =>
+      event === type && options === true && listener ? [listener] : [],
+    );
+    expect(captured).toHaveLength(2);
+    return () => {
+      expect(remove).toHaveBeenCalledWith(type, captured[0], true);
+      expect(remove).not.toHaveBeenCalledWith(type, captured[1], true);
+    };
+  };
 }
 
 afterEach(() => {
@@ -542,16 +551,7 @@ it("dismisses only confirmations owned by the disconnected pane", () => {
       return frameCallbacks.length;
     }),
   );
-  const listeners = (
-    [
-      [document, "click"],
-      [window, "keydown"],
-    ] as const
-  ).map(([target, type]) => ({
-    type,
-    add: vi.spyOn(target, "addEventListener"),
-    remove: vi.spyOn(target, "removeEventListener"),
-  }));
+  const listeners = [watchCapture(document, "click"), watchCapture(window, "keydown")];
   const { pane } = barePane();
   window.localStorage.removeItem(SKIP_REWIND_CONFIRM_PREFERENCE);
   const paneConfirmation = createConfirmationOwner();
@@ -560,20 +560,13 @@ it("dismisses only confirmations owned by the disconnected pane", () => {
   for (const callback of frameCallbacks.splice(0)) {
     callback(0);
   }
-  const captures = listeners.map(({ type, add, remove }) => {
-    const captured = add.mock.calls.flatMap(([event, listener, options]) =>
-      event === type && options === true && listener ? [listener] : [],
-    );
-    expect(captured).toHaveLength(2);
-    return { type, captured, remove };
-  });
+  const checkRemovals = listeners.map((capture) => capture());
   pane.appendChild(paneConfirmation.owner);
   pane.disconnectedCallback();
 
   expect(paneConfirmation.popover.isConnected).toBe(false);
   expect(siblingConfirmation.popover.isConnected).toBe(true);
-  for (const { type, captured, remove } of captures) {
-    expect(remove).toHaveBeenCalledWith(type, captured[0], true);
-    expect(remove).not.toHaveBeenCalledWith(type, captured[1], true);
+  for (const check of checkRemovals) {
+    check();
   }
 });

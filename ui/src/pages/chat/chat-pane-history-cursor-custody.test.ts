@@ -74,20 +74,11 @@ function delta(row: GatewaySessionRow): ChatHistoryResponse {
 }
 
 async function fixture() {
-  const slots: Array<{
-    issued: ReturnType<typeof createDeferred<Parameters<GatewayRequestHandler>>>;
-    response: ReturnType<typeof createDeferred<ChatHistoryResponse>>;
-  }> = [];
-  const allSlots: typeof slots = [];
+  const responses: Array<ReturnType<typeof createDeferred<ChatHistoryResponse>>> = [];
   const pending: Promise<void>[] = [];
-  const request = vi.fn<GatewayRequestHandler>((...args) => {
-    const slot = slots.shift();
-    if (!slot) {
-      return asOptionalRecord(args[1])?.cursor ? delta(idle) : page();
-    }
-    slot.issued.resolve(args);
-    return slot.response.promise;
-  });
+  const request = vi.fn<GatewayRequestHandler>((_method, params) =>
+    asOptionalRecord(params)?.cursor ? delta(idle) : page(),
+  );
   const mounted = createMountedPanes([idle], "main", undefined, {
     "chat.history": request,
     "chat.startup": request,
@@ -105,13 +96,14 @@ async function fixture() {
     state,
     request,
     arm() {
-      const slot = {
-        issued: createDeferred<Parameters<GatewayRequestHandler>>(),
-        response: createDeferred<ChatHistoryResponse>(),
-      };
-      slots.push(slot);
-      allSlots.push(slot);
-      return slot;
+      const issued = createDeferred<Parameters<GatewayRequestHandler>>();
+      const response = createDeferred<ChatHistoryResponse>();
+      request.mockImplementationOnce((...args) => {
+        issued.resolve(args);
+        return response.promise;
+      });
+      responses.push(response);
+      return { issued, response };
     },
     refresh(target = state) {
       const operation = refreshPageChat(target, {
@@ -146,8 +138,8 @@ async function fixture() {
       return { runId, stream, toolIdentity, tool: target.toolStreamById.get(toolIdentity) };
     },
     async finish() {
-      for (const slot of allSlots) {
-        slot.response.resolve(delta(idle));
+      for (const response of responses) {
+        response.resolve(delta(idle));
       }
       await Promise.allSettled(pending);
       await vi.dynamicImportSettled();

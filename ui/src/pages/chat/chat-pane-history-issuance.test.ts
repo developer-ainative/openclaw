@@ -4,7 +4,6 @@ import { expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
 import type { AgentsListResult } from "../../api/types.ts";
-import type { ApplicationContext } from "../../app/context.ts";
 import {
   createGatewayHarness,
   createTestSessionCapability,
@@ -37,9 +36,7 @@ function createCanonicalRoutePane(
     mainKey: "main",
     mainSessionKey: "agent:main:main",
   };
-  const hello = { snapshot: { sessionDefaults } } as unknown as NonNullable<
-    ApplicationContext["gateway"]["snapshot"]["hello"]
-  >;
+  const hello = { snapshot: { sessionDefaults } } as NonNullable<typeof state.hello>;
   state.hello = hello;
   state.settings = {
     sessionKey: state.sessionKey,
@@ -98,7 +95,7 @@ it("does not request the optional header platform while initial history is pendi
     subscribed.resolve();
     await historyStarted.promise;
     expect(requestCalls(request, "chat.startup")).toHaveLength(1);
-    expect(request.mock.calls.filter(([method]) => method === "system.info")).toEqual([]);
+    expect(requestCalls(request, "system.info")).toEqual([]);
   } finally {
     history.resolve(assistantHistory("Selected transcript"));
     await history.promise;
