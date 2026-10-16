@@ -17,6 +17,12 @@ import { updateRunStepsFromResultStep } from "./update-run-step.js";
 const dirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => vi.restoreAllMocks());
 
+const readText = (...parts: string[]) => fs.readFile(path.join(...parts), "utf8");
+
+async function expectVersion(root: string, version: string) {
+  expect(await readText(root, "package.json")).toContain(`"version":"${version}"`);
+}
+
 describe("retained package backup retirement", () => {
   it("keeps launcher evidence with a published transaction when mutation admission throws", async () => {
     await withTestDir({ prefix: "openclaw-retained-admission-" }, async (base) => {
@@ -40,60 +46,53 @@ describe("retained package backup retirement", () => {
         entry.startsWith(".openclaw.shim-backup-"),
       );
       expect(backup).toBeDefined();
-      await expect(fs.readFile(path.join(globalRoot, backup!, "openclaw"), "utf8")).resolves.toBe(
-        "old launcher\n",
-      );
-      await expect(fs.readFile(launcher, "utf8")).resolves.toBe("old launcher\n");
+      await expect(readText(globalRoot, backup!, "openclaw")).resolves.toBe("old launcher\n");
+      await expect(readText(launcher)).resolves.toBe("old launcher\n");
       expect(await transaction!.rollback(() => {})).toMatchObject({ exitCode: 0 });
       expect(await transaction!.complete({ activationVerified: false }, () => {})).toBeUndefined();
       expect(await fs.readdir(globalRoot)).toEqual(["openclaw"]);
     });
   });
 
-  it.each([true])(
-    "does not copy or remove the old package after a denied backup rename (caller verified=%s)",
-    async (activationVerified) => {
-      await withTestDir({ prefix: "openclaw-retained-backup-" }, async (base) => {
-        const { params, packageRoot, launcher } = await createPackageSwapFixture(base);
-        const rename = fs.rename.bind(fs);
-        const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
-          if (String(args[0]) === packageRoot) {
-            throw Object.assign(new Error("cross-device move"), { code: "EXDEV" });
-          }
-          return rename(...args);
-        });
-        let transaction: PackageUpdateTransaction | undefined;
-        let result;
-        try {
-          result = await swapStagedPackageInstall({
-            ...params,
-            onTransaction: (value) => {
-              transaction = value;
-            },
-          });
-        } finally {
-          renameSpy.mockRestore();
+  it("does not copy or remove the old package after a denied backup rename", async () => {
+    await withTestDir({ prefix: "openclaw-retained-backup-" }, async (base) => {
+      const { params, packageRoot, launcher } = await createPackageSwapFixture(base);
+      const rename = fs.rename.bind(fs);
+      const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
+        if (String(args[0]) === packageRoot) {
+          throw Object.assign(new Error("cross-device move"), { code: "EXDEV" });
         }
-        expect(transaction).toBeDefined();
-        expect(result).toMatchObject({ status: "failed", activePackageRoot: packageRoot });
-        const snapshots = `${transaction!.backupRoot}.databases`;
-        await fs.mkdir(snapshots);
-        const completion = await transaction!.complete({ activationVerified }, () => {});
-        await expect(fs.stat(snapshots)).resolves.toBeDefined();
-        await expect(fs.readFile(path.join(packageRoot, "dist", "index.js"), "utf8")).resolves.toBe(
-          "export {};\n",
-        );
-        await expect(fs.stat(transaction!.backupRoot)).rejects.toMatchObject({
-          code: "ENOENT",
-        });
-        await expect(fs.readFile(launcher, "utf8")).resolves.toBe("old launcher\n");
-        expect(completion).toMatchObject({
-          exitCode: 1,
-          stderrTail: expect.stringContaining("Installation recovery is unverified"),
-        });
+        return rename(...args);
       });
-    },
-  );
+      let transaction: PackageUpdateTransaction | undefined;
+      let result;
+      try {
+        result = await swapStagedPackageInstall({
+          ...params,
+          onTransaction: (value) => {
+            transaction = value;
+          },
+        });
+      } finally {
+        renameSpy.mockRestore();
+      }
+      expect(transaction).toBeDefined();
+      expect(result).toMatchObject({ status: "failed", activePackageRoot: packageRoot });
+      const snapshots = `${transaction!.backupRoot}.databases`;
+      await fs.mkdir(snapshots);
+      const completion = await transaction!.complete({ activationVerified: true }, () => {});
+      await expect(fs.stat(snapshots)).resolves.toBeDefined();
+      await expect(readText(packageRoot, "dist", "index.js")).resolves.toBe("export {};\n");
+      await expect(fs.stat(transaction!.backupRoot)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(readText(launcher)).resolves.toBe("old launcher\n");
+      expect(completion).toMatchObject({
+        exitCode: 1,
+        stderrTail: expect.stringContaining("Installation recovery is unverified"),
+      });
+    });
+  });
 
   it("preserves replacement, later-created, and unrelated recovery artifacts after activation", async () => {
     const base = await fs.realpath(dirs.make("openclaw-historical-backup-replaced-"));
@@ -123,15 +122,13 @@ describe("retained package backup retirement", () => {
       advisory: { kind: "recoverable-maintenance", message: expect.stringContaining(replaced) },
     });
     for (const directory of [replaced, later]) {
-      expect(await fs.readFile(path.join(directory, "sentinel"), "utf8")).toBe("successor bytes");
+      expect(await readText(directory, "sentinel")).toBe("successor bytes");
     }
     for (const name of [
       ".openclaw.package-backup-1-100.candidate",
       ".openclaw.package-backup-manual",
     ]) {
-      expect(await fs.readFile(path.join(globalRoot, name, "sentinel"), "utf8")).toBe(
-        "recovery bytes",
-      );
+      expect(await readText(globalRoot, name, "sentinel")).toBe("recovery bytes");
     }
     expect(await transaction.complete({ activationVerified: true }, () => {})).toBe(completion);
   });
@@ -189,9 +186,7 @@ describe("retained package backup retirement", () => {
       exitCode: 1,
       advisory: { kind: "recoverable-maintenance", message: expect.stringContaining(retained) },
     });
-    expect(await fs.readFile(path.join(retained, "snapshot.sqlite"), "utf8")).toBe(
-      "pre-migration bytes",
-    );
+    expect(await readText(retained, "snapshot.sqlite")).toBe("pre-migration bytes");
     expect(await transaction.complete({ activationVerified: true }, () => {})).toBe(completion);
   });
 });
@@ -226,9 +221,7 @@ describe("launcher backup capture", () => {
       );
       expect(beforeActivate).not.toHaveBeenCalled();
       expect((await fs.lstat(launcher)).ino).toBe(original.ino);
-      expect(await fs.readFile(path.join(packageRoot, "package.json"), "utf8")).toContain(
-        '"version":"1.0.0"',
-      );
+      await expectVersion(packageRoot, "1.0.0");
       expect(await fs.lstat(backup)).toBeDefined();
       expect(result.step.stderrTail).toContain("../lib/node_modules/openclaw/package.json");
       expect(result.step.stderrTail).toContain("different-target");
@@ -236,138 +229,120 @@ describe("launcher backup capture", () => {
     },
   );
 
-  it.each([true])(
-    "preserves the installation after a launcher backup failure (cleanup denied=%s)",
-    async (cleanupDenied) => {
-      await withTestDir({ prefix: "openclaw-partial-launcher-backup-" }, async (base) => {
-        const { params, packageRoot, globalRoot, launcher } = await createPackageSwapFixture(base);
-        const secondLauncher = `${launcher}.cmd`;
-        await fs.writeFile(secondLauncher, "old command launcher\n");
-        await fs.writeFile(
-          path.join(params.stage.layout.binDir, "openclaw.cmd"),
-          "candidate command launcher\n",
-        );
-        const originals = await Promise.all(
-          [packageRoot, launcher, secondLauncher].map(async (entry) => (await fs.lstat(entry)).ino),
-        );
-        const prototype = Object.getPrototypeOf(await fsSafeRoot(base)) as Root;
-        // oxlint-disable-next-line typescript/unbound-method -- Called below with the intercepted Root receiver to preserve its path and mutation authority.
-        const copyIn = prototype.copyIn;
-        // oxlint-disable-next-line typescript/unbound-method -- Called below with the intercepted Root receiver to preserve its path and mutation authority.
-        const removeEntry = prototype.remove;
-        const rename = fs.rename.bind(fs);
-        let copyRefusals = 0;
-        let cleanupRefusals = 0;
-        let retirementRefusals = 0;
-        const remove = vi.spyOn(prototype, "remove").mockImplementation(async function (
-          this: Root,
-          relativePath,
-          options,
+  it("preserves the installation after launcher backup and cleanup fail", async () => {
+    await withTestDir({ prefix: "openclaw-partial-launcher-backup-" }, async (base) => {
+      const { params, packageRoot, globalRoot, launcher } = await createPackageSwapFixture(base);
+      const secondLauncher = `${launcher}.cmd`;
+      await fs.writeFile(secondLauncher, "old command launcher\n");
+      await fs.writeFile(
+        path.join(params.stage.layout.binDir, "openclaw.cmd"),
+        "candidate command launcher\n",
+      );
+      const originals = await Promise.all(
+        [packageRoot, launcher, secondLauncher].map(async (entry) => (await fs.lstat(entry)).ino),
+      );
+      const prototype = Object.getPrototypeOf(await fsSafeRoot(base)) as Root;
+      // oxlint-disable-next-line typescript/unbound-method -- Called below with the intercepted Root receiver to preserve its path and mutation authority.
+      const copyIn = prototype.copyIn;
+      // oxlint-disable-next-line typescript/unbound-method -- Called below with the intercepted Root receiver to preserve its path and mutation authority.
+      const removeEntry = prototype.remove;
+      const rename = fs.rename.bind(fs);
+      let copyRefusals = 0;
+      let cleanupRefusals = 0;
+      let retirementRefusals = 0;
+      const remove = vi.spyOn(prototype, "remove").mockImplementation(async function (
+        this: Root,
+        relativePath,
+        options,
+      ) {
+        const target = path.resolve(this.rootReal, relativePath);
+        // Let each copy finish cleaning its private staging directory first.
+        if (
+          path.basename(target) === path.basename(launcher) &&
+          path.basename(path.dirname(target)).startsWith(".openclaw.shim-backup-")
         ) {
-          const target = path.resolve(this.rootReal, relativePath);
-          // Let each copy finish cleaning its private staging directory first.
-          if (
-            cleanupDenied &&
-            path.basename(target) === path.basename(launcher) &&
-            path.basename(path.dirname(target)).startsWith(".openclaw.shim-backup-")
-          ) {
-            cleanupRefusals += 1;
-            throw Object.assign(new Error("backup cleanup denied"), { code: "EACCES" });
-          }
-          return removeEntry.call(this, relativePath, options);
-        });
-        const move = vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
-          if (
-            cleanupDenied &&
-            path.basename(String(args[0])).startsWith(".openclaw.shim-backup-")
-          ) {
-            retirementRefusals += 1;
-            throw Object.assign(new Error("backup retirement denied"), { code: "EACCES" });
-          }
-          return rename(...args);
-        });
-        let firstBackup: string | undefined;
-        const copy = vi.spyOn(prototype, "copyIn").mockImplementation(async function (
-          this: Root,
-          destination,
-          source,
-          options,
-        ) {
-          if (source === secondLauncher) {
-            const backupDir = (await fs.readdir(globalRoot)).find((entry) =>
-              entry.startsWith(".openclaw.shim-backup-"),
-            );
-            if (!backupDir) {
-              throw new Error("missing partial launcher backup");
-            }
-            firstBackup = await fs.readFile(path.join(globalRoot, backupDir, "openclaw"), "utf8");
-            copyRefusals += 1;
-            throw new Error("second launcher backup refused");
-          }
-          await copyIn.call(this, destination, source, options);
-        });
-        const beforeActivate = vi.fn();
-        const onLiveMutation = vi.fn();
-        const onTransaction = vi.fn();
-        let result;
-        try {
-          result = await swapStagedPackageInstall({
-            ...params,
-            beforeActivate,
-            onLiveMutation,
-            onTransaction,
-          });
-        } finally {
-          copy.mockRestore();
-          remove.mockRestore();
-          move.mockRestore();
+          cleanupRefusals += 1;
+          throw Object.assign(new Error("backup cleanup denied"), { code: "EACCES" });
         }
-        expect(copyRefusals).toBe(1);
-        expect(cleanupRefusals).toBe(cleanupDenied ? 1 : 0);
-        expect(retirementRefusals).toBe(cleanupDenied ? 1 : 0);
-        expect(firstBackup).toBe("old launcher\n");
-        expect(result).toMatchObject({
-          status: "failed",
-          activePackageRoot: packageRoot,
-          packageRollbackVerified: false,
-          step: {
-            exitCode: 1,
-            stderrTail: expect.stringContaining("second launcher backup refused"),
-          },
-        });
-        expect(beforeActivate).not.toHaveBeenCalled();
-        expect(result.step.stderrTail).not.toContain("Installation recovery is unverified");
-        expect(onLiveMutation).not.toHaveBeenCalled();
-        expect(onTransaction).not.toHaveBeenCalled();
-        expect(
-          await Promise.all(
-            [packageRoot, launcher, secondLauncher].map(
-              async (entry) => (await fs.lstat(entry)).ino,
-            ),
-          ),
-        ).toEqual(originals);
-        await expect(
-          fs.readFile(path.join(packageRoot, "package.json"), "utf8"),
-        ).resolves.toContain('"version":"1.0.0"');
-        await expect(fs.readFile(launcher, "utf8")).resolves.toBe("old launcher\n");
-        await expect(fs.readFile(secondLauncher, "utf8")).resolves.toBe("old command launcher\n");
-        const remaining = await fs.readdir(globalRoot);
-        if (cleanupDenied) {
-          expect(remaining).toHaveLength(2);
-          expect(remaining).toContain("openclaw");
-          const backup = remaining.find((entry) => entry.startsWith(".openclaw.shim-backup-"));
-          expect(backup).toBeDefined();
-          await expect(
-            fs.readFile(path.join(globalRoot, backup!, "openclaw"), "utf8"),
-          ).resolves.toBe("old launcher\n");
-          expect(result.step.stderrTail).toContain("preserved shim backup");
-        } else {
-          expect(remaining).toEqual(["openclaw"]);
-          expect(result.step.stderrTail).toBe("second launcher backup refused");
-        }
+        return removeEntry.call(this, relativePath, options);
       });
-    },
-  );
+      const move = vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
+        if (path.basename(String(args[0])).startsWith(".openclaw.shim-backup-")) {
+          retirementRefusals += 1;
+          throw Object.assign(new Error("backup retirement denied"), { code: "EACCES" });
+        }
+        return rename(...args);
+      });
+      let firstBackup: string | undefined;
+      const copy = vi.spyOn(prototype, "copyIn").mockImplementation(async function (
+        this: Root,
+        destination,
+        source,
+        options,
+      ) {
+        if (source === secondLauncher) {
+          const backupDir = (await fs.readdir(globalRoot)).find((entry) =>
+            entry.startsWith(".openclaw.shim-backup-"),
+          );
+          if (!backupDir) {
+            throw new Error("missing partial launcher backup");
+          }
+          firstBackup = await readText(globalRoot, backupDir, "openclaw");
+          copyRefusals += 1;
+          throw new Error("second launcher backup refused");
+        }
+        await copyIn.call(this, destination, source, options);
+      });
+      const beforeActivate = vi.fn();
+      const onLiveMutation = vi.fn();
+      const onTransaction = vi.fn();
+      let result;
+      try {
+        result = await swapStagedPackageInstall({
+          ...params,
+          beforeActivate,
+          onLiveMutation,
+          onTransaction,
+        });
+      } finally {
+        copy.mockRestore();
+        remove.mockRestore();
+        move.mockRestore();
+      }
+      expect(copyRefusals).toBe(1);
+      expect(cleanupRefusals).toBe(1);
+      expect(retirementRefusals).toBe(1);
+      expect(firstBackup).toBe("old launcher\n");
+      expect(result).toMatchObject({
+        status: "failed",
+        activePackageRoot: packageRoot,
+        packageRollbackVerified: false,
+        step: {
+          exitCode: 1,
+          stderrTail: expect.stringContaining("second launcher backup refused"),
+        },
+      });
+      expect(beforeActivate).not.toHaveBeenCalled();
+      expect(result.step.stderrTail).not.toContain("Installation recovery is unverified");
+      expect(onLiveMutation).not.toHaveBeenCalled();
+      expect(onTransaction).not.toHaveBeenCalled();
+      expect(
+        await Promise.all(
+          [packageRoot, launcher, secondLauncher].map(async (entry) => (await fs.lstat(entry)).ino),
+        ),
+      ).toEqual(originals);
+      await expect(readText(packageRoot, "package.json")).resolves.toContain('"version":"1.0.0"');
+      await expect(readText(launcher)).resolves.toBe("old launcher\n");
+      await expect(readText(secondLauncher)).resolves.toBe("old command launcher\n");
+      const remaining = await fs.readdir(globalRoot);
+      expect(remaining).toHaveLength(2);
+      expect(remaining).toContain("openclaw");
+      const backup = remaining.find((entry) => entry.startsWith(".openclaw.shim-backup-"));
+      expect(backup).toBeDefined();
+      await expect(readText(globalRoot, backup!, "openclaw")).resolves.toBe("old launcher\n");
+      expect(result.step.stderrTail).toContain("preserved shim backup");
+    });
+  });
 });
 
 describe("launcher observations", () => {
@@ -401,12 +376,10 @@ describe("launcher observations", () => {
         expect(result.step.stderrTail).toContain(replacement);
         expect(onLiveMutation).not.toHaveBeenCalled();
         expect(await fs.readlink(launcher)).toBe(replacement);
-        expect(await fs.readFile(path.join(packageRoot, "package.json"), "utf8")).toContain(
-          '"version":"1.0.0"',
-        );
+        await expectVersion(packageRoot, "1.0.0");
       } else {
         expect(result.status, result.step.stderrTail ?? "").toBe("committed");
-        expect(await fs.readFile(launcher, "utf8")).toBe("candidate launcher\n");
+        expect(await readText(launcher)).toBe("candidate launcher\n");
       }
     },
   );
@@ -438,7 +411,7 @@ describe("launcher observations", () => {
       });
       expect(injected).toBe(true);
       expect(result).toMatchObject({ status: "failed", packageRollbackVerified: true });
-      expect(await fs.readFile(launcher, "utf8")).toBe("old launcher\n");
+      expect(await readText(launcher)).toBe("old launcher\n");
     },
   );
 });
@@ -485,12 +458,10 @@ describe("retained package transaction authority", () => {
       expect(copy).not.toHaveBeenCalled();
       expect((await fs.lstat(launcher)).ino).toBe(launcherIdentity);
       await expect(fs.lstat(packageRoot)).rejects.toMatchObject({ code: "ENOENT" });
-      await expect(fs.readFile(path.join(candidate, "package.json"), "utf8")).resolves.toContain(
-        '"version":"2.0.0"',
+      await expectVersion(candidate, "2.0.0");
+      await expect(readText(transaction.backupRoot, "package.json")).resolves.toContain(
+        '"version":"1.0.0"',
       );
-      await expect(
-        fs.readFile(path.join(transaction.backupRoot, "package.json"), "utf8"),
-      ).resolves.toContain('"version":"1.0.0"');
     });
   });
 
@@ -609,14 +580,12 @@ describe("retained package transaction authority", () => {
         expect(await fs.readdir(path.dirname(launcher))).toEqual(["openclaw"]);
         await expect(fs.stat(path.join(globalRoot, shimBackup))).resolves.toBeDefined();
         if (boundary === "integrity") {
-          await expect(
-            fs.readFile(path.join(packageRoot, "package.json"), "utf8"),
-          ).resolves.toContain('"version":"2.0.0"');
+          await expect(readText(packageRoot, "package.json")).resolves.toContain(
+            '"version":"2.0.0"',
+          );
           expect(renameSpy).not.toHaveBeenCalled();
         } else {
-          await expect(
-            fs.readFile(path.join(candidate, "package.json"), "utf8"),
-          ).resolves.toContain('"version":"2.0.0"');
+          await expect(readText(candidate, "package.json")).resolves.toContain('"version":"2.0.0"');
         }
         if (boundary === "displacement" || boundary === "compensation") {
           await expect(fs.lstat(packageRoot)).rejects.toMatchObject({ code: "ENOENT" });
@@ -625,10 +594,8 @@ describe("retained package transaction authority", () => {
           boundary === "launcher" || boundary === "retirement"
             ? packageRoot
             : transaction.backupRoot;
-        await expect(fs.readFile(path.join(previous, "package.json"), "utf8")).resolves.toContain(
-          '"version":"1.0.0"',
-        );
-        await expect(fs.readFile(launcher, "utf8")).resolves.toBe(
+        await expectVersion(previous, "1.0.0");
+        await expect(readText(launcher)).resolves.toBe(
           boundary === "retirement" ? "old launcher\n" : "candidate launcher\n",
         );
       });
@@ -671,12 +638,10 @@ describe("retained package transaction authority", () => {
       expect(rename).not.toHaveBeenCalled();
       expect(unlink).not.toHaveBeenCalled();
       expect(rmdir).not.toHaveBeenCalled();
-      await expect(
-        fs.readFile(path.join(transaction.backupRoot, "package.json"), "utf8"),
-      ).resolves.toContain('"version":"1.0.0"');
-      await expect(fs.readFile(path.join(packageRoot, "package.json"), "utf8")).resolves.toContain(
-        '"version":"2.0.0"',
+      await expect(readText(transaction.backupRoot, "package.json")).resolves.toContain(
+        '"version":"1.0.0"',
       );
+      await expectVersion(packageRoot, "2.0.0");
     });
   });
 });
