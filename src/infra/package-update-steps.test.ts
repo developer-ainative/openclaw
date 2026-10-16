@@ -35,14 +35,27 @@ function createFsError(code: string, message = code): NodeJS.ErrnoException {
   return Object.assign(new Error(message), { code });
 }
 
-async function expectPathMissing(filePath: string): Promise<void> {
-  try {
-    await fs.access(filePath);
-  } catch (error) {
-    expect((error as NodeJS.ErrnoException).code).toBe("ENOENT");
-    return;
+const expectPathMissing = (filePath: string) =>
+  expect(fs.access(filePath)).rejects.toMatchObject({ code: "ENOENT" });
+
+const readText = (...parts: string[]) => fs.readFile(path.join(...parts), "utf8");
+const expectText = (...parts: string[]) => expect(readText(...parts)).resolves;
+
+async function npmPackage(base: string, existing = true) {
+  const prefix = path.join(base, "prefix");
+  const globalRoot = path.join(prefix, "lib", "node_modules");
+  const packageRoot = path.join(globalRoot, "openclaw");
+  if (existing) {
+    await writePackageRoot(packageRoot, "1.0.0");
   }
-  throw new Error(`Expected missing path: ${filePath}`);
+  return { prefix, globalRoot, packageRoot };
+}
+
+async function stagePackage(argv: string[], version = "2.0.0") {
+  const prefix = stagedNpmPrefix(argv);
+  const root = path.join(prefix, "lib", "node_modules", "openclaw");
+  await writePackageRoot(root, version);
+  return { prefix, root };
 }
 
 describe("runGlobalPackageUpdateSteps", () => {
@@ -92,9 +105,7 @@ describe("runGlobalPackageUpdateSteps", () => {
       expect(result.failedStep).toBeNull();
       expect(result.activePackageRoot).toBe(packageRoot);
       expect(result.afterVersion).toBe("2.0.0");
-      await expect(fs.readFile(path.join(packageRoot, "package.json"), "utf8")).resolves.toContain(
-        '"version":"2.0.0"',
-      );
+      await expectText(packageRoot, "package.json").toContain('"version":"2.0.0"');
       if (process.platform !== "win32") {
         await expect(fs.lstat(path.join(packageRoot, "dist", "index.js"))).resolves.toMatchObject({
           nlink: 2,
@@ -106,9 +117,7 @@ describe("runGlobalPackageUpdateSteps", () => {
 
   it("rejects npm pack output overflow before installation", async () => {
     await withTestDir({ prefix: "openclaw-package-update-npm-pack-" }, async (base) => {
-      const globalRoot = path.join(base, "prefix", "lib", "node_modules");
-      const packageRoot = path.join(globalRoot, "openclaw");
-      await writePackageRoot(packageRoot, "1.0.0");
+      const { globalRoot, packageRoot } = await npmPackage(base);
       let packDir: string | undefined;
       const runStep = vi.fn(async ({ name, argv, cwd }): Promise<PackageUpdateStepResult> => {
         packDir = argv[argv.indexOf("--pack-destination") + 1];
@@ -126,9 +135,7 @@ describe("runGlobalPackageUpdateSteps", () => {
       });
       expect(runStep).toHaveBeenCalledOnce();
       expect(runStep.mock.calls[0]?.[0].timeoutMs).toBeUndefined();
-      await expect(fs.readFile(path.join(packageRoot, "package.json"), "utf8")).resolves.toContain(
-        '"version":"1.0.0"',
-      );
+      await expectText(packageRoot, "package.json").toContain('"version":"1.0.0"');
       if (!packDir) {
         throw new Error("expected npm pack directory");
       }
@@ -138,10 +145,8 @@ describe("runGlobalPackageUpdateSteps", () => {
 
   it("packs an aliased hosted GitHub URL and installs without an implicit deadline", async () => {
     await withTestDir({ prefix: "openclaw-package-update-npm-pack-variant-" }, async (base) => {
-      const globalRoot = path.join(base, "prefix", "lib", "node_modules");
-      const packageRoot = path.join(globalRoot, "openclaw");
+      const { globalRoot } = await npmPackage(base);
       const sourceSpec = "openclaw@https://github.com/openclaw/openclaw#main";
-      await writePackageRoot(packageRoot, "1.0.0");
       let tarball: string | undefined;
       const runStep = vi.fn(async ({ name, argv, cwd }): Promise<PackageUpdateStepResult> => {
         if (name === "package-pack") {
@@ -168,8 +173,7 @@ describe("runGlobalPackageUpdateSteps", () => {
         expect(argv).toContain(tarball);
         expect(argv).toContain(`--allow-scripts=${tarball}`);
         expect(cwd).toBe(path.dirname(tarball));
-        const stagePrefix = stagedNpmPrefix(argv);
-        await writePackageRoot(path.join(stagePrefix, "lib", "node_modules", "openclaw"), "2.0.0");
+        await stagePackage(argv);
         return packageUpdateStepResult({ name, argv, cwd });
       });
       const result = await runGlobalPackageUpdateSteps({
@@ -196,9 +200,7 @@ describe("runGlobalPackageUpdateSteps", () => {
 
   it("swaps staged npm package roots through the copy fallback when rename crosses devices", async () => {
     await withTestDir({ prefix: "openclaw-package-update-exdev-" }, async (base) => {
-      const prefix = path.join(base, "prefix");
-      const globalRoot = path.join(prefix, "lib", "node_modules");
-      const packageRoot = path.join(globalRoot, "openclaw");
+      const { globalRoot, packageRoot } = await npmPackage(base, false);
 
       const realRename = fs.rename.bind(fs);
       let stagedPackageRoot: string | undefined;
@@ -223,9 +225,8 @@ describe("runGlobalPackageUpdateSteps", () => {
           ...createNpmUpdateOptions(globalRoot),
           packageRoot,
           runStep: async ({ name, argv, cwd }) => {
-            const stagePrefix = stagedNpmPrefix(argv);
-            const stageLayout = resolveNpmGlobalPrefixLayoutFromPrefix(stagePrefix);
-            stagedPackageRoot = path.join(stageLayout.globalRoot, "openclaw");
+            const layout = resolveNpmGlobalPrefixLayoutFromPrefix(stagedNpmPrefix(argv));
+            stagedPackageRoot = path.join(layout.globalRoot, "openclaw");
             await writePackageRoot(stagedPackageRoot, "2.0.0");
             return packageUpdateStepResult({ name, argv, cwd });
           },
@@ -234,9 +235,7 @@ describe("runGlobalPackageUpdateSteps", () => {
         expect(result.failedStep).toBeNull();
         expect(result.afterVersion).toBe("2.0.0");
         expect(exdevMoves).toBe(1);
-        await expect(
-          fs.readFile(path.join(packageRoot, "package.json"), "utf8"),
-        ).resolves.toContain('"version":"2.0.0"');
+        await expectText(packageRoot, "package.json").toContain('"version":"2.0.0"');
       } finally {
         renameSpy.mockRestore();
       }
@@ -247,10 +246,7 @@ describe("runGlobalPackageUpdateSteps", () => {
     "keeps a successful staged swap with %s cleanup after a Windows native module error",
     async (cleanupMode) => {
       await withTestDir({ prefix: "openclaw-package-update-staged-cleanup-" }, async (base) => {
-        const prefix = path.join(base, "prefix");
-        const globalRoot = path.join(prefix, "lib", "node_modules");
-        const packageRoot = path.join(globalRoot, "openclaw");
-        await writePackageRoot(packageRoot, "1.0.0");
+        const { globalRoot, packageRoot } = await npmPackage(base);
         await fs.writeFile(path.join(packageRoot, "native.node"), "old native module");
 
         const realUnlink = fs.unlink.bind(fs);
@@ -286,9 +282,8 @@ describe("runGlobalPackageUpdateSteps", () => {
             ...createNpmUpdateOptions(globalRoot),
             packageRoot,
             runStep: async ({ name, argv, cwd }) => {
-              const stagePrefix = stagedNpmPrefix(argv);
-              const stageLayout = resolveNpmGlobalPrefixLayoutFromPrefix(stagePrefix);
-              await writePackageRoot(path.join(stageLayout.globalRoot, "openclaw"), "2.0.0");
+              const layout = resolveNpmGlobalPrefixLayoutFromPrefix(stagedNpmPrefix(argv));
+              await writePackageRoot(path.join(layout.globalRoot, "openclaw"), "2.0.0");
               return packageUpdateStepResult({ name, argv, cwd });
             },
           });
@@ -309,11 +304,9 @@ describe("runGlobalPackageUpdateSteps", () => {
           );
           expect(delayedCleanupDirs).toHaveLength(1);
           await expect(
-            fs.readFile(path.join(globalRoot, delayedCleanupDirs[0] ?? "", "native.node"), "utf8"),
+            readText(globalRoot, delayedCleanupDirs[0] ?? "", "native.node"),
           ).resolves.toBe("old native module");
-          await expect(
-            fs.readFile(path.join(packageRoot, "package.json"), "utf8"),
-          ).resolves.toContain('"version":"2.0.0"');
+          await expectText(packageRoot, "package.json").toContain('"version":"2.0.0"');
         } finally {
           unlinkSpy.mockRestore();
           renameSpy.mockRestore();
@@ -324,21 +317,14 @@ describe("runGlobalPackageUpdateSteps", () => {
 
   it("does not run post-verify work when staged npm verification fails", async () => {
     await withTestDir({ prefix: "openclaw-package-update-verify-" }, async (base) => {
-      const prefix = path.join(base, "prefix");
-      const globalRoot = path.join(prefix, "lib", "node_modules");
-      const packageRoot = path.join(globalRoot, "openclaw");
-      await writePackageRoot(packageRoot, "1.0.0");
+      const { globalRoot, packageRoot } = await npmPackage(base);
       const postVerifyStep = vi.fn();
 
       const result = await runGlobalPackageUpdateSteps({
         ...createNpmUpdateOptions(globalRoot),
         packageRoot,
         runStep: async ({ name, argv, cwd }) => {
-          const stagePrefix = stagedNpmPrefix(argv);
-          await writePackageRoot(
-            path.join(stagePrefix, "lib", "node_modules", "openclaw"),
-            "1.5.0",
-          );
+          await stagePackage(argv, "1.5.0");
           return packageUpdateStepResult({ name, argv, cwd });
         },
         postVerifyStep,
@@ -353,9 +339,7 @@ describe("runGlobalPackageUpdateSteps", () => {
       expect(result.activePackageRoot).toBe(packageRoot);
       expect(result.afterVersion).toBe("1.0.0");
       expect(postVerifyStep).not.toHaveBeenCalled();
-      await expect(fs.readFile(path.join(packageRoot, "package.json"), "utf8")).resolves.toContain(
-        '"version":"1.0.0"',
-      );
+      await expectText(packageRoot, "package.json").toContain('"version":"1.0.0"');
     });
   });
 
@@ -363,13 +347,10 @@ describe("runGlobalPackageUpdateSteps", () => {
     "preserves staged swap rollback safety after %s failure",
     async (failure) => {
       await withTestDir({ prefix: "openclaw-package-update-shim-rollback-" }, async (base) => {
-        const prefix = path.join(base, "prefix");
-        const globalRoot = path.join(prefix, "lib", "node_modules");
-        const packageRoot = path.join(globalRoot, "openclaw");
+        const { prefix, globalRoot, packageRoot } = await npmPackage(base);
         const targetShim = path.join(prefix, "bin", "openclaw");
         const oldLink = "../lib/node_modules/openclaw/dist/legacy.js";
         const newLink = "../lib/node_modules/openclaw/dist/index.js";
-        await writePackageRoot(packageRoot, "1.0.0");
         await fs.mkdir(path.dirname(targetShim), { recursive: true });
         if (failure === "symlink copy") {
           await fs.writeFile(path.join(packageRoot, "dist", "legacy.js"), "old shim\n");
@@ -435,11 +416,7 @@ describe("runGlobalPackageUpdateSteps", () => {
             packageRoot,
             beforeActivate,
             runStep: async ({ name, argv, cwd }) => {
-              const stagePrefix = stagedNpmPrefix(argv);
-              await writePackageRoot(
-                path.join(stagePrefix, "lib", "node_modules", "openclaw"),
-                "2.0.0",
-              );
+              const { prefix: stagePrefix } = await stagePackage(argv);
               const stagedShim = path.join(stagePrefix, "bin", "openclaw");
               stagedShimForFailure = stagedShim;
               await fs.mkdir(path.dirname(stagedShim), { recursive: true });
@@ -472,20 +449,16 @@ describe("runGlobalPackageUpdateSteps", () => {
             [backupRoot, packageRoot],
             [`${backupRoot}.candidate`, packageRoot],
           ]);
-          await expect(
-            fs.readFile(path.join(backupRoot, "package.json"), "utf8"),
-          ).resolves.toContain('"version":"1.0.0"');
-          await expect(
-            fs.readFile(path.join(`${backupRoot}.candidate`, "package.json"), "utf8"),
-          ).resolves.toContain('"version":"2.0.0"');
+          await expectText(backupRoot, "package.json").toContain('"version":"1.0.0"');
+          await expectText(`${backupRoot}.candidate`, "package.json").toContain(
+            '"version":"2.0.0"',
+          );
         } else {
           expect(refusedPackageRestores).toEqual([]);
           expect(result.afterVersion).toBe("1.0.0");
-          await expect(
-            fs.readFile(path.join(packageRoot, "package.json"), "utf8"),
-          ).resolves.toContain('"version":"1.0.0"');
+          await expectText(packageRoot, "package.json").toContain('"version":"1.0.0"');
         }
-        await expect(fs.readFile(targetShim, "utf8")).resolves.toBe("old shim\n");
+        await expectText(targetShim).toBe("old shim\n");
         if (failure === "symlink copy") {
           expect(await fs.readlink(targetShim)).toBe(oldLink);
         }
@@ -497,14 +470,12 @@ describe("runGlobalPackageUpdateSteps", () => {
           const retry = await runGlobalPackageUpdateSteps({
             ...createNpmUpdateOptions(globalRoot),
             packageRoot,
-            runStep: async ({ name, argv, cwd }) => ({
-              name,
-              command: argv.join(" "),
-              cwd: cwd ?? process.cwd(),
-              durationMs: 0,
-              exitCode: 1,
-              stderrTail: "retry install failed before activation",
-            }),
+            runStep: async (step) =>
+              packageUpdateStepResult(step, {
+                durationMs: 0,
+                exitCode: 1,
+                stderrTail: "retry install failed before activation",
+              }),
           });
           expect(retry.failedStep).not.toBeNull();
           expect(await fs.readdir(globalRoot)).toEqual(expect.arrayContaining(backups));
@@ -612,7 +583,7 @@ it.each([
     expect(result.failedStep === null).toBe(repaired);
     expect(result.afterVersion).toBe(repaired ? "2.0.0" : null);
     expect(result.recovery.serviceRestartSafe).toBe(true);
-    await expect(fs.readFile(path.join(packageRoot, "package.json"), "utf8")).resolves.toContain(
+    await expectText(packageRoot, "package.json").toContain(
       `"version":"${repaired ? "2.0.0" : "1.0.0"}"`,
     );
     const warnings = updateRunWarningMessages(result.steps.flatMap(updateRunStepsFromResultStep));

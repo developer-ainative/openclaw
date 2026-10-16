@@ -20,11 +20,24 @@ import type { PackageUpdateTransaction } from "./package-update-swap-contract.js
 import { resolveNpmGlobalPrefixLayoutFromPrefix } from "./update-npm-prefix.js";
 import type { UpdateStepResult } from "./update-step-result.js";
 
+const readText = (file: string) => fs.readFile(file, "utf8");
+const expectText = async (file: string, expected: string) =>
+  expect(await readText(file)).toBe(expected);
+const expectMissing = async (file: string) =>
+  expect(fs.access(file)).rejects.toMatchObject({ code: "ENOENT" });
+const hiddenEntries = async (root: string) =>
+  (await fs.readdir(root)).filter((entry) => entry.startsWith("."));
 async function expectPackageVersion(packageRoot: string, version: string) {
-  expect(await fs.readFile(path.join(packageRoot, "package.json"), "utf8")).toContain(
+  expect(await readText(path.join(packageRoot, "package.json"))).toContain(
     `"version":"${version}"`,
   );
 }
+const stepResult = (
+  name: string,
+  cwd: string,
+  command: string,
+  exitCode = 0,
+): UpdateStepResult => ({ name, cwd, command, exitCode, durationMs: 1 });
 
 describe("retained package update transactions", () => {
   it.each([
@@ -57,11 +70,12 @@ describe("retained package update transactions", () => {
         });
         const receiptThrow = outcome.endsWith("receipt throw");
         const doctorReceipt: UpdateStepResult = {
-          name: "openclaw doctor",
-          command: "doctor --fix",
-          cwd: packageRoot,
-          durationMs: 1,
-          exitCode: outcome === "doctor success receipt throw" ? 0 : 1,
+          ...stepResult(
+            "openclaw doctor",
+            packageRoot,
+            "doctor --fix",
+            outcome === "doctor success receipt throw" ? 0 : 1,
+          ),
           configChanges: [{ kind: "migration", message: "Moved model allowlist." }],
           ...(outcome === "doctor receipt throw"
             ? {
@@ -101,16 +115,9 @@ describe("retained package update transactions", () => {
             expect(serving).toBe(true);
             expect(candidateRoot).toBe(stageRoot);
             await expectPackageVersion(packageRoot, "1.0.0");
-            await expect(fs.readFile(launcher, "utf8")).resolves.toBe("old launcher\n");
+            await expectText(launcher, "old launcher\n");
             return [
-              {
-                name: "candidate canary",
-                command: "canary",
-                cwd: candidateRoot,
-                durationMs: 1,
-                exitCode: 0,
-                termination: "exit",
-              },
+              { ...stepResult("candidate canary", candidateRoot, "canary"), termination: "exit" },
             ];
           },
           beforeActivate: async () => {
@@ -137,24 +144,16 @@ describe("retained package update transactions", () => {
               results?.push(doctorReceipt);
               throw doctorFailure;
             }
-            return {
-              name: "doctor",
-              command: "doctor --fix",
-              cwd: candidateRoot,
-              durationMs: 0,
-              exitCode: 0,
-            };
+            return { ...stepResult("doctor", candidateRoot, "doctor --fix"), durationMs: 0 };
           },
         });
         if (outcome === "activation rejected") {
           await expect(update).rejects.toBe(activationError);
           expect(phases).toEqual(["validate", "stop"]);
           expect(transaction).toBeUndefined();
-          await expect(fs.readFile(launcher, "utf8")).resolves.toBe("old launcher\n");
+          await expectText(launcher, "old launcher\n");
           await expectPackageVersion(packageRoot, "1.0.0");
-          expect((await fs.readdir(globalRoot)).filter((entry) => entry.startsWith("."))).toEqual(
-            [],
-          );
+          expect(await hiddenEntries(globalRoot)).toEqual([]);
           await expect(fs.stat(stageRoot!)).rejects.toMatchObject({ code: "ENOENT" });
           return;
         }
@@ -224,28 +223,24 @@ describe("retained package update transactions", () => {
         );
         expect(result.activePackageRoot).toBe(packageRoot);
         expect(result.afterVersion).toBe(outcome === "backup failed" ? "1.0.0" : "2.0.0");
-        if (!transaction) {
-          throw new Error("activated package did not retain a transaction");
-        }
+        assert(transaction, "activated package did not retain a transaction");
         if (outcome === "backup failed") {
           await expectPackageVersion(packageRoot, "1.0.0");
         } else {
           await expectPackageVersion(transaction.backupRoot, "1.0.0");
         }
-        await expect(fs.readFile(launcher, "utf8")).resolves.toBe(
-          activationFailed ? "old launcher\n" : "new launcher\n",
-        );
+        await expectText(launcher, activationFailed ? "old launcher\n" : "new launcher\n");
         if (outcome !== "confirm") {
           const restored = await transaction.rollback(() => {});
           expect(restored).toMatchObject({ exitCode: 0, activePackageRoot: packageRoot });
           expect(await transaction.rollback(() => {})).toEqual(restored);
-          await expect(fs.readFile(launcher, "utf8")).resolves.toBe("old launcher\n");
+          await expectText(launcher, "old launcher\n");
         }
         await transaction.complete({ activationVerified: outcome === "confirm" }, () => {});
         await transaction.complete({ activationVerified: outcome === "confirm" }, () => {});
         await expectPackageVersion(packageRoot, outcome === "confirm" ? "2.0.0" : "1.0.0");
         expect((await transaction.rollback(() => {})).exitCode).toBe(1);
-        expect((await fs.readdir(globalRoot)).filter((entry) => entry.startsWith("."))).toEqual([]);
+        expect(await hiddenEntries(globalRoot)).toEqual([]);
       });
     },
   );
@@ -280,8 +275,8 @@ describe("runGlobalPackageUpdateSteps staging ownership", () => {
           const stagePrefix = stagedNpmPrefix(argv);
           expect((await fs.stat(stagePrefix)).isDirectory()).toBe(true);
           aPrefixes.push(stagePrefix);
-          const stageLayout = resolveNpmGlobalPrefixLayoutFromPrefix(stagePrefix);
-          const candidateRoot = path.join(stageLayout.globalRoot, "openclaw");
+          const { globalRoot: stageGlobal } = resolveNpmGlobalPrefixLayoutFromPrefix(stagePrefix);
+          const candidateRoot = path.join(stageGlobal, "openclaw");
           await writePackageRoot(candidateRoot, "2.0.0");
           const step = { name, command: argv.join(" "), cwd: cwd ?? base, durationMs: 0 };
           if (aPrefixes.length === 1) {
@@ -290,7 +285,7 @@ describe("runGlobalPackageUpdateSteps staging ownership", () => {
           expect(argv).toContain("--omit=optional");
           const firstPrefix = aPrefixes[0]!;
           expect(stagePrefix).not.toBe(firstPrefix);
-          await expect(fs.access(firstPrefix)).rejects.toMatchObject({ code: "ENOENT" });
+          await expectMissing(firstPrefix);
           candidateBytes = await Promise.all(readPackageBytes(candidateRoot));
 
           // Seed after A's initial cleanup so only the nested B can remove these.
@@ -319,15 +314,11 @@ describe("runGlobalPackageUpdateSteps staging ownership", () => {
             afterVersion: null,
             recovery: { serviceRestartSafe: true, version: "1.0.0" },
           });
-          if (!bPrefix) {
-            throw new Error("B did not reach its package-manager step");
-          }
+          assert(bPrefix, "B did not reach its package-manager step");
           for (const removed of [bPrefix, ...obsoleteDirs]) {
-            await expect(fs.access(removed)).rejects.toMatchObject({ code: "ENOENT" });
+            await expectMissing(removed);
           }
-          await expect(fs.readFile(path.join(protectedBackup, "evidence"), "utf8")).resolves.toBe(
-            "existing backup bytes\n",
-          );
+          await expectText(path.join(protectedBackup, "evidence"), "existing backup bytes\n");
           expect(await Promise.all(readPackageBytes(packageRoot))).toEqual(originalBytes);
           const survivingCandidate = await Promise.allSettled(readPackageBytes(candidateRoot));
           // Keep A running after this diagnostic so real verification and cleanup also settle.
@@ -340,14 +331,12 @@ describe("runGlobalPackageUpdateSteps staging ownership", () => {
 
       expect(aPrefixes).toHaveLength(2);
       for (const prefix of aPrefixes) {
-        await expect(fs.access(prefix)).rejects.toMatchObject({ code: "ENOENT" });
+        await expectMissing(prefix);
       }
       expect((await fs.readdir(globalRoot)).toSorted()).toEqual(
         [path.basename(protectedBackup), path.basename(staleStage), "openclaw"].toSorted(),
       );
-      await expect(fs.readFile(path.join(staleStage, "evidence"), "utf8")).resolves.toBe(
-        "earlier candidate bytes\n",
-      );
+      await expectText(path.join(staleStage, "evidence"), "earlier candidate bytes\n");
       expect(result).toMatchObject({
         failedStep: null,
         afterVersion: "2.0.0",
