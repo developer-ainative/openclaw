@@ -255,8 +255,6 @@ describe("connectApnsHttp2Session", () => {
     const registration = registerActiveManagedProxyUrl(new URL("https://proxy.example:8443"), {
       loopbackMode: "gateway-only",
     });
-    const { connectApnsHttp2Session } = await import("./push-apns-http2.js");
-
     await connectApnsHttp2Session({
       authority: "https://api.push.apple.com",
       timeoutMs: Number.MAX_SAFE_INTEGER,
@@ -304,8 +302,6 @@ describe("connectApnsHttp2Session", () => {
   });
 
   it("caps oversized explicit proxy probe timeouts", async () => {
-    const { probeApnsHttp2ReachabilityViaProxy } = await import("./push-apns-http2.js");
-
     await probeApnsHttp2ReachabilityViaProxy({
       authority: "https://api.sandbox.push.apple.com",
       proxyUrl: "http://proxy.example:8080",
