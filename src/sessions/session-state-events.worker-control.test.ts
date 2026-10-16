@@ -101,9 +101,10 @@ vi.mock("./session-state-events.kernel.js", () => ({
 }));
 vi.mock("./session-state-notices.js", () => ({ enqueueSessionStateNotice: edge.notice }));
 
+const watcherStorePath = resolveOpenClawAgentSqlitePath({ agentId: "main" });
 const notice: SessionStateNotice = {
   watcherSessionKey: "agent:main:main",
-  watcherStorePath: resolveOpenClawAgentSqlitePath({ agentId: "main" }),
+  watcherStorePath,
   targetSessionKey: "agent:main:child",
   lastSeenSequence: 17,
   queueOnly: false,
@@ -154,7 +155,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   edge.phases.length = 0;
   // Supply the accepted store without loading runtime config or native ownership metadata.
-  publishSystemEventStoreResolver(() => notice.watcherStorePath);
+  publishSystemEventStoreResolver(() => watcherStorePath);
   edge.capture.mockImplementation(() => edge.context);
   edge.execute.mockImplementation(async (command) => {
     edge.phases.push(command.type === "sessionState.prune" ? "prune" : "record");
