@@ -110,8 +110,17 @@ vi.mock("./worker-native-lifecycle.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./worker-native-lifecycle.js")>();
   return {
     ...actual,
-    createRetainedNativeWorker(...args: Parameters<typeof actual.createRetainedNativeWorker>) {
-      return observeNativeReplies(actual.createRetainedNativeWorker(...args));
+    captureRetainedNativeWorkerSource(
+      ...args: Parameters<typeof actual.captureRetainedNativeWorkerSource>
+    ) {
+      const source = actual.captureRetainedNativeWorkerSource(...args);
+      if (!vi.isMockFunction(source.create)) {
+        const create = source.create.bind(source);
+        vi.spyOn(source, "create").mockImplementation((...createArgs) =>
+          observeNativeReplies(create(...createArgs)),
+        );
+      }
+      return source;
     },
   };
 });

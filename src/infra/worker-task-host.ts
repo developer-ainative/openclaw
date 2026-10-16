@@ -19,10 +19,7 @@ import {
   receiveWorkerMemoryPort,
 } from "./worker-cpu.js";
 import { recordWorkerMessage } from "./worker-message-metrics.js";
-import {
-  captureRetainedNativeWorkerSource,
-  createRetainedNativeWorker,
-} from "./worker-native-lifecycle.js";
+import { captureRetainedNativeWorkerSource } from "./worker-native-lifecycle.js";
 import { resolveWorkerPoolSize, type WorkerPoolClass } from "./worker-pool-sizing.js";
 import { classifyWorkerRequest, trackWorkerRequest } from "./worker-request-diagnostics.js";
 import { workerRequestKind } from "./worker-request-kind.js";
@@ -67,15 +64,12 @@ export function createWorkerTaskHost(
           stackSizeMb: limits?.stackSizeMb,
         };
       }
-      if (owner.retainedTransport) {
+      if (source) {
         const { port1, port2 } = new MessageChannel();
-        const native = createRetainedNativeWorker(
-          url,
-          workerOptions,
-          source,
-          owner.nativeResource,
-          { host: port1, worker: port2 },
-        );
+        const native = source.create(url, workerOptions, owner.nativeResource, {
+          host: port1,
+          worker: port2,
+        });
         return { worker: native, native };
       }
       return { worker: createCpuTrackedWorker(url, workerOptions) };
