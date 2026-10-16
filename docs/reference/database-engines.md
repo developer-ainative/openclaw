@@ -564,7 +564,11 @@ the captured version's descriptor and retains exact allocation state, including 
 sequence deliberately reset below retained row IDs. Maintenance checks the stable
 Gateway lease contract independently of the newer application schema.
 
-Candidate Doctor schema migrations publish their before/after generations through
+Update-run admission reads PostgreSQL through its existing schema connection and
+initializes only the update-history fragment; it does not copy the anchor as SQLite
+state or run candidate schema migrations before managed shutdown.
+
+Candidate Doctor state and agent schema migrations publish their before/after generations through
 the existing maintenance write receipt. PostgreSQL table and sequence locks retain
 native exclusion until the migration transaction commits; only that confirmed
 publication advances the expected generation. Independent writes before migration
