@@ -1,11 +1,10 @@
-// Crabline runner tests preserve provider-native thread ownership at the Gateway boundary.
 import { mattermostPlugin } from "@openclaw/mattermost/channel-plugin-api.js";
 import { setMattermostRuntime } from "@openclaw/mattermost/runtime-api.js";
 import { createPluginRuntimeMock } from "openclaw/plugin-sdk/plugin-test-runtime";
-import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
 import { describe, expect, it, vi } from "vitest";
 import {
   type CrablineTransport,
+  postJson,
   requireString,
   withTransport,
 } from "./crabline-transport.test-support.js";
@@ -19,31 +18,6 @@ function waitForReply(
   timeoutMs = 1_000,
 ) {
   return transport.waitForOutbound({ conversation, threadId, textIncludes, timeoutMs });
-}
-
-async function postJson<T>(params: {
-  url: string;
-  body: unknown;
-  headers?: Record<string, string>;
-  method?: string;
-  auditContext: string;
-}): Promise<T> {
-  const { response, release } = await fetchWithSsrFGuard({
-    url: params.url,
-    init: {
-      body: JSON.stringify(params.body),
-      headers: { "content-type": "application/json", ...params.headers },
-      method: params.method ?? "POST",
-    },
-    policy: { allowPrivateNetwork: true },
-    auditContext: params.auditContext,
-  });
-  try {
-    expect(response.ok).toBe(true);
-    return (await response.json()) as T;
-  } finally {
-    await release();
-  }
 }
 
 describe("Crabline provider thread routing", () => {
@@ -68,13 +42,12 @@ describe("Crabline provider thread routing", () => {
       const matrixBaseUrl = requireString(env.MATRIX_BASE_URL, "Matrix base URL");
       const accessToken = requireString(env.MATRIX_ACCESS_TOKEN, "Matrix access token");
       const send = async (transactionId: string, body: Record<string, unknown>) =>
-        await postJson({
-          url: `${matrixBaseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${transactionId}`,
+        await postJson(
+          `${matrixBaseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${transactionId}`,
           body,
-          headers: { authorization: `Bearer ${accessToken}` },
-          method: "PUT",
-          auditContext: "qa-lab-crabline-matrix-thread-correlation-test",
-        });
+          "qa-lab-crabline-matrix-thread-correlation-test",
+          { method: "PUT", headers: { authorization: `Bearer ${accessToken}` } },
+        );
 
       const wait = (thread: string, text: string, timeout: number) =>
         waitForReply(transport, { id: conversationId, kind: "direct" }, thread, text, timeout);
@@ -121,12 +94,12 @@ describe("Crabline provider thread routing", () => {
       const mattermostUrl = requireString(env.MATTERMOST_URL, "Mattermost URL");
       const botToken = requireString(env.MATTERMOST_BOT_TOKEN, "Mattermost bot token");
       const send = async (message: string, rootId?: string) =>
-        await postJson<{ id: string }>({
-          url: `${mattermostUrl}/api/v4/posts`,
-          body: { channel_id: channelId, message, ...(rootId ? { root_id: rootId } : {}) },
-          headers: { authorization: `Bearer ${botToken}` },
-          auditContext: "qa-lab-crabline-mattermost-thread-correlation-test",
-        });
+        await postJson<{ id: string }>(
+          `${mattermostUrl}/api/v4/posts`,
+          { channel_id: channelId, message, ...(rootId ? { root_id: rootId } : {}) },
+          "qa-lab-crabline-mattermost-thread-correlation-test",
+          { headers: { authorization: `Bearer ${botToken}` } },
+        );
 
       const root = await send("mattermost seed root");
       const conversation = { id: conversationId, kind: "group" } as const;

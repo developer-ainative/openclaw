@@ -1,6 +1,5 @@
 import { readFile } from "node:fs/promises";
-import path from "node:path";
-import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { asOptionalRecord, isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { Page, WebSocket } from "playwright";
 import { expect, it } from "vitest";
 import { createControlUiE2eSuite } from "../../../ui/src/e2e/control-ui-e2e-suite.test-support.ts";
@@ -9,7 +8,9 @@ import {
   authenticateControlUi,
   captureControlUi,
   controlUiPageOptions as pageOptions,
+  historyMessages,
   startControlUiGateway,
+  stopControlUiGateway,
   writeControlUiVerdict,
 } from "./control-ui-gateway.e2e.test-support.ts";
 import { createQaLiveLaneGateway } from "./live-transports/shared/live-gateway.runtime.ts";
@@ -81,25 +82,19 @@ function observeEvents(page: Page, gatewayUrl: string, sessionKey: string, activ
       if (activeOnly && socket !== activeUiSocket) {
         return;
       }
-      const frame: unknown = JSON.parse(String(payload));
-      if (!isRecord(frame) || frame.type !== "event") {
+      const frame = asOptionalRecord(JSON.parse(String(payload)));
+      if (frame?.type !== "event") {
         return;
       }
+      const data = asOptionalRecord(frame.payload);
       if (typeof frame.event === "string" && frame.event.startsWith("openclaw.approval.")) {
         const suffix =
-          activeOnly &&
-          isRecord(frame.payload) &&
-          typeof frame.payload.applicationStatus === "string"
-            ? `:${frame.payload.applicationStatus}`
+          activeOnly && typeof data?.applicationStatus === "string"
+            ? `:${data.applicationStatus}`
             : "";
         events.push(`${frame.event}${suffix}`);
       }
-      if (
-        frame.event === "chat" &&
-        isRecord(frame.payload) &&
-        frame.payload.sessionKey === sessionKey &&
-        frame.payload.state === "final"
-      ) {
+      if (frame.event === "chat" && data?.sessionKey === sessionKey && data.state === "final") {
         finals += 1;
         if (activeOnly) {
           events.push("chat.final");
@@ -139,36 +134,26 @@ function loggingLevel(config: unknown): unknown {
 }
 
 function readDelegationResults(history: unknown): Record<string, unknown>[] {
-  if (!isRecord(history) || !Array.isArray(history.messages)) {
-    return [];
-  }
-  const results: Record<string, unknown>[] = [];
-  for (const message of history.messages) {
-    if (
-      !isRecord(message) ||
-      message.role !== "toolResult" ||
-      message.toolName !== "openclaw" ||
-      !Array.isArray(message.content)
-    ) {
-      continue;
-    }
-    const text = message.content
-      .flatMap((block) =>
-        isRecord(block) && block.type === "text" && typeof block.text === "string"
-          ? [block.text]
-          : [],
-      )
-      .join("\n");
-    const result: unknown = JSON.parse(text);
-    if (isRecord(result)) {
-      results.push(result);
-    }
-  }
-  return results;
-}
-
-function readDelegationResult(history: unknown): Record<string, unknown> | undefined {
-  return readDelegationResults(history).at(-1);
+  return historyMessages(history)
+    .map(asOptionalRecord)
+    .flatMap((message) => {
+      if (
+        message?.role !== "toolResult" ||
+        message.toolName !== "openclaw" ||
+        !Array.isArray(message.content)
+      ) {
+        return [];
+      }
+      const text = message.content
+        .flatMap((block) =>
+          isRecord(block) && block.type === "text" && typeof block.text === "string"
+            ? [block.text]
+            : [],
+        )
+        .join("\n");
+      const result: unknown = JSON.parse(text);
+      return isRecord(result) ? [result] : [];
+    });
 }
 
 suite.define(() => {
@@ -193,17 +178,11 @@ suite.define(() => {
           true,
         );
         await page.addInitScript(
-          ({ gatewayUrl, token }) => {
+          ({ gatewayUrl, token, browserFallbackMarkers }) => {
             const proofWindow = window as ProofWindow;
             proofWindow["__OPENCLAW_NATIVE_CONTROL_AUTH__"] = { gatewayUrl, token };
             proofWindow["__OPENCLAW_APPROVAL_UI_SEQUENCE__"] = [];
             proofWindow["__OPENCLAW_APPROVAL_FALLBACK_OBSERVED__"] = false;
-            const browserFallbackMarkers = [
-              "OpenClaw change pending approval",
-              "/approve",
-              "needsApproval",
-              "proposalId",
-            ];
             const containsFallback = (text: string | null) =>
               browserFallbackMarkers.some((marker) => text?.includes(marker));
             new MutationObserver((mutations) => {
@@ -225,16 +204,10 @@ suite.define(() => {
                   try {
                     const frame = JSON.parse(String(event.data)) as {
                       event?: unknown;
-                      payload?: {
-                        applicationStatus?: unknown;
-                        sessionKey?: unknown;
-                      };
+                      payload?: { applicationStatus?: unknown };
                       type?: unknown;
                     };
-                    if (frame.type !== "event") {
-                      return;
-                    }
-                    if (frame.event === "openclaw.approval.resolved") {
+                    if (frame.type === "event" && frame.event === "openclaw.approval.resolved") {
                       const applicationStatus =
                         typeof frame.payload?.applicationStatus === "string"
                           ? `:${frame.payload.applicationStatus}`
@@ -243,14 +216,16 @@ suite.define(() => {
                         `openclaw.approval.resolved${applicationStatus}`,
                       );
                     }
-                  } catch {
-                    // Ignore non-JSON frames from unrelated WebSocket traffic.
-                  }
+                  } catch {}
                 });
               }
             };
           },
-          { gatewayUrl: gateway.wsUrl, token: gateway.token },
+          {
+            gatewayUrl: gateway.wsUrl,
+            token: gateway.token,
+            browserFallbackMarkers: fallbackMarkers,
+          },
         );
         await page.goto(controlUiSessionUrl(suite.server.baseUrl, sessionKey));
         const composer = page.locator(".agent-chat__composer-combobox textarea");
@@ -261,16 +236,17 @@ suite.define(() => {
           '.chat-inline-approval [data-approval-id^="system-agent:"]',
         );
         await approvalCard.waitFor();
-        await expect.poll(() => approvalCard.count()).toBe(1);
-        expect(eventSequence).toEqual(["openclaw.approval.requested"]);
-        expect(finals()).toBe(0);
+        const expectPending = async () => {
+          await expect.poll(() => approvalCard.count()).toBe(1);
+          expect(eventSequence).toEqual(["openclaw.approval.requested"]);
+          expect(finals()).toBe(0);
+          const history = await gateway.call("chat.history", { sessionKey, limit: 30 });
+          expect(readDelegationResults(history)).toEqual([]);
+          expectNoFallback(await page.locator("body").textContent());
+          return history;
+        };
         expect(loggingLevel(JSON.parse(await readFile(gateway.configPath, "utf8")))).toBe("debug");
-
-        const pendingHistory = await gateway.call("chat.history", { sessionKey, limit: 30 });
-        expect(readDelegationResults(pendingHistory)).toEqual([]);
-        const pendingTranscript = JSON.stringify(pendingHistory);
-        expectNoFallback(pendingTranscript, false);
-        expectNoFallback(await page.locator("body").textContent());
+        expectNoFallback(JSON.stringify(await expectPending()), false);
         await captureControlUi(page, proofDir, "01-native-approval.png");
 
         const approvalFallbackWasObserved = () =>
@@ -281,22 +257,15 @@ suite.define(() => {
         await page.reload();
         await composer.waitFor();
         await approvalCard.waitFor();
-        await expect.poll(() => approvalCard.count()).toBe(1);
-        expect(eventSequence).toEqual(["openclaw.approval.requested"]);
-        expect(finals()).toBe(0);
-        expect(
-          readDelegationResults(await gateway.call("chat.history", { sessionKey, limit: 30 })),
-        ).toEqual([]);
-        expectNoFallback(await page.locator("body").textContent());
+        await expectPending();
 
         await approvalCard.evaluate((card) => {
           const proofWindow = window as ProofWindow;
           const observer = new MutationObserver(() => {
-            if (card.isConnected) {
-              return;
+            if (!card.isConnected) {
+              observer.disconnect();
+              proofWindow["__OPENCLAW_APPROVAL_UI_SEQUENCE__"].push("approval.card.removed");
             }
-            observer.disconnect();
-            proofWindow["__OPENCLAW_APPROVAL_UI_SEQUENCE__"].push("approval.card.removed");
           });
           observer.observe(document.body, { childList: true, subtree: true });
         });
@@ -341,11 +310,7 @@ suite.define(() => {
     } catch (error) {
       errors.push(error);
     }
-    const stopped = await owner.stop({ preserveToDir: path.join(proofDir, "gateway") });
-    errors.push(...stopped.errors);
-    if (errors.length > 0) {
-      throw new AggregateError(errors, "native OpenClaw approval proof failed");
-    }
+    await stopControlUiGateway(owner, proofDir, "native OpenClaw approval proof failed", errors);
   }, 180_000);
 });
 
@@ -353,6 +318,8 @@ const fullAccessOwner = createQaLiveLaneGateway();
 let fullAccessRuntime: Awaited<ReturnType<typeof fullAccessOwner.start>>;
 let fullAccessProofDir: string;
 let fullAccessGatewayUsed = false;
+const stopFullAccess = (message: string) =>
+  stopControlUiGateway(fullAccessOwner, fullAccessProofDir, message);
 const fullAccessSuite = createControlUiE2eSuite({
   name: "Control UI OpenClaw delegation with a real Gateway",
   startServerBeforeBrowser: true,
@@ -366,14 +333,7 @@ const fullAccessSuite = createControlUiE2eSuite({
       fullAccessRuntime = await startGateway(fullAccessOwner, fullAccessSuite.server.baseUrl);
       signal.throwIfAborted();
     },
-    close: async () => {
-      const stopped = await fullAccessOwner.stop({
-        preserveToDir: path.join(fullAccessProofDir, "gateway"),
-      });
-      if (stopped.errors.length > 0) {
-        throw new AggregateError(stopped.errors, "Full Access Gateway cleanup failed");
-      }
-    },
+    close: () => stopFullAccess("Full Access Gateway cleanup failed"),
   },
 });
 
@@ -434,7 +394,7 @@ fullAccessSuite.define(() => {
 
             await expect.poll(finals, { timeout: 60_000 }).toBeGreaterThan(0);
             const history = await gateway.call("chat.history", { sessionKey, limit: 30 });
-            const result = readDelegationResult(history);
+            const result = readDelegationResults(history).at(-1);
             expect(result).toBeDefined();
             expectApplied(result);
             expect(approvalEvents).toEqual([]);
@@ -443,12 +403,9 @@ fullAccessSuite.define(() => {
             expect(loggingLevel(savedConfig)).toBe("info");
             const configSnapshot = await gateway.call("config.get", {});
             expect(isRecord(configSnapshot) && loggingLevel(configSnapshot.config)).toBe("info");
-            const finalMessage =
-              isRecord(history) && Array.isArray(history.messages)
-                ? history.messages.findLast(
-                    (message) => isRecord(message) && message.role === "assistant",
-                  )
-                : undefined;
+            const finalMessage = historyMessages(history).findLast(
+              (message) => isRecord(message) && message.role === "assistant",
+            );
             const finalMeta = isRecord(finalMessage) ? finalMessage["__openclaw"] : undefined;
             const finalEntryId = isRecord(finalMeta) ? finalMeta.id : undefined;
             if (typeof finalEntryId !== "string") {
@@ -478,12 +435,7 @@ fullAccessSuite.define(() => {
             return;
           }
           // Failed or cancelled cases close admission before another case can reuse state.
-          const stopped = await fullAccessOwner.stop({
-            preserveToDir: path.join(fullAccessProofDir, "gateway"),
-          });
-          if (stopped.errors.length > 0) {
-            throw new AggregateError(stopped.errors, `Full Access cleanup failed (${mode})`);
-          }
+          await stopFullAccess(`Full Access cleanup failed (${mode})`);
         },
       });
     },

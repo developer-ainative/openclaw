@@ -19,6 +19,7 @@ import {
   authenticateControlUi as authenticate,
   captureControlUi,
   controlUiPageOptions,
+  historyMessages,
   startControlUiGateway,
   writeControlUiVerdict,
 } from "./control-ui-gateway.e2e.test-support.ts";
@@ -103,8 +104,7 @@ async function createPptx(): Promise<Buffer> {
 }
 
 function historyHasAssistantText(history: unknown, text: string): boolean {
-  const messages = (history as { messages?: unknown[] } | undefined)?.messages ?? [];
-  return messages.some(
+  return historyMessages(history).some(
     (message) =>
       asOptionalRecord(message)?.role === "assistant" &&
       JSON.stringify(asOptionalRecord(message)?.content).includes(text),
@@ -116,16 +116,13 @@ function omittedCard(pane: Locator) {
 }
 
 function imageInHistory(history: unknown): Record<string, unknown> | undefined {
-  const messages = asOptionalRecord(history)?.messages;
-  return Array.isArray(messages)
-    ? messages
-        .flatMap((message) => {
-          const content = asOptionalRecord(message)?.content;
-          return Array.isArray(content) ? content : [];
-        })
-        .map(asOptionalRecord)
-        .find((block) => block?.type === "image")
-    : undefined;
+  return historyMessages(history)
+    .flatMap((message) => {
+      const content = asOptionalRecord(message)?.content;
+      return Array.isArray(content) ? content : [];
+    })
+    .map(asOptionalRecord)
+    .find((block) => block?.type === "image");
 }
 
 function readRawAssistantMessages(stateDir: string): PersistedAssistantMessage[] {
@@ -167,7 +164,8 @@ suite.define(() => {
       ...process.env,
       OPENCLAW_STATE_DIR: path.join(gateway.gateway.tempRoot, "state"),
     };
-    const seed = async (sessionKey: string, sessionId: string, content: unknown[]) => {
+    const seed = async (sessionId: string, image: Record<string, unknown>) => {
+      const sessionKey = `agent:qa:${sessionId}`;
       const storePath = resolveStorePath(undefined, { agentId: "qa", env });
       const identity = { agentId: "qa", env, sessionKey, storePath };
       await upsertSessionEntry({
@@ -177,7 +175,11 @@ suite.define(() => {
       await appendSessionTranscriptMessageByIdentity({
         ...identity,
         sessionId,
-        message: { role: "user", timestamp: Date.now(), content },
+        message: {
+          role: "user",
+          timestamp: Date.now(),
+          content: [{ type: "image", mimeType: "image/png", ...image }],
+        },
       });
     };
     const omittedSessionKey = "agent:qa:omitted-image-history";
@@ -187,19 +189,9 @@ suite.define(() => {
     try {
       // Startup admits the fixture rows into the child Gateway's resident projection.
       await gateway.gateway.restartAfterStateMutation(async () => {
-        await seed(omittedSessionKey, "omitted-image-history", [
-          { type: "image", mimeType: "image/png", omitted: true, bytes: 12 * 1024 },
-        ]);
-        await seed(recoveredSessionKey, "recovered-image-history", [
-          { type: "image", mimeType: "image/png", data: retainedImageBase64 },
-        ]);
-        await seed(retainedSessionKey, "retained-image-history", [
-          {
-            type: "image",
-            mimeType: "image/png",
-            source: { type: "url", url: retainedImageUrl },
-          },
-        ]);
+        await seed("omitted-image-history", { omitted: true, bytes: 12 * 1024 });
+        await seed("recovered-image-history", { data: retainedImageBase64 });
+        await seed("retained-image-history", { source: { type: "url", url: retainedImageUrl } });
       });
       const history = (sessionKey: string) =>
         gateway.gateway.call("chat.history", { sessionKey, limit: 10 });

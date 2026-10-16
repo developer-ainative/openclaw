@@ -1,5 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
+import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { BrowserContextOptions, Page } from "playwright";
 import { createQaLiveLaneGateway } from "./live-transports/shared/live-gateway.runtime.ts";
 
@@ -56,4 +57,22 @@ export async function captureControlUi(page: Page, proofDir: string, name: strin
 
 export function writeControlUiVerdict(proofDir: string, verdict: unknown) {
   return writeFile(path.join(proofDir, "verdict.json"), `${JSON.stringify(verdict, null, 2)}\n`);
+}
+
+export function historyMessages(history: unknown): unknown[] {
+  const messages = asOptionalRecord(history)?.messages;
+  return Array.isArray(messages) ? messages : [];
+}
+
+export async function stopControlUiGateway(
+  owner: GatewayOwner,
+  proofDir: string,
+  message: string,
+  errors: unknown[] = [],
+) {
+  const stopped = await owner.stop({ preserveToDir: path.join(proofDir, "gateway") });
+  errors.push(...stopped.errors);
+  if (errors.length > 0) {
+    throw new AggregateError(errors, message);
+  }
 }

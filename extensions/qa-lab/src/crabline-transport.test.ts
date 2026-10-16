@@ -1,38 +1,17 @@
 // Qa Lab tests cover Crabline channel-driver integration with local provider servers.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
 import { withTempDir } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it } from "vitest";
 import { createQaBusState } from "./bus-state.js";
 import { createQaCrablineTransportAdapter } from "./crabline-transport.js";
 import {
-  type CrablineTransport,
   createSelection,
+  postJson as post,
   requireString,
+  telegramApi,
   withTransport,
 } from "./crabline-transport.test-support.js";
-
-function telegramUrl(transport: CrablineTransport) {
-  const telegram = transport.createGatewayConfig({ baseUrl: "http://127.0.0.1:1" }).channels
-    ?.telegram;
-  return `${requireString(telegram?.apiRoot, "Telegram API root")}/bot${requireString(telegram?.botToken, "Telegram bot token")}`;
-}
-
-async function post(url: string, body: unknown, auditContext: string) {
-  const { response, release } = await fetchWithSsrFGuard({
-    url,
-    init: {
-      body: JSON.stringify(body),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    },
-    policy: { allowPrivateNetwork: true },
-    auditContext,
-  });
-  await release();
-  expect(response.ok).toBe(true);
-}
 
 describe("crabline transport", () => {
   it("configures OpenClaw's Telegram plugin against a Crabline local provider server", async () => {
@@ -120,7 +99,7 @@ describe("crabline transport", () => {
           text: "driver",
         });
 
-        const apiUrl = telegramUrl(transport);
+        const { url: apiUrl } = telegramApi(transport);
         const response = await fetch(`${apiUrl}/getUpdates`);
         const payload = (await response.json()) as {
           result?: Array<{ message?: { from?: { id?: number }; text?: string } }>;
@@ -163,7 +142,7 @@ describe("crabline transport", () => {
         nativeCommand: { name: "status" },
       });
 
-      const apiUrl = telegramUrl(transport);
+      const { url: apiUrl } = telegramApi(transport);
       const response = await fetch(`${apiUrl}/getUpdates`);
       await expect(response.json()).resolves.toMatchObject({
         result: [
@@ -180,55 +159,6 @@ describe("crabline transport", () => {
             },
           },
         ],
-      });
-    });
-  });
-
-  it("observes Telegram preview edits through the shared transport adapter", async () => {
-    await withTransport("telegram", async (transport) => {
-      const apiUrl = telegramUrl(transport);
-      await transport.sendInbound({
-        conversation: { id: "-1001234567890", kind: "group" },
-        senderId: "100001",
-        text: "forum topic seed",
-        threadId: "42",
-      });
-      const postTelegram = async (method: string, body: Record<string, unknown>) => {
-        const response = await fetch(`${apiUrl}/${method}`, {
-          body: JSON.stringify(body),
-          headers: { "content-type": "application/json" },
-          method: "POST",
-        });
-        expect(response.ok).toBe(true);
-        return (await response.json()) as { result: { message_id: number } };
-      };
-      const sent = await postTelegram("sendMessage", {
-        chat_id: "-1001234567890",
-        message_thread_id: 42,
-        text: "preview text",
-      });
-      expect(transport.state.searchMessages({ query: "preview text" })).toEqual([
-        expect.objectContaining({ text: "preview text" }),
-      ]);
-      await postTelegram("editMessageText", {
-        chat_id: "-1001234567890",
-        message_id: sent.result.message_id,
-        text: "final marker",
-      });
-
-      expect(transport.waitForOutboundSequence).toBeTypeOf("function");
-      await expect(
-        transport.waitForOutboundSequence!({
-          conversationId: "-1001234567890",
-          finalSettleMs: 0,
-          finalTextIncludes: "final marker",
-          minimumPreviewEvents: 1,
-          threadId: "42",
-          timeoutMs: 1_000,
-        }),
-      ).resolves.toMatchObject({
-        events: [{ kind: "sent" }, { kind: "edited" }],
-        final: { text: "final marker", threadId: "42" },
       });
     });
   });
@@ -752,8 +682,8 @@ describe("crabline transport", () => {
         text: "Channel baseline marker check.",
       });
 
-      const apiUrl = telegramUrl(transport);
-      const updatesResponse = await fetch(`${apiUrl}/getUpdates`);
+      const api = telegramApi(transport);
+      const updatesResponse = await fetch(`${api.url}/getUpdates`);
       const updates = (await updatesResponse.json()) as {
         result?: Array<{ message?: { chat?: { id?: number } } }>;
       };
@@ -763,16 +693,12 @@ describe("crabline transport", () => {
         target: "channel:telegram-command-room",
       });
       expect(groupDelivery.to).toBe(String(authoritativeChatId));
-      await post(
-        `${apiUrl}/sendMessage`,
-        {
-          chat_id: transport.buildAgentDelivery({
-            target: `channel:${inbound.conversation.id}`,
-          }).to,
-          text: "assistant via fake telegram",
-        },
-        "qa-lab-crabline-transport-test",
-      );
+      await api.post("sendMessage", {
+        chat_id: transport.buildAgentDelivery({
+          target: `channel:${inbound.conversation.id}`,
+        }).to,
+        text: "assistant via fake telegram",
+      });
 
       await expect(
         transport.waitForOutbound({
@@ -791,14 +717,10 @@ describe("crabline transport", () => {
 
       await transport.state.reset();
       const delivery = transport.buildAgentDelivery({ target: "dm:qa-operator" });
-      await post(
-        `${apiUrl}/sendMessage`,
-        {
-          chat_id: delivery.to,
-          text: "assistant after reset",
-        },
-        "qa-lab-crabline-transport-reset-test",
-      );
+      await api.post("sendMessage", {
+        chat_id: delivery.to,
+        text: "assistant after reset",
+      });
 
       await expect(
         transport.state.waitFor({

@@ -18,8 +18,8 @@ function discordClient(transport: CrablineTransport) {
     transport.createRuntimeEnvPatch?.().DISCORD_API_URL,
     "Discord API URL",
   );
-  const request = (route: string, method = "GET", body?: unknown) =>
-    fetch(`${apiUrl}/${route}`, {
+  const request = async (route: string, method = "GET", body?: unknown) => {
+    const response = await fetch(`${apiUrl}/${route}`, {
       method,
       headers: {
         authorization: `Bot ${requireString(discord?.token, "Discord bot token")}`,
@@ -27,7 +27,15 @@ function discordClient(transport: CrablineTransport) {
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
+    expect(response.ok).toBe(true);
+    return response;
+  };
   return { discord, apiUrl, request };
+}
+
+function messagesRoute(target: string | undefined) {
+  const channelId = requireString(target, "Discord delivery target").replace(/^channel:/u, "");
+  return `channels/${channelId}/messages`;
 }
 
 describe("Crabline Discord transport", () => {
@@ -56,7 +64,6 @@ describe("Crabline Discord transport", () => {
         });
 
         const gatewayResponse = await request("gateway/bot");
-        expect(gatewayResponse.ok).toBe(true);
         const gateway: unknown = await gatewayResponse.json();
         const gatewayUrl = requireString(
           isRecord(gateway) ? gateway.url : undefined,
@@ -106,15 +113,10 @@ describe("Crabline Discord transport", () => {
           to: expect.stringMatching(/^channel:\d{17,20}$/u),
         });
 
-        const channelId = requireString(delivery.to, "Discord delivery target").replace(
-          /^channel:/u,
-          "",
-        );
-        const response = await request(`channels/${channelId}/messages`, "POST", {
+        const response = await request(messagesRoute(delivery.to), "POST", {
           content: "Discord provider outbound marker.",
           message_reference: { message_id: inbound.id },
         });
-        expect(response.ok).toBe(true);
         await response.body?.cancel();
         await expect(
           transport.waitForOutbound({
@@ -129,7 +131,6 @@ describe("Crabline Discord transport", () => {
 
         expect("cleanup" in transport).toBe(false);
         const beforeGatewayStop = await request("users/@me");
-        expect(beforeGatewayStop.ok).toBe(true);
         await beforeGatewayStop.body?.cancel();
         await transport.cleanupAfterGatewayStop?.();
         await expect(fetch(`${runtimeEnv.DISCORD_API_URL}/users/@me`)).rejects.toThrow();
@@ -173,46 +174,36 @@ describe("Crabline Discord transport", () => {
               const delivery = transport.buildAgentDelivery({
                 target: `group:${input.conversation.id}`,
               });
-              const channelId = requireString(delivery.to, "Discord delivery target").replace(
-                /^channel:/u,
-                "",
-              );
-              const messagesRoute = `channels/${channelId}/messages`;
+              const route = messagesRoute(delivery.to);
+              const reference = { message_reference: { message_id: inbound.id } };
               runQueue.enqueue(inbound.id, async () => {
                 try {
-                  const previewResponse = await request(messagesRoute, "POST", {
+                  const previewResponse = await request(route, "POST", {
                     content: marker,
-                    ...(finalKind === "top-level"
-                      ? { message_reference: { message_id: inbound.id } }
-                      : {}),
+                    ...(finalKind === "top-level" ? reference : {}),
                   });
-                  expect(previewResponse.ok).toBe(true);
                   const preview = (await previewResponse.json()) as { id: string };
                   await releaseFinal.promise;
                   const response = await request(
                     finalKind === "edited" || finalKind === "deleted"
-                      ? `${messagesRoute}/${preview.id}`
-                      : messagesRoute,
+                      ? `${route}/${preview.id}`
+                      : route,
                     finalKind === "edited" ? "PATCH" : finalKind === "deleted" ? "DELETE" : "POST",
                     finalKind === "deleted"
                       ? undefined
                       : {
                           content: finalKind === "edited" ? "wrong final" : marker,
-                          ...(finalKind === "reply"
-                            ? { message_reference: { message_id: inbound.id } }
-                            : {}),
+                          ...(finalKind === "reply" ? reference : {}),
                         },
                   );
-                  expect(response.ok).toBe(true);
                   if (finalKind === "deleted-final" || finalKind === "edited-final") {
                     const final = (await response.json()) as { id: string };
                     expect(final.id).not.toBe(preview.id);
                     const mutation = await request(
-                      `${messagesRoute}/${final.id}`,
+                      `${route}/${final.id}`,
                       finalKind === "deleted-final" ? "DELETE" : "PATCH",
                       finalKind === "edited-final" ? { content: "wrong final" } : undefined,
                     );
-                    expect(mutation.ok).toBe(true);
                     await mutation.body?.cancel();
                   } else {
                     await response.body?.cancel();

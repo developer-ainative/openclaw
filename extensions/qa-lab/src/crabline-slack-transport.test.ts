@@ -1,14 +1,15 @@
 import { createHmac } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
 import { withServer } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it } from "vitest";
-import { withTransport } from "./crabline-transport.test-support.js";
+import { postJson, withTransport } from "./crabline-transport.test-support.js";
 
 describe("Crabline Slack transport", () => {
   it("keeps startup readiness and full runtime evidence for the same Slack provider", async () => {
     await withTransport("slack", async (transport, outputDir) => {
+      const readArtifact = (relativePath: string) =>
+        fs.readFile(path.join(outputDir, relativePath), "utf8");
       expect(transport.id).toBe("crabline");
       expect(transport.requiredPluginIds).toEqual(["slack"]);
       expect(transport.sendNativeCommand).toBeUndefined();
@@ -36,12 +37,12 @@ describe("Crabline Slack transport", () => {
         headers: { authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
       });
       await response.json();
-      const recorderPath = path.join(outputDir, "artifacts/crabline/slack-provider-server.jsonl");
-      const beforeCapture = await fs.readFile(recorderPath, "utf8");
+      const recorderPath = "artifacts/crabline/slack-provider-server.jsonl";
+      const beforeCapture = await readArtifact(recorderPath);
       expect(beforeCapture).toContain('"path":"/api/users.info"');
 
       const captured = await transport.captureArtifacts({ outputDir });
-      const afterCapture = await fs.readFile(recorderPath, "utf8");
+      const afterCapture = await readArtifact(recorderPath);
       expect(afterCapture.startsWith(beforeCapture)).toBe(true);
       const finalProbe = afterCapture.slice(beforeCapture.length).trim().split("\n");
       expect(finalProbe).toHaveLength(1);
@@ -52,16 +53,11 @@ describe("Crabline Slack transport", () => {
       const readinessPath = captured.artifacts.find(
         (artifact) => artifact.kind === "channel-driver-smoke",
       )!.path;
-      const readiness = JSON.parse(await fs.readFile(path.join(outputDir, readinessPath), "utf8"));
-      const startupRecorder = await fs.readFile(
-        path.join(outputDir, readiness.providerReadiness.result.recorderPath),
-        "utf8",
-      );
+      const readiness = JSON.parse(await readArtifact(readinessPath));
+      const startupRecorder = await readArtifact(readiness.providerReadiness.result.recorderPath);
       expect(startupRecorder).toContain('"path":"/api/auth.test"');
       expect(startupRecorder).not.toContain('"path":"/api/users.info"');
-      expect(captured.reportNotes.join("\n")).toContain(
-        "artifacts/crabline/slack-provider-server.jsonl",
-      );
+      expect(captured.reportNotes.join("\n")).toContain(recorderPath);
     });
   });
 
@@ -72,6 +68,7 @@ describe("Crabline Slack transport", () => {
       let holdWebhook = false;
       const pendingWebhook = Promise.withResolvers<void>();
       const conversation = { id: "D12345678", kind: "direct" } as const;
+      const stopped = "Crabline Slack inbound transport stopped";
       const send = (text: string, senderName?: string) =>
         transport.sendInbound({
           conversation,
@@ -159,26 +156,14 @@ describe("Crabline Slack transport", () => {
           const env = transport.createRuntimeEnvPatch?.() ?? {};
           expect(env.SLACK_API_URL).toBeTruthy();
           expect(env.SLACK_BOT_TOKEN).toBeTruthy();
-          const { response, release } = await fetchWithSsrFGuard({
-            url: `${env.SLACK_API_URL}chat.postMessage`,
-            init: {
-              body: JSON.stringify({
-                channel: "D12345678",
-                text: "assistant via fake slack",
-              }),
-              headers: {
-                authorization: `Bearer ${env.SLACK_BOT_TOKEN}`,
-                "content-type": "application/json",
-              },
-              method: "POST",
-            },
-            policy: { allowPrivateNetwork: true },
-            auditContext: "qa-lab-crabline-slack-transport-test",
-          });
-          await release();
-          expect(response.ok).toBe(true);
-
           const outbound = { conversation, text: "assistant via fake slack" };
+          await postJson(
+            `${env.SLACK_API_URL}chat.postMessage`,
+            { channel: conversation.id, text: outbound.text },
+            "qa-lab-crabline-slack-transport-test",
+            { headers: { authorization: `Bearer ${env.SLACK_BOT_TOKEN}` } },
+          );
+
           await expect(
             transport.waitForOutbound({
               conversation,
@@ -199,15 +184,11 @@ describe("Crabline Slack transport", () => {
             direction: "outbound",
           });
           holdWebhook = true;
-          const interrupted = expect(send("Interrupted webhook")).rejects.toThrow(
-            "Crabline Slack inbound transport stopped",
-          );
+          const interrupted = expect(send("Interrupted webhook")).rejects.toThrow(stopped);
           await pendingWebhook.promise;
           await transport.cleanup?.();
           await interrupted;
-          await expect(send("After shutdown")).rejects.toThrow(
-            "Crabline Slack inbound transport stopped",
-          );
+          await expect(send("After shutdown")).rejects.toThrow(stopped);
           expect(requests).toHaveLength(3);
           expect(
             transport.state
