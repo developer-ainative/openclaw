@@ -12,20 +12,29 @@ import { createRunExit } from "./bash-tools.exec-runtime.test-support.js";
 import type { BashSandboxConfig } from "./bash-tools.shared.js";
 import { prepareCoreToolPolicy } from "./prepared-tool-surface.js";
 
-const mocks = vi.hoisted(() => ({
-  egressActive: false,
-  proxyUrl: ["http://openclaw:", "fixture-password", "@127.0.0.1:19090"].join(""),
-  gatewayParams: [] as Array<{
-    env: Record<string, string>;
-    requestedEnv?: Record<string, string>;
-  }>,
-  nodeHostParams: [] as Array<{
-    env: Record<string, string>;
-    requestedEnv?: Record<string, string>;
-  }>,
-  spawnInputs: [] as Array<{ env?: Record<string, string> }>,
-  proxyBindings: [] as Array<unknown>,
-}));
+type CapturedEnvironment = Pick<ExecuteNodeHostCommandParams, "env" | "requestedEnv">;
+const { mocks, EGRESS_ENV } = vi.hoisted(() => {
+  const proxyUrl = ["http://openclaw:", "fixture-password", "@127.0.0.1:19090"].join("");
+  return {
+    EGRESS_ENV: {
+      HTTPS_PROXY: proxyUrl,
+      HTTP_PROXY: proxyUrl,
+      NODE_USE_ENV_PROXY: "1",
+      NODE_EXTRA_CA_CERTS: "/state/secret-egress/root-ca.pem",
+      SSL_CERT_FILE: "/state/secret-egress/root-ca.pem",
+      CURL_CA_BUNDLE: "/state/secret-egress/root-ca.pem",
+      REQUESTS_CA_BUNDLE: "/state/secret-egress/root-ca.pem",
+      GIT_SSL_CAINFO: "/state/secret-egress/root-ca.pem",
+    },
+    mocks: {
+      egressActive: false,
+      gatewayParams: [] as CapturedEnvironment[],
+      nodeHostParams: [] as CapturedEnvironment[],
+      spawnInputs: [] as Array<{ env?: Record<string, string> }>,
+      proxyBindings: [] as Array<unknown>,
+    },
+  };
+});
 
 vi.mock("../plugins/hook-runner-global.js", () => ({
   getGlobalHookRunner: () => null,
@@ -38,16 +47,7 @@ vi.mock("../secrets/egress-proxy/registry.js", () => ({
     mocks.proxyBindings.push(bindings);
     return {
       revoke: () => {},
-      env: {
-        HTTPS_PROXY: mocks.proxyUrl,
-        HTTP_PROXY: mocks.proxyUrl,
-        NODE_USE_ENV_PROXY: "1",
-        NODE_EXTRA_CA_CERTS: "/state/secret-egress/root-ca.pem",
-        SSL_CERT_FILE: "/state/secret-egress/root-ca.pem",
-        CURL_CA_BUNDLE: "/state/secret-egress/root-ca.pem",
-        REQUESTS_CA_BUNDLE: "/state/secret-egress/root-ca.pem",
-        GIT_SSL_CAINFO: "/state/secret-egress/root-ca.pem",
-      },
+      env: { ...EGRESS_ENV },
     };
   },
 }));
@@ -123,16 +123,13 @@ type StoreEntry = {
 
 type StoreEnvHost = "gateway" | "sandbox";
 
-const EGRESS_ENV = {
-  HTTPS_PROXY: mocks.proxyUrl,
-  HTTP_PROXY: mocks.proxyUrl,
-  NODE_USE_ENV_PROXY: "1",
-  NODE_EXTRA_CA_CERTS: "/state/secret-egress/root-ca.pem",
-  SSL_CERT_FILE: "/state/secret-egress/root-ca.pem",
-  CURL_CA_BUNDLE: "/state/secret-egress/root-ca.pem",
-  REQUESTS_CA_BUNDLE: "/state/secret-egress/root-ca.pem",
-  GIT_SSL_CAINFO: "/state/secret-egress/root-ca.pem",
-} as const;
+const lazyTool = (host: "gateway" | "node" = "gateway") =>
+  createLazyExecTool({ host, security: "full", ask: "off" });
+const execute = (
+  tool: ReturnType<typeof createLazyExecTool>,
+  callId: string,
+  command = "echo ok",
+) => tool.execute(callId, { command, yieldMs: 120_000 });
 
 const tempDirs = createTempDirTracker();
 async function writeEntries(entries: StoreEntry[]) {
@@ -192,14 +189,8 @@ describe("exec store environment", () => {
         configPath: "/fixture/custom.json",
         defaultWorkspaceDir: "/fixture/default-workspace",
       };
-      const tool = withInstallationTarget(target, () =>
-        createLazyExecTool({
-          host,
-          security: "full",
-          ask: "off",
-        }),
-      );
-      const run = tool.execute("target-probe", { command: "echo ok", yieldMs: 120_000 });
+      const tool = withInstallationTarget(target, () => lazyTool(host));
+      const run = execute(tool, "target-probe");
       if (host === "gateway") {
         await run;
         expect(mocks.spawnInputs.at(-1)?.env).toMatchObject({
@@ -207,10 +198,8 @@ describe("exec store environment", () => {
           OPENCLAW_CONFIG_PATH: target.configPath,
           OPENCLAW_WORKSPACE_DIR: target.defaultWorkspaceDir,
         });
-        const ordinary = createLazyExecTool({ host, security: "full", ask: "off" });
-        await withInstallationTarget(target, () =>
-          ordinary.execute("ordinary-probe", { command: "echo ok", yieldMs: 120_000 }),
-        );
+        const ordinary = lazyTool(host);
+        await withInstallationTarget(target, () => execute(ordinary, "ordinary-probe"));
         expect(mocks.spawnInputs.at(-1)?.env?.OPENCLAW_STATE_DIR).toBe(
           process.env.OPENCLAW_STATE_DIR,
         );
@@ -249,19 +238,18 @@ describe("exec store environment", () => {
       { name: "AWS_REGION", value: "us-west-2", kind: "env" },
       { name: "INTERNAL_VALUE", value: "not-for-subprocesses", kind: "secret" },
     ]);
-    const tool = createLazyExecTool({ host: "gateway", security: "full", ask: "off" });
+    const tool = lazyTool();
 
-    await tool.execute("code-mode-first", { command: "echo one", yieldMs: 120_000 });
+    await execute(tool, "code-mode-first", "echo one");
     await writeEntries([{ name: "AWS_REGION", value: "eu-west-1", kind: "env" }]);
-    await tool.execute("code-mode-nested", { command: "echo two", yieldMs: 120_000 });
+    await execute(tool, "code-mode-nested", "echo two");
 
     expect(mocks.gatewayParams).toHaveLength(2);
     for (const params of mocks.gatewayParams) {
       expect(params.env.AWS_REGION).toBe("us-west-2");
       expect(params.env).not.toHaveProperty("INTERNAL_VALUE");
     }
-    const nextRun = createLazyExecTool({ host: "gateway", security: "full", ask: "off" });
-    await nextRun.execute("code-mode-next-run", { command: "echo three", yieldMs: 120_000 });
+    await execute(lazyTool(), "code-mode-next-run", "echo three");
     expect(mocks.gatewayParams.at(-1)?.env.AWS_REGION).toBe("eu-west-1");
   });
 
@@ -361,12 +349,7 @@ describe("exec store environment", () => {
       { name: "HTTPS_PROXY", value: "http://store-proxy.test:8080", kind: "env" },
       { name: "NODE_EXTRA_CA_CERTS", value: "/store/ca.pem", kind: "env" },
     ]);
-    const tool = createLazyExecTool({ host: "gateway", security: "full", ask: "off" });
-
-    const result = await tool.execute("call-protected-store-env", {
-      command: "echo ok",
-      yieldMs: 120_000,
-    });
+    const result = await execute(lazyTool(), "call-protected-store-env");
 
     expect(mocks.gatewayParams[0]?.env).toMatchObject({
       PATH: "/inherited/bin",

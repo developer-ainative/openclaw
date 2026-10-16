@@ -82,16 +82,22 @@ beforeAll(async () => {
   openOpenClawStateDatabase();
 });
 
+async function admitEvent(params: RunEmbeddedAgentParams) {
+  await expectDefined(params.preparedRunAdmission, "real event admission").admit(
+    "gateway",
+    params.runId,
+  );
+  params.onExecutionPhase?.({ phase: "model_call_started" });
+  await params.onExecutionStarted?.();
+  await params.onAgentEvent?.({ stream: "lifecycle", data: { phase: "start" } });
+}
+
+const silentReply = () => ({ payloads: [{ text: "NO_REPLY" }], meta: { durationMs: 1 } });
+
 beforeEach(() => {
-  model.mockReset().mockImplementation(async (params: RunEmbeddedAgentParams) => {
-    await expectDefined(params.preparedRunAdmission, "real event admission").admit(
-      "gateway",
-      params.runId,
-    );
-    params.onExecutionPhase?.({ phase: "model_call_started" });
-    await params.onExecutionStarted?.();
-    await params.onAgentEvent?.({ stream: "lifecycle", data: { phase: "start" } });
-    return { payloads: [{ text: "NO_REPLY" }], meta: { durationMs: 1 } };
+  model.mockReset().mockImplementation(async (params) => {
+    await admitEvent(params);
+    return silentReply();
   });
   observe = vi
     .spyOn(sessionEvents, "enqueueSessionEventForHost")
@@ -143,9 +149,11 @@ async function completionPrompt(sessionKey: string, signal: AbortSignal) {
   });
   expect(model).toHaveBeenCalledOnce();
   const turn = expectDefined(model.mock.calls[0]?.[0], "completion turn");
-  expect(turn.trigger).toBe("event");
-  expect(turn.sessionKey).toBe(sessionKey);
-  expect(turn.sessionId).toBe(sessionKey.replaceAll(":", "-"));
+  expect(turn).toMatchObject({
+    trigger: "event",
+    sessionKey,
+    sessionId: sessionKey.replaceAll(":", "-"),
+  });
   return turn.prompt;
 }
 
@@ -209,6 +217,40 @@ function createGatewayExecTool(defaults: Parameters<typeof createExecTool>[0]) {
     timeoutSec: 10,
     ...defaults,
   });
+}
+
+function backgroundTool(scopeKey: string, notifyOnExit = true, notifyOnExitEmptySuccess = true) {
+  return createGatewayExecTool({
+    allowBackground: true,
+    backgroundMs: 0,
+    notifyOnExit,
+    ...(notifyOnExit ? { notifyOnExitEmptySuccess } : {}),
+    sessionKey: notifyOnExit ? scopeKey : undefined,
+    scopeKey,
+  });
+}
+
+function processActions(scopeKey: string, sessionId: string) {
+  const tool = createProcessTool({ scopeKey });
+  type Params = Parameters<typeof tool.execute>[1];
+  const call = (
+    action: Params["action"],
+    extra: Omit<Params, "action"> = {},
+    signal?: AbortSignal,
+  ) => tool.execute(`process-${action}`, { action, sessionId, ...extra }, signal);
+  const waitFor = (action: "poll" | "log", expected: string) =>
+    expect
+      .poll(
+        async () => {
+          const result = await call(action, action === "poll" ? { timeout: 250 } : {});
+          return action === "log"
+            ? textContent(result)
+            : ((result.details as { aggregated?: string }).aggregated ?? "");
+        },
+        { timeout: 5_000, interval: 25 },
+      )
+      .toContain(expected);
+  return { tool, call, waitFor };
 }
 
 function backgroundSessionId(details: ExecToolDetails): string {
@@ -489,14 +531,7 @@ test.skipIf(process.platform === "win32").for([
   async ({ name, exitCode, expectsNotification }, { signal }) => {
     const scopeKey = `agent:main:process-default-wake-${name.replaceAll(" ", "-")}`;
     await seedOrigin(scopeKey);
-    const execTool = createGatewayExecTool({
-      allowBackground: true,
-      backgroundMs: 0,
-      notifyOnExit: true,
-      notifyOnExitEmptySuccess: false,
-      sessionKey: scopeKey,
-      scopeKey,
-    });
+    const execTool = backgroundTool(scopeKey, true, false);
     const started = await execTool.execute(`process-default-wake-${name}`, {
       command: currentNodeEvalCommand(`process.exit(${exitCode});`),
       background: true,
@@ -536,14 +571,7 @@ test.skipIf(process.platform === "win32")(
       abortSignal: signal,
       deliver: false,
     });
-    const execTool = createGatewayExecTool({
-      allowBackground: true,
-      backgroundMs: 0,
-      notifyOnExit: true,
-      notifyOnExitEmptySuccess: true,
-      sessionKey: scopeKey,
-      scopeKey,
-    });
+    const execTool = backgroundTool(scopeKey);
     const processTool = createProcessTool({ scopeKey });
     const marker = "REAL_NOTIFY_ON_EXIT";
     try {
@@ -590,13 +618,7 @@ test.skipIf(process.platform === "win32")(
   "controls and cancels one real interactive background child through process tools",
   async () => {
     const scopeKey = "agent:main:process-control-roundtrip";
-    const execTool = createGatewayExecTool({
-      allowBackground: true,
-      backgroundMs: 0,
-      notifyOnExit: false,
-      scopeKey,
-    });
-    const processTool = createProcessTool({ scopeKey });
+    const execTool = backgroundTool(scopeKey, false);
     const command = currentNodeEvalCommand(
       [
         'process.stdin.setEncoding("utf8");',
@@ -633,8 +655,9 @@ test.skipIf(process.platform === "win32")(
       });
       expect(started.details).toMatchObject({ status: "running" });
       sessionId = backgroundSessionId(started.details);
+      const { tool: processTool, call, waitFor } = processActions(scopeKey, sessionId);
 
-      const listed = await processTool.execute("process-control-list", { action: "list" });
+      const listed = await call("list");
       expect(listed.details).toMatchObject({
         status: "completed",
         sessions: expect.arrayContaining([
@@ -646,138 +669,56 @@ test.skipIf(process.platform === "win32")(
         ]),
       });
 
-      await expect
-        .poll(
-          async () => {
-            const log = await processTool.execute("process-control-ready-log", {
-              action: "log",
-              sessionId,
-            });
-            return textContent(log);
-          },
-          { timeout: 5_000, interval: 25 },
-        )
-        .toContain("READY");
+      await waitFor("log", "READY");
 
-      const readyPoll = await processTool.execute(
-        "process-control-ready-poll",
-        { action: "poll", sessionId, timeout: 30_000 },
-        AbortSignal.timeout(1_000),
-      );
+      const readyPoll = await call("poll", { timeout: 30_000 }, AbortSignal.timeout(1_000));
       expect(readyPoll.details).toMatchObject({
         status: "running",
         sessionId,
         aggregated: expect.stringContaining("READY"),
       });
 
-      const write = await processTool.execute("process-control-write", {
-        action: "write",
-        sessionId,
-        data: "alpha",
-      });
+      const write = await call("write", { data: "alpha" });
       expect(write.details).toMatchObject({ status: "running", sessionId });
       expect(textContent(write)).toContain("Wrote 5 bytes");
 
-      const beforeSubmit = await processTool.execute("process-control-before-submit", {
-        action: "log",
-        sessionId,
-      });
+      const beforeSubmit = await call("log");
       expect(textContent(beforeSubmit)).not.toContain("LINE:alpha");
 
-      const submit = await processTool.execute("process-control-submit", {
-        action: "submit",
-        sessionId,
-      });
+      const submit = await call("submit");
       expect(submit.details).toMatchObject({ status: "running", sessionId });
       expect(textContent(submit)).toContain("Submitted");
 
-      await expect
-        .poll(
-          async () => {
-            const poll = await processTool.execute("process-control-alpha-poll", {
-              action: "poll",
-              sessionId,
-              timeout: 250,
-            });
-            return (poll.details as { aggregated?: string }).aggregated ?? "";
-          },
-          { timeout: 5_000, interval: 25 },
-        )
-        .toContain("LINE:alpha");
+      await waitFor("poll", "LINE:alpha");
 
-      const literal = await processTool.execute("process-control-send-literal", {
-        action: "send-keys",
-        sessionId,
-        literal: "beta",
-      });
+      const literal = await call("send-keys", { literal: "beta" });
       expect(literal.details).toMatchObject({ status: "running", sessionId });
       expect(textContent(literal)).toContain("Sent 4 bytes");
 
-      const enter = await processTool.execute("process-control-send-enter", {
-        action: "send-keys",
-        sessionId,
-        keys: ["Enter"],
-      });
+      const enter = await call("send-keys", { keys: ["Enter"] });
       expect(enter.details).toMatchObject({ status: "running", sessionId });
 
-      await expect
-        .poll(
-          async () => {
-            const poll = await processTool.execute("process-control-beta-poll", {
-              action: "poll",
-              sessionId,
-              timeout: 250,
-            });
-            return (poll.details as { aggregated?: string }).aggregated ?? "";
-          },
-          { timeout: 5_000, interval: 25 },
-        )
-        .toContain("LINE:beta");
+      await waitFor("poll", "LINE:beta");
 
-      const interrupt = await processTool.execute("process-control-send-interrupt", {
-        action: "send-keys",
-        sessionId,
-        keys: ["C-c"],
-      });
+      const interrupt = await call("send-keys", { keys: ["C-c"] });
       expect(interrupt.details).toMatchObject({ status: "running", sessionId });
-      await expect
-        .poll(
-          async () => {
-            const log = await processTool.execute("process-control-interrupt-log", {
-              action: "log",
-              sessionId,
-            });
-            return textContent(log);
-          },
-          { timeout: 5_000, interval: 25 },
-        )
-        .toContain("CONTROL:CTRL-C:2");
+      await waitFor("log", "CONTROL:CTRL-C:2");
 
-      const killed = await processTool.execute("process-control-kill", {
-        action: "kill",
-        sessionId,
-      });
+      const killed = await call("kill");
       expect(textContent(killed)).toBe(`Termination requested for session ${sessionId}.`);
       // A performed kill must not read as a failed tool call.
       expect(killed.details).toMatchObject({ status: "completed" });
       expect(Value.Check(processTool.outputSchema!, killed.details)).toBe(true);
 
       await waitForExecScope(scopeKey);
-      const finalPoll = await processTool.execute("process-control-final-poll", {
-        action: "poll",
-        sessionId,
-        timeout: 250,
-      });
+      const finalPoll = await call("poll", { timeout: 250 });
       expect(finalPoll.details).toMatchObject({
         status: "completed",
         exitReason: "manual-cancel",
         aggregated: expect.stringContaining("CONTROL:CTRL-C:2"),
       });
 
-      const completedLog = await processTool.execute("process-control-completed-log", {
-        action: "log",
-        sessionId,
-      });
+      const completedLog = await call("log");
       expect(completedLog.details).toMatchObject({ status: "completed", sessionId });
       expect(Value.Check(processTool.outputSchema!, completedLog.details)).toBe(true);
       expect(textContent(completedLog)).toContain("LINE:alpha");
@@ -785,10 +726,7 @@ test.skipIf(process.platform === "win32")(
       expect(textContent(completedLog)).toContain("CONTROL:CTRL-C:2");
     } finally {
       if (sessionId && getSession(sessionId)) {
-        await processTool.execute("process-control-cleanup", {
-          action: "kill",
-          sessionId,
-        });
+        await processActions(scopeKey, sessionId).call("kill");
       }
     }
   },
@@ -817,19 +755,13 @@ test.skipIf(process.platform === "win32")(
     const firstStarted = createDeferredCore();
     const turns: Array<{ prompt: string; deny: readonly string[] | undefined }> = [];
     model.mockImplementation(async (params: RunEmbeddedAgentParams) => {
-      await expectDefined(params.preparedRunAdmission, "real event admission").admit(
-        "gateway",
-        params.runId,
-      );
-      params.onExecutionPhase?.({ phase: "model_call_started" });
-      await params.onExecutionStarted?.();
-      await params.onAgentEvent?.({ stream: "lifecycle", data: { phase: "start" } });
+      await admitEvent(params);
       turns.push({ prompt: params.prompt, deny: params.config?.tools?.deny });
       if (turns.length === 1) {
         firstStarted.resolve();
         await held.promise;
       }
-      return { payloads: [{ text: "NO_REPLY" }], meta: { durationMs: 1 } };
+      return silentReply();
     });
     const target = await sessionEvents.captureSessionEventTargetForHost("main", scopeKey);
     sessionEvents.enqueueSessionEventForHost("Hold the active turn", {

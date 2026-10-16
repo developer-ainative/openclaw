@@ -16,6 +16,8 @@ declare module "../plugins/hook-types.js" {
 
 const CHANNEL_CONTEXT_ENV_KEY = "OPENCLAW_CHANNEL_CONTEXT";
 const OPENCLAW_CLI_ENV_VALUE = "1";
+const sessionKey = "agent:main:telegram:chat-1";
+const channelContext = { sender: { id: "ou_1", unionId: "on_1" }, chat: { id: "oc_1" } };
 type CapturedNodeHostParams = Pick<
   ExecuteNodeHostCommandParams,
   "env" | "requestedEnv" | "workdir"
@@ -112,6 +114,15 @@ function createTestExecTool(options: Parameters<typeof createExecTool>[0]) {
   return createExecTool({ security: "full", ask: "off", ...options });
 }
 
+function expectNoLaunch() {
+  expect(mocks.gatewayParams).toHaveLength(0);
+  expect(mocks.spawnInputs).toHaveLength(0);
+}
+
+function expectFailed(result: { details?: unknown }) {
+  expect(result.details).toMatchObject({ status: "failed" });
+}
+
 function backendSandboxConfig(overrides: Partial<BashSandboxConfig>): BashSandboxConfig {
   return {
     containerName: "remote-sandbox-workdir-test",
@@ -134,7 +145,7 @@ function executeWrapped(
   params: Record<string, unknown>,
   context: Parameters<typeof toToolDefinitions>[1] = {
     agentId: "main",
-    sessionKey: "agent:main:telegram:chat-1",
+    sessionKey,
   },
 ) {
   const [definition] = toToolDefinitions([tool], context);
@@ -187,14 +198,11 @@ describe("exec resolve_exec_env hook wiring", () => {
 
     const tool = createTestExecTool({
       host: "auto",
-      sessionKey: "agent:main:telegram:chat-1",
+      sessionKey,
       sessionId: "session-1",
       messageProvider: "telegram",
       currentChannelId: "chat-1",
-      channelContext: {
-        sender: { id: "ou_1", unionId: "on_1" },
-        chat: { id: "oc_1" },
-      },
+      channelContext,
     });
     await tool.execute("call-1", {
       command: "echo ok",
@@ -204,20 +212,17 @@ describe("exec resolve_exec_env hook wiring", () => {
 
     expect(mocks.hookRunner?.runResolveExecEnv).toHaveBeenCalledWith(
       {
-        sessionKey: "agent:main:telegram:chat-1",
+        sessionKey,
         toolName: "exec",
         host: "gateway",
       },
       {
         agentId: "main",
-        sessionKey: "agent:main:telegram:chat-1",
+        sessionKey,
         sessionId: "session-1",
         messageProvider: "telegram",
         channelId: "chat-1",
-        channelContext: {
-          sender: { id: "ou_1", unionId: "on_1" },
-          chat: { id: "oc_1" },
-        },
+        channelContext,
       },
     );
     for (const env of [
@@ -263,7 +268,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       workdir: "   ",
     });
 
-    expect((result.details as { status?: unknown } | undefined)?.status).toBe("failed");
+    expectFailed(result);
     expect(mocks.hookRunner?.runResolveExecEnv).not.toHaveBeenCalled();
     expect(validateWorkdir).not.toHaveBeenCalled();
     expect(mocks.nodeHostParams).toHaveLength(0);
@@ -287,16 +292,13 @@ describe("exec resolve_exec_env hook wiring", () => {
       workdir: "/remote/workspace/generated",
     });
 
-    expect(
-      result.details as { status?: unknown; deniedReason?: unknown } | undefined,
-    ).toMatchObject({
+    expect(result.details).toMatchObject({
       status: "blocked",
       deniedReason: "plugin-before-tool-call",
     });
     expect(mocks.hookRunner.runBeforeToolCall!).toHaveBeenCalledOnce();
     expect(validateWorkdir).not.toHaveBeenCalled();
-    expect(mocks.gatewayParams).toHaveLength(0);
-    expect(mocks.spawnInputs).toHaveLength(0);
+    expectNoLaunch();
   });
 
   it("defers resolve_exec_env for backend sandboxes until workdir validation succeeds", async () => {
@@ -311,12 +313,11 @@ describe("exec resolve_exec_env hook wiring", () => {
       workdir: "/remote/workspace/missing",
     });
 
-    expect((result.details as { status?: unknown } | undefined)?.status).toBe("failed");
+    expectFailed(result);
     expect(hooks.runBeforeToolCall).toHaveBeenCalledOnce();
     expect(validateWorkdir).toHaveBeenCalledWith("/remote/workspace/missing");
     expect(hooks.runResolveExecEnv).not.toHaveBeenCalled();
-    expect(mocks.gatewayParams).toHaveLength(0);
-    expect(mocks.spawnInputs).toHaveLength(0);
+    expectNoLaunch();
   });
 
   it("preserves hook context when backend sandbox env resolution is deferred", async () => {
@@ -349,7 +350,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       },
     );
 
-    expect((result.details as { status?: unknown } | undefined)?.status).toBe("completed");
+    expect(result.details).toMatchObject({ status: "completed" });
     expect(validateWorkdir).toHaveBeenCalledWith("/remote/workspace/generated");
     expect(hooks.runBeforeToolCall).toHaveBeenCalledOnce();
     expect(hooks.runResolveExecEnv).toHaveBeenCalledOnce();
@@ -364,9 +365,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       sessionId: "ctx-session",
       channelId: "ctx-channel",
     });
-    expect(buildExecSpec.mock.calls[0]?.[0]?.env).toMatchObject({
-      PLUGIN_SAFE: "yes",
-    });
+    expect(buildExecSpec.mock.calls[0]?.[0]?.env).toMatchObject({ PLUGIN_SAFE: "yes" });
   });
 
   it("lets lazy before_tool_call see invalid workdirs before failing unchanged params", async () => {
@@ -377,7 +376,7 @@ describe("exec resolve_exec_env hook wiring", () => {
 
     const exec = createOpenClawCodingTools({
       agentId: "main",
-      sessionKey: "agent:main:telegram:chat-1",
+      sessionKey,
       cwd: process.cwd(),
       exec: { host: "gateway", security: "full", ask: "off" },
     }).find((tool) => tool.name === "exec");
@@ -390,18 +389,17 @@ describe("exec resolve_exec_env hook wiring", () => {
       },
       {
         agentId: "main",
-        sessionKey: "agent:main:telegram:chat-1",
+        sessionKey,
         channelId: "chat-1",
       },
     );
     const text = result.content.find((entry) => entry.type === "text")?.text ?? "";
 
-    expect((result.details as { status?: unknown } | undefined)?.status).toBe("failed");
+    expectFailed(result);
     expect(text).toContain('workdir "   " is unavailable or not a directory');
     expect(hooks.runBeforeToolCall).toHaveBeenCalledTimes(1);
     expect(hooks.runResolveExecEnv).not.toHaveBeenCalled();
-    expect(mocks.gatewayParams).toHaveLength(0);
-    expect(mocks.spawnInputs).toHaveLength(0);
+    expectNoLaunch();
   });
 
   it("recomputes plugin env when before_tool_call changes exec host", async () => {
@@ -459,7 +457,7 @@ describe("exec resolve_exec_env hook wiring", () => {
 
     const tool = createTestExecTool({
       host: "auto",
-      sessionKey: "agent:main:telegram:chat-1",
+      sessionKey,
     });
     await executeWrapped(tool, {
       command: "echo ok",
@@ -478,7 +476,6 @@ describe("exec resolve_exec_env hook wiring", () => {
       REQUEST_SAFE: "request",
     });
     expect(mocks.nodeHostParams[0]?.workdir).toBe("/remote/node/workspace");
-    expect(mocks.gatewayParams).toHaveLength(0);
-    expect(mocks.spawnInputs).toHaveLength(0);
+    expectNoLaunch();
   });
 });
