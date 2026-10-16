@@ -2,7 +2,7 @@
 // recovery-state markers, and failed-entry moves.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it, vi } from "vitest";
 import { trackSqliteStatementExecutions } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import {
   openOpenClawStateDatabase,
@@ -40,8 +40,21 @@ import { installDeliveryQueueTmpDirHooks, readQueuedEntry } from "./delivery-que
 
 describe("delivery-queue storage", () => {
   const { tmpDir } = installDeliveryQueueTmpDirHooks();
-  const enqueueTextDelivery = (params: Parameters<typeof enqueueDelivery>[0], rootDir = tmpDir()) =>
-    enqueueDelivery(params, rootDir);
+  function textDelivery(params: Partial<Parameters<typeof enqueueDelivery>[0]> = {}) {
+    return { channel: "directchat", to: "+1555", ...params };
+  }
+  const enqueueTextDelivery = (params: Partial<Parameters<typeof enqueueDelivery>[0]> = {}) =>
+    enqueueDelivery(textDelivery(params), tmpDir());
+  async function createMedia(suffix: string, content: string) {
+    const artifact = path.join(
+      tmpDir(),
+      "delivery-queue-media",
+      `00000000-0000-4000-8000-${suffix}.ogg`,
+    );
+    await fs.mkdir(path.dirname(artifact), { recursive: true });
+    await fs.writeFile(artifact, content);
+    return artifact;
+  }
 
   it("refreshes empty recovery facts after worker and native writes without publishing rollback", async () => {
     const stateDir = tmpDir();
@@ -51,16 +64,10 @@ describe("delivery-queue storage", () => {
     expect(await read()).toEqual([]);
     expect(await read()).toEqual([]);
 
-    const id = await enqueueTextDelivery({
-      channel: "directchat",
-      to: "+1555",
-      payloads: [{ text: "Queued after an idle poll" }],
-    });
+    const id = await enqueueTextDelivery({ payloads: [{ text: "Queued after an idle poll" }] });
     expect((await read()).map((entry) => entry.id)).toEqual([id]);
     const entry = await loadPendingDelivery(id, stateDir);
-    if (!entry) {
-      throw new Error("Expected pending delivery");
-    }
+    assert(entry, "Expected pending delivery");
     await ackDelivery(id, stateDir);
     expect(await read()).toEqual([]);
     expect(await read()).toEqual([]);
@@ -105,35 +112,23 @@ describe("delivery-queue storage", () => {
     it("fences stale same-millisecond terminal mutations without releasing newer owner media", async () => {
       const stateDir = tmpDir();
       const id = "cron-direct-delivery:v1:fenced-stale-terminal-media";
-      const artifact = path.join(
-        stateDir,
-        "delivery-queue-media",
-        "00000000-0000-4000-8000-000000000090.ogg",
-      );
-      await fs.mkdir(path.dirname(artifact), { recursive: true });
-      await fs.writeFile(artifact, "newer owner still needs these bytes");
+      const artifact = await createMedia("000000000090", "newer owner still needs these bytes");
       await enqueueDeliveryOnce(
-        {
-          channel: "directchat",
-          to: "+1555",
+        textDelivery({
           payloads: [{ text: "x".repeat(64 * 1024), mediaUrl: artifact, audioAsVoice: true }],
           completionRetention: {
             idPrefix: "cron-direct-delivery:v1:",
             maxAgeMs: 24 * 60 * 60_000,
             maxEntries: 2_000,
           },
-        },
+        }),
         id,
         stateDir,
       );
       const unclaimedSnapshot = await loadPendingDelivery(id, stateDir);
-      if (!unclaimedSnapshot) {
-        throw new Error("test invariant: the unclaimed bounded row must be readable");
-      }
+      assert(unclaimedSnapshot, "test invariant: the unclaimed bounded row must be readable");
       const firstAttemptId = await claimDeliveryPlatformSendAttempt(id, stateDir);
-      if (!firstAttemptId) {
-        throw new Error("test invariant: first platform owner must claim the durable row");
-      }
+      assert(firstAttemptId, "test invariant: first platform owner must claim the durable row");
       const lostClaim = `Delivery platform claim was lost: ${id}`;
       // Admission snapshots taken before ownership must CAS the unclaimed
       // state; a producer that claimed meanwhile retains its media and row.
@@ -167,9 +162,7 @@ describe("delivery-queue storage", () => {
         sameStartedAt,
         firstAttemptId,
       );
-      if (!secondAttemptId) {
-        throw new Error("test invariant: reconciled replacement must claim the durable row");
-      }
+      assert(secondAttemptId, "test invariant: reconciled replacement must claim the durable row");
       await markDeliveryPlatformSendAttemptStarted(
         id,
         stateDir,
@@ -214,9 +207,7 @@ describe("delivery-queue storage", () => {
       );
       expect(await fs.readFile(artifact, "utf8")).toBe("newer owner still needs these bytes");
       const pending = await loadPendingDelivery(id, stateDir);
-      if (!pending) {
-        throw new Error("Expected the replacement platform owner to remain pending");
-      }
+      assert(pending, "Expected the replacement platform owner to remain pending");
       expect(pending).toMatchObject({
         recoveryState: "send_attempt_started",
         platformSendAttemptId: secondAttemptId,
@@ -230,22 +221,15 @@ describe("delivery-queue storage", () => {
       );
       retryCount.run(9007199254740992n, OUTBOUND_DELIVERY_QUEUE_NAME, id);
       try {
-        let readError: unknown;
-        try {
-          await loadPendingDelivery(id, stateDir);
-        } catch (error) {
-          readError = error;
-        }
-        if (!(readError instanceof Error)) {
-          throw new Error("Expected the full pending reader to reject the unsafe integer");
-        }
+        const readError = await loadPendingDelivery(id, stateDir).catch((error: unknown) => error);
+        assert(
+          readError instanceof Error,
+          "Expected the pending reader to reject the unsafe integer",
+        );
         expect(readError).toMatchObject({ code: "ERR_OUT_OF_RANGE" });
-        let ackError: unknown;
-        try {
-          await ackDelivery(id, stateDir, { expectedPlatformSendAttemptId: secondAttemptId });
-        } catch (error) {
-          ackError = error;
-        }
+        const ackError = await ackDelivery(id, stateDir, {
+          expectedPlatformSendAttemptId: secondAttemptId,
+        }).catch((error: unknown) => error);
         expect(ackError).toBeInstanceOf(Error);
         expect(ackError).toMatchObject({
           code: "ERR_OUT_OF_RANGE",
@@ -289,17 +273,18 @@ describe("delivery-queue storage", () => {
     });
 
     it("projects process-local hook metadata out before JSON custody", async () => {
+      const entry = {
+        sourceIndex: 0,
+        status: "suppressed" as const,
+        reason: "cancelled_by_message_sending_hook" as const,
+      };
+      const preparedBatch = { schemaVersion: 1 as const, sourcePayloadCount: 1, entries: [entry] };
       const id = await enqueueTextDelivery({
-        channel: "directchat",
-        to: "+1555",
         preparedBatch: {
-          schemaVersion: 1,
-          sourcePayloadCount: 1,
+          ...preparedBatch,
           entries: [
             {
-              sourceIndex: 0,
-              status: "suppressed",
-              reason: "cancelled_by_message_sending_hook",
+              ...entry,
               hookEffect: {
                 cancelReason: "owned elsewhere",
                 metadata: { nonJsonValue: 1n },
@@ -309,23 +294,11 @@ describe("delivery-queue storage", () => {
         },
       });
 
-      expect(readQueuedEntry(tmpDir(), id).preparedBatch).toEqual({
-        schemaVersion: 1,
-        sourcePayloadCount: 1,
-        entries: [
-          {
-            sourceIndex: 0,
-            status: "suppressed",
-            reason: "cancelled_by_message_sending_hook",
-          },
-        ],
-      });
+      expect(readQueuedEntry(tmpDir(), id).preparedBatch).toEqual(preparedBatch);
     });
 
     it("atomically reserves delivery attempts up to the producer budget", async () => {
       const id = await enqueueTextDelivery({
-        channel: "directchat",
-        to: "+1555",
         payloads: [{ text: "attempt-budget" }],
         maxRetries: 2,
       });
@@ -354,14 +327,11 @@ describe("delivery-queue storage", () => {
     it("claimless ack rejects a live-claimed row instead of deleting it", async () => {
       const stateDir = tmpDir();
       const id = await enqueueTextDelivery({
-        channel: "directchat",
         to: "+1",
         payloads: [{ text: "claimless-ack-guard" }],
       });
       const attemptId = await claimDeliveryPlatformSendAttempt(id, stateDir);
-      if (!attemptId) {
-        throw new Error("test invariant: the unclaimed row must accept a platform claim");
-      }
+      assert(attemptId, "test invariant: the unclaimed row must accept a platform claim");
 
       await expect(ackDelivery(id, stateDir)).rejects.toThrow(
         `Delivery platform claim was lost: ${id}`,
@@ -393,9 +363,7 @@ describe("delivery-queue storage", () => {
         stateDir,
       );
       const claimId = await claimDeliveryPlatformSendAttempt(id, stateDir);
-      if (!claimId) {
-        throw new Error("test invariant: explicit producer must own the stable row");
-      }
+      assert(claimId, "test invariant: explicit producer must own the stable row");
       await markDeliveryPlatformSendAttemptStarted(id, stateDir, undefined, claimId);
       const originalExpiry = Date.now() + 10_000;
       updateDeliveryQueueEntryInDatabase(
@@ -423,14 +391,11 @@ describe("delivery-queue storage", () => {
     });
 
     it("keeps ambiguous post-send evidence across a later unclaimed batch dispatch", async () => {
-      const id = await enqueueTextDelivery(
-        {
-          channel: "forum",
-          to: "123",
-          payloads: [{ text: "test" }],
-        },
-        tmpDir(),
-      );
+      const id = await enqueueTextDelivery({
+        channel: "forum",
+        to: "123",
+        payloads: [{ text: "test" }],
+      });
 
       await markDeliveryPlatformSendAttemptStarted(id, tmpDir());
       await markDeliveryPlatformOutcomeUnknown(id, tmpDir());
@@ -453,46 +418,35 @@ describe("delivery-queue storage", () => {
 
       await failDelivery(id, "provider failed", tmpDir(), claimId);
 
-      expect(readQueuedEntry(tmpDir(), id)).toMatchObject({
+      const entry = readQueuedEntry(tmpDir(), id);
+      expect(entry).toMatchObject({
         retryCount: 1,
         lastError: "provider failed",
       });
-      expect(readQueuedEntry(tmpDir(), id)).not.toHaveProperty("availableAt");
-      expect(readQueuedEntry(tmpDir(), id)).not.toHaveProperty("producerClaimId");
-      expect(readQueuedEntry(tmpDir(), id)).not.toHaveProperty("recoveryState");
+      for (const key of ["availableAt", "producerClaimId", "recoveryState"]) {
+        expect(entry).not.toHaveProperty(key);
+      }
     });
 
     it("terminalizes a rejected stable row under its exact crash claim", async () => {
       vi.useFakeTimers();
       try {
         vi.setSystemTime(1_000);
-        const artifact = path.join(
-          tmpDir(),
-          "delivery-queue-media",
-          "00000000-0000-4000-8000-000000000091.ogg",
-        );
-        await fs.mkdir(path.dirname(artifact), { recursive: true });
-        await fs.writeFile(artifact, "private rejected media");
+        const artifact = await createMedia("000000000091", "private rejected media");
         const id = "stable-rejected-after-crash-claim";
         await enqueueDeliveryOnce(
-          {
-            channel: "directchat",
-            to: "+1555",
+          textDelivery({
             payloads: [{ mediaUrl: artifact, audioAsVoice: true }],
             requiresProducerClaim: true,
-          },
+          }),
           id,
           tmpDir(),
         );
         const claimId = await claimDeliveryPlatformSendAttempt(id, tmpDir());
-        if (!claimId) {
-          throw new Error("test invariant: stable rejection must own a producer claim");
-        }
+        assert(claimId, "test invariant: stable rejection must own a producer claim");
         vi.setSystemTime(60_000);
         const claimed = await loadPendingDelivery(id, tmpDir());
-        if (!claimed) {
-          throw new Error("test invariant: claimed delivery must remain pending");
-        }
+        assert(claimed, "test invariant: claimed delivery must remain pending");
 
         await expect(failPendingDelivery({ id, entry: claimed }, tmpDir())).resolves.toEqual({
           status: "failed",
@@ -520,9 +474,7 @@ describe("delivery-queue storage", () => {
         payloads: [{ text: "blocked" }],
       });
       const entry = await loadPendingDelivery(id, tmpDir());
-      if (!entry) {
-        throw new Error("expected pending entry");
-      }
+      assert(entry, "expected pending entry");
       await moveToFailed(id, tmpDir());
 
       await expect(

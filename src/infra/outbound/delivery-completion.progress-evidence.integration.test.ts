@@ -1,5 +1,5 @@
 import path from "node:path";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { assert, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { persistPendingFinalDeliveryMarker } from "../../agents/pending-final-delivery-marker.js";
 import { capturePendingFinalRecoverySource } from "../../agents/pending-final-recovery-source.js";
 import { resolvePendingFinalDeliveryCompletion } from "../../auto-reply/reply/pending-final-delivery.js";
@@ -94,9 +94,7 @@ describe("final receipt reported progress evidence", () => {
         restartRecoveryDeliveryContext: context,
       });
       const entry = loadSessionEntry(scope);
-      if (!entry) {
-        throw new Error("missing fixture session");
-      }
+      assert(entry, "missing fixture session");
       const payloads = [{ text: "final" }];
       await persistPendingFinalDeliveryMarker({
         ...scope,
@@ -111,9 +109,7 @@ describe("final receipt reported progress evidence", () => {
         runOwnedSessionId: entry.sessionId,
       });
       const completion = resolvePendingFinalDeliveryCompletion(payloads);
-      if (!completion) {
-        throw new Error("missing final custody");
-      }
+      assert(completion, "missing final custody");
       const progress = receipt();
       if (["target", "mutated-target", "callback-mutation"].includes(placement)) {
         progress.target = { kind: "room", id: "!other:example" };

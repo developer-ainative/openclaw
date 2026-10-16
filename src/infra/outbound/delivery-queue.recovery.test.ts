@@ -1,22 +1,16 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { assert, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { controlNextRecoverySleep } from "../../../test/helpers/infra/delivery-recovery.js";
 import type { TrustedMessageAuditEvent } from "../../audit/message-audit-events.js";
 import { onTrustedMessageAuditEventForTest as onTrustedMessageAuditEvent } from "../../audit/message-audit-events.test-support.js";
 import {
-  beginConversationDeliveryOperation,
   getConversationDeliveryOperation,
   markConversationDeliveryRejected,
   markConversationDeliverySent,
   markConversationDeliverySuppressed,
 } from "../../config/sessions/conversation-delivery-store.js";
-import {
-  loadSessionEntry,
-  replaceSessionEntry,
-  upsertSessionEntryCore,
-} from "../../config/sessions/session-accessor.js";
-import { buildConversationRef } from "../../routing/conversation-ref.js";
+import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
   closeOpenClawAgentDatabasesAsync,
@@ -24,7 +18,6 @@ import {
 } from "../../state/openclaw-agent-db.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
-import { normalizeSessionDeliveryState } from "../../utils/delivery-context.shared.js";
 import { resolveDeliveryQueueStateEnv } from "../delivery-queue-state-context.js";
 import {
   OutboundDeliveryError,
@@ -50,6 +43,7 @@ import {
   asDeliverFn,
   createRecoveryLog,
   installDeliveryQueueTmpDirHooks,
+  prepareConversationDelivery,
   readQueuedEntry,
   setQueuedEntryState,
 } from "./delivery-queue.test-helpers.js";
@@ -214,10 +208,7 @@ describe("delivery-queue recovery", () => {
   async function expectPendingEntry(expected: Record<string, unknown>) {
     const entries = await loadPendingDeliveries(tmpDir());
     expect(entries).toHaveLength(1);
-    const entry = entries[0] as unknown as Record<string, unknown>;
-    for (const [key, value] of Object.entries(expected)) {
-      expect(entry[key]).toEqual(value);
-    }
+    expect(entries[0]).toMatchObject(expected);
     return entries[0];
   }
   async function enqueueClaimedRecoveryDelivery(
@@ -237,9 +228,7 @@ describe("delivery-queue recovery", () => {
       tmpDir(),
     );
     const claimId = await claimDeliveryPlatformSendAttempt(id, tmpDir());
-    if (!claimId) {
-      throw new Error("test invariant: stable delivery must own its platform attempt");
-    }
+    assert(claimId, "test invariant: stable delivery must own its platform attempt");
     await markDeliveryPlatformSendAttemptStarted(id, tmpDir(), route, claimId);
     return claimId;
   }
@@ -278,6 +267,20 @@ describe("delivery-queue recovery", () => {
     });
     return { result, log };
   };
+  function finalSessionScope(completion: { sessionKey: string; storePath: string }) {
+    return { ...completion, env: resolveDeliveryQueueStateEnv(tmpDir()) };
+  }
+  async function replaceFinalWriter(completion: { sessionKey: string; storePath: string }) {
+    const scope = finalSessionScope(completion);
+    const current = loadSessionEntry(scope);
+    assert(current, "Expected pending-final recovery session");
+    await replaceSessionEntry(scope, {
+      ...current,
+      activeWriterRunId: "replacement-writer",
+      lifecycleRevision: "replacement-revision",
+      updatedAt: Date.now(),
+    });
+  }
   async function runRecoveryWithStorageOverrides(params: {
     overrides: Partial<
       Pick<typeof deliveryQueueStorage, "ackDelivery" | "markDeliveryPlatformOutcomeUnknown">
@@ -309,35 +312,7 @@ describe("delivery-queue recovery", () => {
       storePath,
       env: { ...process.env, OPENCLAW_STATE_DIR: tmpDir() },
     };
-    const conversationRef = buildConversationRef({
-      channel: "reef",
-      accountId: "default",
-      kind: "direct",
-      peerId: "peer-agent",
-    });
-    await upsertSessionEntryCore(
-      { ...scope, sessionKey: "agent:main:reef:direct:peer-agent" },
-      {
-        sessionId: "reef-session",
-        updatedAt: 100,
-        chatType: "direct",
-        delivery: normalizeSessionDeliveryState({
-          context: { channel: "reef", accountId: "default", to: "reef:peer-agent" },
-          origin: {
-            provider: "reef",
-            accountId: "default",
-            nativeDirectUserId: "peer-agent",
-          },
-        }),
-      },
-    );
-    await beginConversationDeliveryOperation(scope, {
-      operationId,
-      operationKind: "send",
-      conversationRef,
-      message: "hello",
-      preparedMessageId: "reef-prepared",
-    });
+    await prepareConversationDelivery(scope, operationId, "hello");
     await enqueueDeliveryOnce(
       {
         channel: "reef",
@@ -509,13 +484,7 @@ describe("delivery-queue recovery", () => {
 
       const { result } = await runRecovery({ deliver });
 
-      expect(
-        loadSessionEntry({
-          sessionKey: completion.sessionKey,
-          storePath: completion.storePath,
-          env: resolveDeliveryQueueStateEnv(tmpDir()),
-        }),
-      ).toMatchObject({
+      expect(loadSessionEntry(finalSessionScope(completion))).toMatchObject({
         pendingFinalDelivery: {
           deliveries: [{ id: deliveryId, state: "unknown" }],
         },
@@ -561,27 +530,7 @@ describe("delivery-queue recovery", () => {
       const { completion } = await createPendingFinalRecoveryFixture(deliveryId, {
         withWriterAuthority: true,
       });
-      const current = loadSessionEntry({
-        sessionKey: completion.sessionKey,
-        storePath: completion.storePath,
-        env: resolveDeliveryQueueStateEnv(tmpDir()),
-      });
-      if (!current) {
-        throw new Error("test invariant: pending-final recovery session must exist");
-      }
-      await replaceSessionEntry(
-        {
-          sessionKey: completion.sessionKey,
-          storePath: completion.storePath,
-          env: resolveDeliveryQueueStateEnv(tmpDir()),
-        },
-        {
-          ...current,
-          activeWriterRunId: "replacement-writer",
-          lifecycleRevision: "replacement-revision",
-          updatedAt: Date.now(),
-        },
-      );
+      await replaceFinalWriter(completion);
       const platformSend = vi.fn();
       const deliver = vi.fn(async (params: Parameters<DeliverFn>[0]) => {
         await params[transportBoundary]?.();
@@ -604,27 +553,7 @@ describe("delivery-queue recovery", () => {
     const platformSend = vi.fn();
     const deliver = vi.fn(async (params: Parameters<DeliverFn>[0]) => {
       await params.onDirectAdapterHandoff?.();
-      const current = loadSessionEntry({
-        sessionKey: completion.sessionKey,
-        storePath: completion.storePath,
-        env: resolveDeliveryQueueStateEnv(tmpDir()),
-      });
-      if (!current) {
-        throw new Error("test invariant: pending-final recovery session must exist");
-      }
-      await replaceSessionEntry(
-        {
-          sessionKey: completion.sessionKey,
-          storePath: completion.storePath,
-          env: resolveDeliveryQueueStateEnv(tmpDir()),
-        },
-        {
-          ...current,
-          activeWriterRunId: "replacement-writer",
-          lifecycleRevision: "replacement-revision",
-          updatedAt: Date.now(),
-        },
-      );
+      await replaceFinalWriter(completion);
       params.assertDirectAdapterHandoff?.();
       await platformSend();
       return [];
@@ -1007,25 +936,23 @@ describe("delivery-queue recovery", () => {
     expect(result).toEqual(RECOVERY_SUMMARY.recovered);
     const reconcileInput = mockCallRecord(reconcileUnknownSend);
     expect(reconcileInput.cfg).toBe(baseCfg);
-    expect(reconcileInput.queueId).toBe(id);
-    expect(reconcileInput.channel).toBe("demo-channel-a");
-    expect(reconcileInput.to).toBe("+1");
-    expect(reconcileInput.accountId).toBe("acct-1");
     expect(reconcileInput.payloads).toEqual([{ text: "maybe sent" }]);
-    expect(reconcileInput.replyToId).toBe("root-message");
-    expect(reconcileInput.effectiveReplyToId).toBe("hooked-root-message");
-    expect(reconcileInput.threadId).toBe("thread-1");
-    expect(reconcileInput.silent).toBe(true);
-    expect(reconcileInput.retryCount).toBe(0);
-    const afterCommitInput = mockCallRecord(afterCommit);
-    expect(afterCommitInput.deliveryQueueId).toBe(id);
-    expect(afterCommitInput.kind).toBe("text");
-    expect(afterCommitInput.to).toBe("+1");
-    expect(afterCommitInput.accountId).toBe("acct-1");
-    expect(afterCommitInput.replyToId).toBe("hooked-root-message");
-    expect(afterCommitInput.threadId).toBe("thread-1");
-    expect(afterCommitInput.silent).toBe(true);
-    expect((afterCommitInput.result as { messageId?: string })?.messageId).toBe("platform-1");
+    const route = { to: "+1", accountId: "acct-1", threadId: "thread-1", silent: true };
+    expect(reconcileInput).toMatchObject({
+      ...route,
+      queueId: id,
+      channel: "demo-channel-a",
+      replyToId: "root-message",
+      effectiveReplyToId: "hooked-root-message",
+      retryCount: 0,
+    });
+    expect(mockCallRecord(afterCommit)).toMatchObject({
+      ...route,
+      deliveryQueueId: id,
+      kind: "text",
+      replyToId: "hooked-root-message",
+      result: { messageId: "platform-1" },
+    });
     expect(order).toEqual(["afterCommit"]);
     expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
     expectPayloadAudits(auditEvents, id, [

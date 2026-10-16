@@ -3,11 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { controlNextRecoverySleep } from "../../../test/helpers/infra/delivery-recovery.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import { beginConversationDeliveryOperation } from "../../config/sessions/conversation-delivery-store.js";
-import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import { drainPendingDeliveries as drainPluginPendingDeliveries } from "../../plugin-sdk/delivery-queue-runtime.js";
-import { buildConversationRef } from "../../routing/conversation-ref.js";
-import { normalizeSessionDeliveryState } from "../../utils/delivery-context.shared.js";
 import { PlatformMessageNotDispatchedError } from "./deliver-types.js";
 import {
   type DeliverFn,
@@ -20,6 +16,7 @@ import {
   loadPendingDeliveries,
   createRecoveryLog,
   installDeliveryQueueTmpDirHooks,
+  prepareConversationDelivery,
   readQueuedEntry,
   setQueuedEntryState,
 } from "./delivery-queue.test-helpers.js";
@@ -101,35 +98,11 @@ describe("drainPendingDeliveriesCore for reconnect", () => {
     const operationId = "conversation-reconnect";
     const storePath = path.join(tmpDir, "agent-sessions.json");
     const scope = { agentId: "main", storePath };
-    const conversationRef = buildConversationRef({
-      channel: "reef",
-      accountId: "default",
-      kind: "direct",
-      peerId: "peer-agent",
-    });
-    await upsertSessionEntryCore(
-      { ...scope, sessionKey: "agent:main:reef:direct:peer-agent" },
-      {
-        sessionId: "reef-session",
-        updatedAt: 100,
-        chatType: "direct",
-        delivery: normalizeSessionDeliveryState({
-          context: { channel: "reef", accountId: "default", to: "reef:peer-agent" },
-          origin: {
-            provider: "reef",
-            accountId: "default",
-            nativeDirectUserId: "peer-agent",
-          },
-        }),
-      },
-    );
-    await beginConversationDeliveryOperation(scope, {
+    await prepareConversationDelivery(
+      scope,
       operationId,
-      operationKind: "send",
-      conversationRef,
-      message: "deliver only through the authorized recovery owner",
-      preparedMessageId: "reef-prepared",
-    });
+      "deliver only through the authorized recovery owner",
+    );
     const id = await enqueueDelivery(
       {
         channel: "reef",

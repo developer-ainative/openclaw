@@ -1,5 +1,5 @@
 import path from "node:path";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { assert, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { persistPendingFinalDeliveryMarker } from "../../agents/pending-final-delivery-marker.js";
 import type { TrustedMessageAuditEvent } from "../../audit/message-audit-events.js";
@@ -86,6 +86,44 @@ describe("pending-final durable delivery completion", () => {
       },
     };
   }
+  async function prepareWriter(name: string) {
+    const scope = {
+      agentId: "main",
+      sessionKey: `agent:main:matrix:direct:${name}`,
+      storePath: path.join(tmpDir, "sessions.json"),
+    };
+    const entry = {
+      sessionId: `${name}-session`,
+      lifecycleRevision: `${name}-revision`,
+      activeWriterRunId: `${name}-writer`,
+      updatedAt: 1,
+    };
+    const authority = {
+      ...scope,
+      expectedSessionId: entry.sessionId,
+      expectedLifecycleRevision: entry.lifecycleRevision,
+      expectedWriterRunId: entry.activeWriterRunId,
+    };
+    await replaceSessionEntry(scope, entry);
+    return { scope, entry, authority };
+  }
+  function markFinal(
+    scope: { agentId: string; sessionKey: string; storePath: string },
+    entry: NonNullable<ReturnType<typeof loadSessionEntry>>,
+    payloads: Parameters<typeof persistPendingFinalDeliveryMarker>[0]["payloads"],
+  ) {
+    return persistPendingFinalDeliveryMarker({
+      ...scope,
+      sessionEntry: entry,
+      sessionStore: { [scope.sessionKey]: entry },
+      payloads,
+      deliver: true,
+      suppressVisibleSessionEffects: false,
+      sessionReboundDuringRun: false,
+      deliveryContext: { channel: "matrix", to: "!room:example" },
+      runOwnedSessionId: entry.sessionId,
+    });
+  }
 
   it.each(["global", "unknown"])(
     "retains the selected owner through a queued %s final, settlement, and repeat suppression",
@@ -97,28 +135,12 @@ describe("pending-final durable delivery completion", () => {
       await replaceSessionEntry(ops, { sessionId: "ops-session", updatedAt: 1, label: "ops" });
       const mainBefore = loadSessionEntry(main);
       const entry = loadSessionEntry(ops);
-      if (!entry) {
-        throw new Error("Expected the selected agent's session");
-      }
+      assert(entry, "Expected the selected agent's session");
       const payloads = [{ text: "the selected agent's final" }];
-      const marker = await persistPendingFinalDeliveryMarker({
-        agentId: "ops",
-        deliver: true,
-        sessionStore: { [sessionKey]: entry },
-        sessionKey,
-        sessionEntry: entry,
-        storePath,
-        suppressVisibleSessionEffects: false,
-        sessionReboundDuringRun: false,
-        payloads,
-        deliveryContext: { channel: "matrix", to: "!room:example" },
-        runOwnedSessionId: entry.sessionId,
-      });
+      const marker = await markFinal(ops, entry, payloads);
       expect(marker.pendingFinalDeliveryMarkerPersisted).toBe(true);
       const completion = resolvePendingFinalDeliveryCompletion(payloads);
-      if (!completion) {
-        throw new Error("Expected a durable completion from the marker");
-      }
+      assert(completion, "Expected a durable completion from the marker");
       const sendMatrix = vi.fn(async () => {
         expect((await loadPendingDeliveries(tmpDir))[0]?.deliveryCompletion).toMatchObject({
           agentId: "ops",
@@ -155,42 +177,14 @@ describe("pending-final durable delivery completion", () => {
   );
 
   it("retains the writer in queued custody after a channel transforms a direct final", async () => {
-    const scope = {
-      agentId: "main",
-      sessionKey: "agent:main:matrix:direct:rendered-final",
-      storePath: path.join(tmpDir, "sessions.json"),
-    };
-    const authority = {
-      ...scope,
-      expectedSessionId: "rendered-session",
-      expectedLifecycleRevision: "rendered-revision",
-      expectedWriterRunId: "rendered-writer",
-    };
-    await replaceSessionEntry(scope, {
-      sessionId: authority.expectedSessionId,
-      lifecycleRevision: authority.expectedLifecycleRevision,
-      activeWriterRunId: authority.expectedWriterRunId,
-      updatedAt: 1,
-    });
+    const { scope, authority } = await prepareWriter("rendered-final");
     const entry = loadSessionEntry(scope);
-    if (!entry) {
-      throw new Error("Expected the direct delivery session");
-    }
+    assert(entry, "Expected the direct delivery session");
     const payload = setReplyPayloadMetadata(
       { text: "original final" },
       { sessionWriterDeliveryAuthority: authority },
     );
-    await persistPendingFinalDeliveryMarker({
-      ...scope,
-      deliver: true,
-      sessionStore: { [scope.sessionKey]: entry },
-      sessionEntry: entry,
-      suppressVisibleSessionEffects: false,
-      sessionReboundDuringRun: false,
-      payloads: [payload],
-      deliveryContext: { channel: "matrix", to: "!room:example" },
-      runOwnedSessionId: entry.sessionId,
-    });
+    await markFinal(scope, entry, [payload]);
     const custody = await createDirectPendingFinalCustody(payload, scope.storePath);
     const completion = resolvePendingFinalDeliveryCompletion([payload]);
     if (!custody || !completion) {
@@ -204,9 +198,7 @@ describe("pending-final durable delivery completion", () => {
       return { messageId: "rendered-final-message" };
     });
     const rendered = custody.bindPendingFinalDelivery?.({ text: "channel-rendered final" });
-    if (!rendered) {
-      throw new Error("Expected the direct owner to bind the rendered payload");
-    }
+    assert(rendered, "Expected the direct owner to bind the rendered payload");
 
     const result = await sendDurableMessageBatchCore({
       cfg: {},
@@ -229,31 +221,10 @@ describe("pending-final durable delivery completion", () => {
   });
 
   it("revokes prepared direct delivery after a writer commit without host SQL", async () => {
-    const scope = {
-      agentId: "main",
-      sessionKey: "agent:main:matrix:direct:replaced-writer",
-      storePath: path.join(tmpDir, "sessions.json"),
-    };
-    const entry = {
-      sessionId: "session",
-      lifecycleRevision: "revision",
-      activeWriterRunId: "writer",
-      updatedAt: 1,
-    };
-    await replaceSessionEntry(scope, entry);
+    const { scope, entry, authority } = await prepareWriter("replaced-writer");
     const sql = observeHostDataSql();
     const custody = await createDirectPendingFinalCustody(
-      setReplyPayloadMetadata(
-        { text: "final" },
-        {
-          sessionWriterDeliveryAuthority: {
-            ...scope,
-            expectedSessionId: entry.sessionId,
-            expectedLifecycleRevision: entry.lifecycleRevision,
-            expectedWriterRunId: entry.activeWriterRunId,
-          },
-        },
-      ),
+      setReplyPayloadMetadata({ text: "final" }, { sessionWriterDeliveryAuthority: authority }),
     );
     try {
       expect(sql.queries).toEqual([]);
