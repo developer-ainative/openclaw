@@ -99,8 +99,13 @@ export default {
     expect(new Set(workers.map((worker) => `${worker.pid}:${worker.threadId}`)).size, output).toBe(
       1,
     );
-    expect(result.status, output).toBe(0);
+    expect(fs.existsSync(reportPath), output).toBe(true);
     const report = JSON.parse(fs.readFileSync(reportPath, "utf8")) as JsonTestResults;
+    const failures = report.testResults.flatMap((file) => [
+      file.message,
+      ...file.assertionResults.flatMap((assertion) => assertion.failureMessages ?? []),
+    ]);
+    expect(result.status, [output, ...failures].filter(Boolean).join("\n").slice(-16_384)).toBe(0);
     expect(report.testResults, output).toHaveLength(2);
     expect(report.numFailedTests, output).toBe(0);
     for (const file of report.testResults) {
