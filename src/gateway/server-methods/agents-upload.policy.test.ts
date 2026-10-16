@@ -56,6 +56,13 @@ const workspaceState = (bootstrapPending = false) => ({
 function disableUploads() {
   config = { ...config, gateway: { uploads: { enabled: false } } };
 }
+function configureIdentity(avatar?: string) {
+  const identity = { name: "Existing", ...(avatar ? { avatar } : {}) };
+  config = {
+    gateway: { uploads: { enabled: true } },
+    agents: { entries: { existing: { workspace, identity } } },
+  };
+}
 function expectSuccess(respond: ReturnType<typeof vi.fn>, payload = expect.anything()) {
   expect(respond).toHaveBeenCalledWith(true, payload, undefined);
 }
@@ -105,10 +112,7 @@ beforeEach(async () => {
   identityPath = path.join(workspace, "IDENTITY.md");
   await fs.mkdir(workspace);
   await fs.writeFile(identityPath, originalIdentity);
-  config = {
-    gateway: { uploads: { enabled: true } },
-    agents: { entries: { existing: { workspace, identity: { name: "Existing" } } } },
-  };
+  configureIdentity();
   await state.writeConfig(config);
   // Workspace bootstrap has its own authority tests. Keep this boundary fixture on
   // the existing, already-hatched workspace and the real identity/config writers.
@@ -130,6 +134,12 @@ it.each([
     entered.resolve();
     await resume.promise;
   };
+  const pauseBefore =
+    <A extends unknown[], R>(action: (...args: A) => Promise<R>) =>
+    async (...args: A) => {
+      await pause();
+      return await action(...args);
+    };
   let release: (() => void) | undefined;
   const writeFile = vi.fn(async (params: { data: string | Uint8Array }) => {
     await fs.writeFile(identityPath, params.data);
@@ -141,10 +151,7 @@ it.each([
       const handle = await realRoot(...args);
       if (args[0] === workspace) {
         const write = handle.write.bind(handle);
-        vi.spyOn(handle, "write").mockImplementation(async (...writeArgs) => {
-          await pause();
-          return await write(...writeArgs);
-        });
+        vi.spyOn(handle, "write").mockImplementation(pauseBefore(write));
       }
       return handle;
     });
@@ -153,20 +160,14 @@ it.each([
       vi.mocked(workspaceOwner.ensureAgentWorkspace).mockResolvedValue(workspaceState(true));
     }
     const prepare = configBackup.prepareConfigFileWrite;
-    vi.spyOn(configBackup, "prepareConfigFileWrite").mockImplementation(async (params) => {
-      await pause();
-      return await prepare(params);
-    });
+    vi.spyOn(configBackup, "prepareConfigFileWrite").mockImplementation(pauseBefore(prepare));
   } else {
     release = registerAgentWorkspaceAccess(workspace, {
       bridge: {
-        readFile: async () => {
-          if (stage === "remote-read") {
-            await pause();
-            return Buffer.from(originalIdentity);
-          }
-          return await fs.readFile(identityPath);
-        },
+        readFile:
+          stage === "remote-read"
+            ? pauseBefore(async () => Buffer.from(originalIdentity))
+            : () => fs.readFile(identityPath),
         writeFile,
         stat: vi.fn(),
       },
@@ -232,12 +233,7 @@ it.each(["agents.create", "agents.update"] as const)(
 );
 
 it("allows text-only edits to an existing inline avatar while uploads are disabled", async () => {
-  config = {
-    ...config,
-    agents: {
-      entries: { existing: { workspace, identity: { name: "Existing", avatar: inlineAvatar } } },
-    },
-  };
+  configureIdentity(inlineAvatar);
   disableUploads();
   await state.writeConfig(config);
   expectSuccess(await call("agents.update", { name: "Text Only" }), updated);

@@ -1,4 +1,6 @@
+import type { Stats } from "node:fs";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { expect, it, type vi, type Mock } from "vitest";
 import type {
   AgentDeletionJournalCleanupPath,
@@ -9,21 +11,10 @@ import type { AgentMutationHarness } from "./agents-mutate.test.js";
 
 export { expectRecordFields };
 
-type MockIdentity = {
-  name?: string;
-  theme?: string;
-  emoji?: string;
-  avatar?: string;
-};
-
 export type MockAgentEntry = {
   id: string;
-  name?: string;
-  workspace?: string;
-  agentDir?: string;
-  model?: string;
-  identity?: MockIdentity;
-};
+  identity?: Partial<Record<"name" | "theme" | "emoji" | "avatar", string>>;
+} & Partial<Record<"name" | "workspace" | "agentDir" | "model", string>>;
 
 export type MockConfig = {
   agents?: {
@@ -46,13 +37,9 @@ export function getAgentList(cfg: unknown): MockAgentEntry[] {
 
 export function mergeAgentConfig(cfg: unknown, opts: unknown): MockConfig {
   const config = (cfg as MockConfig | undefined) ?? {};
-  const params = (opts as {
+  const params = (opts as Partial<Omit<MockAgentEntry, "id" | "model">> & {
     agentId?: string;
-    name?: string;
-    workspace?: string;
-    agentDir?: string;
     model?: string | null;
-    identity?: MockIdentity;
   }) ?? { agentId: "" };
   const agentId = params.agentId ?? "";
   const base = config.agents?.entries?.[agentId];
@@ -91,9 +78,7 @@ export function cleanupPath(
   };
 }
 
-export function createEnoentError() {
-  return createErrnoError("ENOENT");
-}
+export const createEnoentError = () => createErrnoError("ENOENT");
 
 export function createErrnoError(code: string) {
   return Object.assign(new Error(code), { code });
@@ -118,21 +103,20 @@ export function deletionJournal(
   };
 }
 
-export function registerAgentCreationCommitTests({ mocks, makeCall }: AgentMutationHarness) {
-  const create = (params: Record<string, unknown>) => makeCall("agents.create", params);
+export function registerAgentCreationCommitTests({ mocks, call }: AgentMutationHarness) {
+  const create = (params: Record<string, unknown>) => call("agents.create", params);
   it.each([
     { name: "Test Agent", workspace: "/home/user/agents/test", fancy: false },
     { name: "Test Agent", workspace: undefined, fancy: false },
     { name: "Fancy Agent", workspace: "/tmp/ws", fancy: true },
   ])("creates $name (workspace=$workspace)", async ({ name, workspace, fancy }) => {
-    const { respond, promise } = create({
+    const respond = await create({
       name,
       ...(workspace ? { workspace } : {}),
       ...(fancy
         ? { model: "sonnet-4.6", emoji: "🤖", avatar: "https://example.com/avatar.png" }
         : {}),
     });
-    await promise;
     expectRespondOk(respond, {
       ok: true,
       agentId: fancy ? "fancy-agent" : "test-agent",
@@ -167,9 +151,7 @@ export function registerAgentCreationCommitTests({ mocks, makeCall }: AgentMutat
       ["/agents/test-agent/openclaw-agent.sqlite", "test-agent"],
     ]);
     mocks.reviveAgentDatabases.mockRejectedValueOnce(new Error("worker acknowledgement failed"));
-    const { respond, promise } = create({ name: "Test Agent" });
-
-    await promise;
+    const respond = await create({ name: "Test Agent" });
 
     expectRespondOk(respond, { ok: true, agentId: "test-agent" });
     expect(mocks.loadConfigReturn).toMatchObject({
@@ -183,9 +165,7 @@ export function registerAgentCreationCommitTests({ mocks, makeCall }: AgentMutat
   });
 
   it("rejects invalid params (missing name)", async () => {
-    const { respond, promise } = create({ workspace: "/tmp/ws" });
-    await promise;
-
+    const respond = await create({ workspace: "/tmp/ws" });
     expectRespondErrorContaining(respond, "invalid");
   });
 }
@@ -196,32 +176,22 @@ export function expectUncalled(...callbacks: unknown[]) {
   }
 }
 
-export function makeFileStat({
-  size = 10,
-  mtimeMs = 1234,
-  dev = 1,
-  ino = 1,
-  nlink = 1,
-}: Partial<
-  Pick<import("node:fs").Stats, "size" | "mtimeMs" | "dev" | "ino" | "nlink">
-> = {}): import("node:fs").Stats {
+export function makeFileStat(
+  params: Partial<Pick<Stats, "size" | "mtimeMs" | "dev" | "ino" | "nlink">> = {},
+): Stats {
   return {
     isFile: () => true,
     isSymbolicLink: () => false,
-    size,
-    mtimeMs,
-    dev,
-    ino,
-    nlink,
-  } as unknown as import("node:fs").Stats;
+    size: params.size ?? 10,
+    mtimeMs: params.mtimeMs ?? 1234,
+    dev: params.dev ?? 1,
+    ino: params.ino ?? 1,
+    nlink: params.nlink ?? 1,
+  } as unknown as Stats;
 }
 
 export function mockCallArg(mock: ReturnType<typeof vi.fn>, callIndex = 0, argIndex = 0) {
-  const call = mock.mock.calls[callIndex];
-  if (!call) {
-    throw new Error(`Expected mock call ${callIndex}`);
-  }
-  return call[argIndex];
+  return expectDefined(mock.mock.calls[callIndex], `Expected mock call ${callIndex}`)[argIndex];
 }
 
 export function expectRespondOk(

@@ -25,6 +25,14 @@ import type { AgentMutationHarness } from "./agents-mutate.test.js";
 
 export function registerAgentDeleteDrainRecoveryTests(harness: AgentMutationHarness): void {
   const { mocks, makeCall, call, resume, expectTrashedWithinParent, expectNotTrashed } = harness;
+  const remove = () => makeCall("agents.delete", { agentId: "test-agent" });
+  const expectStorageUntouched = (...other: unknown[]) =>
+    expectUncalled(
+      mocks.beginAgentDeletionRetire,
+      mocks.writeConfigFile,
+      mocks.movePathToTrash,
+      ...other,
+    );
   it.each([
     new Error("Placement read failed; restore the placement database and retry"),
     new Error("Session placement identity changed; reload the session and retry"),
@@ -40,12 +48,11 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentMutationHarn
       .spyOn(sessionPlacement, "prepareSessionWorkerPlacementStop")
       .mockRejectedValueOnce(placementError);
     try {
-      const deletion = makeCall("agents.delete", { agentId: "test-agent" });
+      const deletion = remove();
       await expect(deletion.promise).rejects.toBe(placementError);
-      expect(handle.abort).not.toHaveBeenCalled();
       expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeDefined();
       expect(EMBEDDED_RUN_WAITERS.has(sessionId)).toBe(false);
-      expectUncalled(mocks.beginAgentDeletionRetire, mocks.writeConfigFile, mocks.movePathToTrash);
+      expectStorageUntouched(handle.abort);
     } finally {
       prepareStop.mockRestore();
       clearActiveEmbeddedRun(sessionId, handle, sessionKey);
@@ -77,7 +84,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentMutationHarn
             .spyOn(sessionPlacement, "prepareSessionWorkerPlacementStop")
             .mockReturnValueOnce(preparation.promise)
         : undefined;
-      const deletion = makeCall("agents.delete", { agentId: "test-agent" });
+      const deletion = remove();
       const failed = vi.fn();
       const completed = Promise.resolve(deletion.promise).catch(failed);
       try {
@@ -102,11 +109,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentMutationHarn
         }
         expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeDefined();
         expect(EMBEDDED_RUN_WAITERS.has(sessionId)).toBe(false);
-        expectUncalled(
-          mocks.beginAgentDeletionRetire,
-          mocks.writeConfigFile,
-          mocks.movePathToTrash,
-        );
+        expectStorageUntouched();
       } finally {
         if (slowPlacement) {
           preparation.resolve({ stop, startBeforeDrain: false });
@@ -135,7 +138,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentMutationHarn
       const owner = settled.promise.then(() =>
         clearActiveEmbeddedRun(sessionId, handle, sessionKey),
       );
-      const deletion = makeCall("agents.delete", { agentId: "test-agent" });
+      const deletion = remove();
       try {
         await withinTest(
           awaitGateBeforeSettlement(
@@ -213,91 +216,83 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentMutationHarn
     );
     await resume();
     expect(mocks.logGatewayWarn).toHaveBeenCalledOnce();
-    expectUncalled(
-      mocks.beginAgentDeletionRetire,
-      mocks.beginAgentDeletionFinish,
-      mocks.closeOpenClawAgentDatabaseByPath,
-      mocks.movePathToTrash,
-      mocks.writeConfigFile,
-    );
+    expectStorageUntouched(mocks.beginAgentDeletionFinish, mocks.closeOpenClawAgentDatabaseByPath);
   });
 
-  it("settles recovery without touching a journaled directory claimed by another agent", async () => {
-    mocks.resolveOpenClawAgentSqlitePath.mockImplementation(
-      (params) => params?.path ?? "/journal/agent/openclaw-agent.sqlite",
-    );
-    const directoryOwners = new Map([["/journal/agent", "other-agent"]]);
-    const databaseRows = [
-      { agentId: "test-agent", path: "/journal/agent/openclaw-agent.sqlite" },
-      { agentId: "other-agent", path: "/journal/agent/openclaw-agent.sqlite" },
-    ];
-    mocks.loadConfigReturn = agentConfig({ main: {} });
-    mocks.readAgentDeletionJournal.mockReturnValue(
-      deletionJournal({ workspaceDir: "/journal", sessionsDir: "/deleted/sessions" }),
-    );
-    mocks.resolveRegisteredAgentIdForDir.mockImplementation((pathname?: string) =>
-      directoryOwners.get(pathname ?? ""),
-    );
-    mocks.isPathOwnedByAnotherRegisteredAgent.mockImplementation(
-      ({ agentId, pathname }: { agentId: string; pathname: string }) =>
-        (pathname === "/journal/agent" || pathname.startsWith("/journal/agent/")) &&
-        directoryOwners.get("/journal/agent") !== agentId,
-    );
-    mocks.unregisterResolvedAgentDir.mockImplementation(
-      ({ agentId, agentDir }: { agentId: string; agentDir: string }) =>
-        directoryOwners.get(agentDir) === agentId && directoryOwners.delete(agentDir),
-    );
-    mocks.listOpenClawRegisteredAgentDatabases.mockImplementation(() => databaseRows);
-
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { ok: true });
-    expect(mocks.listOpenClawRegisteredAgentDatabases).toHaveBeenCalled();
-    expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalledWith(
-      "/journal/agent/openclaw-agent.sqlite",
-      "test-agent",
-    );
-    expect(mocks.assertNoOpenClawAgentDatabaseLeases).toHaveBeenCalledWith("test-agent", {});
-    expect(mocks.closeDeletedAgentDatabases).toHaveBeenCalledWith(
-      "test-agent",
-      [],
-      expect.objectContaining({
-        assertCurrentFinal: mocks.assertAgentDeletionCurrentFinal,
-        assertCurrentAsync: mocks.assertAgentDeletionCurrentAsync,
-      }),
-    );
-    expectNotTrashed("/journal/agent", "/journal");
-    expectTrashedWithinParent("/deleted/sessions");
-    expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledWith({ unregisterDatabases: true });
-    expect(mocks.unregisterResolvedAgentDir).toHaveBeenCalledWith({
-      agentId: "test-agent",
-      agentDir: "/journal/agent",
-    });
-    expect(directoryOwners.get("/journal/agent")).toBe("other-agent");
-    expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledOnce();
-  });
-
-  it("protects every journaled path claimed as a surviving agent workspace", async () => {
-    mocks.resolveOpenClawAgentSqlitePath.mockImplementation(
-      (params) => params?.path ?? "/journal/agent/openclaw-agent.sqlite",
-    );
-    mocks.loadConfigReturn = agentConfig({ "other-agent": { workspace: "/journal" } });
-    mocks.readAgentDeletionJournal.mockReturnValue(deletionJournal());
-
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { ok: true, removed: [], failed: [] });
-    expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalledWith(
-      "/journal/agent/openclaw-agent.sqlite",
-      "test-agent",
-    );
-    expectUncalled(mocks.movePathToTrash, mocks.deleteWorkspaceState);
-    expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledOnce();
-  });
+  it.each(["registered directory", "surviving workspace"])(
+    "settles recovery without touching a %s claimed by another agent",
+    async (claim) => {
+      const workspaceClaim = claim === "surviving workspace";
+      mocks.resolveOpenClawAgentSqlitePath.mockImplementation(
+        (params) => params?.path ?? "/journal/agent/openclaw-agent.sqlite",
+      );
+      const directoryOwners = new Map([["/journal/agent", "other-agent"]]);
+      mocks.loadConfigReturn = agentConfig(
+        workspaceClaim ? { "other-agent": { workspace: "/journal" } } : { main: {} },
+      );
+      mocks.readAgentDeletionJournal.mockReturnValue(
+        deletionJournal(
+          workspaceClaim ? {} : { workspaceDir: "/journal", sessionsDir: "/deleted/sessions" },
+        ),
+      );
+      if (!workspaceClaim) {
+        mocks.resolveRegisteredAgentIdForDir.mockImplementation((pathname?: string) =>
+          directoryOwners.get(pathname ?? ""),
+        );
+        mocks.isPathOwnedByAnotherRegisteredAgent.mockImplementation(
+          ({ agentId, pathname }: { agentId: string; pathname: string }) =>
+            (pathname === "/journal/agent" || pathname.startsWith("/journal/agent/")) &&
+            directoryOwners.get("/journal/agent") !== agentId,
+        );
+        mocks.unregisterResolvedAgentDir.mockImplementation(
+          ({ agentId, agentDir }: { agentId: string; agentDir: string }) =>
+            directoryOwners.get(agentDir) === agentId && directoryOwners.delete(agentDir),
+        );
+        mocks.listOpenClawRegisteredAgentDatabases.mockReturnValue([
+          { agentId: "test-agent", path: "/journal/agent/openclaw-agent.sqlite" },
+          { agentId: "other-agent", path: "/journal/agent/openclaw-agent.sqlite" },
+        ]);
+      }
+      const deletion = remove();
+      await deletion.promise;
+      expectRespondOk(
+        deletion.respond,
+        workspaceClaim ? { ok: true, removed: [], failed: [] } : { ok: true },
+      );
+      expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalledWith(
+        "/journal/agent/openclaw-agent.sqlite",
+        "test-agent",
+      );
+      expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledOnce();
+      if (workspaceClaim) {
+        expectUncalled(mocks.movePathToTrash, mocks.deleteWorkspaceState);
+        return;
+      }
+      expect(mocks.listOpenClawRegisteredAgentDatabases).toHaveBeenCalled();
+      expect(mocks.assertNoOpenClawAgentDatabaseLeases).toHaveBeenCalledWith("test-agent", {});
+      expect(mocks.closeDeletedAgentDatabases).toHaveBeenCalledWith(
+        "test-agent",
+        [],
+        expect.objectContaining({
+          assertCurrentFinal: mocks.assertAgentDeletionCurrentFinal,
+          assertCurrentAsync: mocks.assertAgentDeletionCurrentAsync,
+        }),
+      );
+      expectNotTrashed("/journal/agent", "/journal");
+      expectTrashedWithinParent("/deleted/sessions");
+      expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledWith({ unregisterDatabases: true });
+      expect(mocks.unregisterResolvedAgentDir).toHaveBeenCalledWith({
+        agentId: "test-agent",
+        agentDir: "/journal/agent",
+      });
+      expect(directoryOwners.get("/journal/agent")).toBe("other-agent");
+    },
+  );
 }
 
 export function registerAgentDeleteRollbackTests(harness: AgentMutationHarness): void {
   const { mocks, makeCall, call } = harness;
+  const remove = () => makeCall("agents.delete", { agentId: "test-agent" });
   it("rolls back a fresh deletion when draining leaves it as the only configured agent", async () => {
     mocks.sharedAuthStoreOwnership = { location: "state-db" };
     mocks.beginAgentDeletionRetire.mockImplementationOnce(() => {
@@ -320,10 +315,11 @@ export function registerAgentDeleteRollbackTests(harness: AgentMutationHarness):
   });
 
   it("rolls cron back and keeps the roster when authority cleanup fails", async () => {
-    const cronJobs = [
+    const originalJobs = [
       { id: "deleted-job", agentId: "test-agent" },
       { id: "other-job", agentId: "other-agent" },
     ];
+    const cronJobs = structuredClone(originalJobs);
     mocks.cronRemoveAgentJobsTransactional.mockImplementation(
       async (agentId: string, commit: () => Promise<unknown>) => {
         const snapshot = structuredClone(cronJobs);
@@ -338,13 +334,10 @@ export function registerAgentDeleteRollbackTests(harness: AgentMutationHarness):
     );
     mocks.withAgentExecApprovalsRemoved.mockRejectedValueOnce(new Error("approvals busy"));
 
-    const { promise } = makeCall("agents.delete", { agentId: "test-agent" });
+    const { promise } = remove();
 
     await expect(promise).rejects.toThrow("approvals busy");
-    expect(cronJobs).toEqual([
-      { id: "deleted-job", agentId: "test-agent" },
-      { id: "other-job", agentId: "other-agent" },
-    ]);
+    expect(cronJobs).toEqual(originalJobs);
     expect(mocks.beginAgentDeletionRollback).toHaveBeenCalledOnce();
     expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalledTimes(1);
     expectUncalled(mocks.writeConfigFile, mocks.movePathToTrash);
@@ -376,9 +369,7 @@ export function registerAgentDeleteRollbackTests(harness: AgentMutationHarness):
             ),
       );
     }
-    await expect(makeCall("agents.delete", { agentId: "test-agent" }).promise).rejects.toThrow(
-      message,
-    );
+    await expect(remove().promise).rejects.toThrow(message);
     expect(mocks.beginAgentDeletionRollback).not.toHaveBeenCalled();
     if (label !== "post-write refresh") {
       expect(mocks.writeConfigFile).not.toHaveBeenCalled();

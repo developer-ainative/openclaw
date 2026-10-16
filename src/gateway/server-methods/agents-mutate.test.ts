@@ -162,11 +162,9 @@ const mocks = vi.hoisted(() => ({
   >(async () => false),
 }));
 
-vi.mock("../../config/config.js", async () => {
-  const actual =
-    await vi.importActual<typeof import("../../config/config.js")>("../../config/config.js");
+vi.mock("../../config/config.js", async (importOriginal) => {
   return {
-    ...actual,
+    ...(await importOriginal<typeof import("../../config/config.js")>()),
     getRuntimeConfig: () => mocks.loadConfigReturn,
     writeConfigFile: mocks.writeConfigFile,
     replaceConfigFile: async (params: { nextConfig: unknown }) =>
@@ -227,10 +225,8 @@ vi.mock("../../commands/agents.config.js", () => ({
   pruneAgentConfig: mocks.pruneAgentConfig,
 }));
 
-vi.mock("../../agents/auth-profiles/path-resolve.js", async () => ({
-  ...(await vi.importActual<typeof import("../../agents/auth-profiles/path-resolve.js")>(
-    "../../agents/auth-profiles/path-resolve.js",
-  )),
+vi.mock("../../agents/auth-profiles/path-resolve.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../agents/auth-profiles/path-resolve.js")>()),
   resolveSharedAuthStoreOwnership: () => mocks.sharedAuthStoreOwnership,
   prepareSharedAuthStoreOwnership: async () => mocks.sharedAuthStoreOwnership,
   resolveSharedAuthStorePath: () => "/resolved/agents/main/agent/openclaw-agent.sqlite",
@@ -388,21 +384,14 @@ vi.mock("../../state/openclaw-agent-db-lease.js", () => ({
   assertNoOpenClawAgentDatabaseLeases: mocks.assertNoOpenClawAgentDatabaseLeases,
 }));
 
-vi.mock("../../agents/workspace.js", async () => {
-  const actual = await vi.importActual<typeof import("../../agents/workspace.js")>(
-    "../../agents/workspace.js",
-  );
-  return {
-    ...actual,
-    ensureAgentWorkspace: mocks.ensureAgentWorkspace,
-    isWorkspaceSetupCompleted: mocks.isWorkspaceSetupCompleted,
-  };
-});
+vi.mock("../../agents/workspace.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../agents/workspace.js")>()),
+  ensureAgentWorkspace: mocks.ensureAgentWorkspace,
+  isWorkspaceSetupCompleted: mocks.isWorkspaceSetupCompleted,
+}));
 
-vi.mock("../../agents/workspace-state-store.js", async () => ({
-  ...(await vi.importActual<typeof import("../../agents/workspace-state-store.js")>(
-    "../../agents/workspace-state-store.js",
-  )),
+vi.mock("../../agents/workspace-state-store.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../agents/workspace-state-store.js")>()),
   deleteWorkspaceState: mocks.deleteWorkspaceState,
   prepareWorkspaceStateDeletion: mocks.prepareWorkspaceStateDeletion,
 }));
@@ -426,13 +415,10 @@ const { expectTrashedWithinParent, expectNotTrashed } = createTrashAssertions(
   mocks.movePathToTrash,
 );
 
-vi.mock("../../utils.js", async () => {
-  const actual = await vi.importActual<typeof import("../../utils.js")>("../../utils.js");
-  return {
-    ...actual,
-    resolveUserPath: (p: string) => `/resolved${p.startsWith("/") ? "" : "/"}${p}`,
-  };
-});
+vi.mock("../../utils.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../utils.js")>()),
+  resolveUserPath: (p: string) => `/resolved${p.startsWith("/") ? "" : "/"}${p}`,
+}));
 
 // mock-isolation: Keep deletion lifecycle tests on synthetic config and session metadata without opening databases.
 vi.mock("../session-utils.js", async () => ({
@@ -440,11 +426,9 @@ vi.mock("../session-utils.js", async () => ({
   listAgentsForGateway: mocks.listAgentsForGateway,
 }));
 
-vi.mock("../../infra/fs-safe.js", async () => {
-  const actual =
-    await vi.importActual<typeof import("../../infra/fs-safe.js")>("../../infra/fs-safe.js");
+vi.mock("../../infra/fs-safe.js", async (importOriginal) => {
   return {
-    ...actual,
+    ...(await importOriginal<typeof import("../../infra/fs-safe.js")>()),
     root: vi.fn(async (rootDir: string) => ({
       rootReal: rootDir,
       open: async (relativePath: string, options?: Record<string, unknown>) =>
@@ -461,13 +445,10 @@ vi.mock("../../infra/fs-safe.js", async () => {
   };
 });
 
-// Mock node:fs/promises – agents.ts uses `import fs from "node:fs/promises"`
-// which resolves to the module namespace default, so we spread actual and
-// override the methods we need, plus set `default` explicitly.
-vi.mock("node:fs/promises", async () => {
-  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+// Cover both namespace and default imports of the filesystem.
+vi.mock("node:fs/promises", async (importOriginal) => {
   const patched = {
-    ...actual,
+    ...(await importOriginal<typeof import("node:fs/promises")>()),
     mkdir: mocks.fsMkdir,
     appendFile: mocks.fsAppendFile,
     readFile: mocks.fsReadFile,
@@ -625,6 +606,21 @@ function stageDeletionJournal(journal = deletionJournal()) {
   return journal;
 }
 
+function mockSymlinkPaths(
+  link: string,
+  target: string,
+  agentDir = link,
+  resolve: (pathname: string) => string = (pathname) => pathname.replace(link, target),
+) {
+  mocks.resolveRegisteredAgentIdForDir.mockImplementation((pathname) =>
+    pathname === agentDir ? "test-agent" : undefined,
+  );
+  mocks.normalizeAgentDirRegistryPath.mockImplementation((pathname) =>
+    pathname.replace(link, target),
+  );
+  mocks.fsRealpath.mockImplementation(async (pathname) => resolve(pathname));
+}
+
 function retryTrashOnce(failedPath: string) {
   const trashed = new Set<string>();
   let attempts = 0;
@@ -689,11 +685,11 @@ beforeEach(() => {
         close: async () => {},
       }) as unknown,
   );
+  vi.clearAllMocks();
 });
 
 describe("agents.create", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.captureDeletedAgentDatabaseFences.mockReturnValue([]);
     mocks.reviveAgentDatabases.mockReset().mockResolvedValue(undefined);
     mocks.loadConfigReturn = agentConfig({ main: {} });
@@ -704,7 +700,6 @@ describe("agents.create", () => {
 
 describe("agents.update", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.loadConfigReturn = agentConfig({
       "test-agent": {
         workspace: "/workspace/test-agent",
@@ -760,12 +755,10 @@ describe("agents.update", () => {
 
 describe("agents.delete", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.resolveAgentDir.mockImplementation((_cfg?: unknown, agentId?: string) =>
       agentId === "main" ? "/agents/main/agent" : "/agents/test-agent",
     );
     mocks.fsLstat.mockResolvedValue(makeCleanupStat());
-    mocks.fsRealpath.mockImplementation(async (pathname: string) => pathname);
     mocks.loadConfigReturn = agentConfig({
       "test-agent": { workspace: "/workspace/test-agent" },
       main: {},
@@ -800,31 +793,32 @@ describe("agents.delete", () => {
 
   registerAgentDeleteRollbackTests(recoveryHarness);
 
-  it("does not perform destructive cleanup without a config deletion result", async () => {
-    mocks.omitConfigMutationResult = true;
-    mocks.pruneAgentConfig.mockReturnValueOnce({
-      config: mocks.loadConfigReturn,
-      removedBindings: 0,
-    });
+  it.each([false, true])(
+    "preserves deletion authority without a mutation result (committed=%s)",
+    async (committed) => {
+      mocks.omitConfigMutationResult = true;
+      if (!committed) {
+        mocks.pruneAgentConfig.mockReturnValueOnce({
+          config: mocks.loadConfigReturn,
+          removedBindings: 0,
+        });
+      }
 
-    const { promise } = makeCall("agents.delete", { agentId: "test-agent" });
+      const { promise } = makeCall("agents.delete", { agentId: "test-agent" });
 
-    await expect(promise).rejects.toThrow("config mutation did not return its target");
-    expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalledTimes(1);
-    expect(mocks.movePathToTrash).not.toHaveBeenCalled();
-    expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalledWith({ unregisterDatabases: true });
-    expect(mocks.beginAgentDeletionRollback).toHaveBeenCalledOnce();
-  });
-
-  it("keeps authority removed when the committed config omits its mutation result", async () => {
-    mocks.omitConfigMutationResult = true;
-
-    const { promise } = makeCall("agents.delete", { agentId: "test-agent" });
-
-    await expect(promise).rejects.toThrow("config mutation did not return its target");
-    expectUncalled(mocks.beginAgentDeletionRollback, mocks.movePathToTrash);
-    expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalledWith({ unregisterDatabases: true });
-  });
+      await expect(promise).rejects.toThrow("config mutation did not return its target");
+      expect(mocks.movePathToTrash).not.toHaveBeenCalled();
+      expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalledWith({
+        unregisterDatabases: true,
+      });
+      if (committed) {
+        expect(mocks.beginAgentDeletionRollback).not.toHaveBeenCalled();
+      } else {
+        expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalledTimes(1);
+        expect(mocks.beginAgentDeletionRollback).toHaveBeenCalledOnce();
+      }
+    },
+  );
 
   it("converges after partial cleanup and makes the agent id recreatable", async () => {
     const journal = deletionJournal({
@@ -995,15 +989,7 @@ describe("agents.delete", () => {
         sessionsDir: "/deep/sessions",
       }),
     );
-    mocks.resolveRegisteredAgentIdForDir.mockImplementation((pathname?: string) =>
-      pathname === agentLink ? "test-agent" : undefined,
-    );
-    mocks.normalizeAgentDirRegistryPath.mockImplementation((pathname: string) =>
-      pathname.replace(agentLink, agentTarget),
-    );
-    mocks.fsRealpath.mockImplementation(async (pathname: string) =>
-      pathname.replace(agentLink, agentTarget),
-    );
+    mockSymlinkPaths(agentLink, agentTarget);
     mocks.fsLstat.mockImplementation(async (pathname: unknown) =>
       makeCleanupStat({ isSymbolicLink: () => pathname === agentLink }),
     );
@@ -1063,18 +1049,11 @@ describe("agents.delete", () => {
     const agentDir = `${workspaceLink}/agent`;
     const sessionsDir = `${workspaceLink}/transcripts`;
     stageDeletionJournal(deletionJournal({ agentDir, workspaceDir: workspaceLink, sessionsDir }));
-    mocks.resolveRegisteredAgentIdForDir.mockImplementation((pathname?: string) =>
-      pathname === agentDir ? "test-agent" : undefined,
+    mockSymlinkPaths(workspaceLink, workspaceTarget, agentDir, (pathname) =>
+      pathname === workspaceParent
+        ? workspaceParentTarget
+        : pathname.replace(workspaceLink, workspaceTarget),
     );
-    mocks.normalizeAgentDirRegistryPath.mockImplementation((pathname: string) =>
-      pathname.replace(workspaceLink, workspaceTarget),
-    );
-    mocks.fsRealpath.mockImplementation(async (pathname: string) => {
-      if (pathname === workspaceParent) {
-        return workspaceParentTarget;
-      }
-      return pathname.replace(workspaceLink, workspaceTarget);
-    });
     mocks.fsLstat.mockImplementation(async (pathname: unknown) =>
       makeCleanupStat({
         isSymbolicLink: () => pathname === workspaceLink || pathname === canonicalWorkspaceLink,
@@ -1130,13 +1109,7 @@ describe("agents.delete", () => {
     });
     const trashed = retryTrashOnce(originalTarget);
     stageDeletionJournal(journal);
-    mocks.resolveRegisteredAgentIdForDir.mockImplementation((pathname?: string) =>
-      pathname === journal.agentDir ? "test-agent" : undefined,
-    );
-    mocks.normalizeAgentDirRegistryPath.mockImplementation((pathname: string) =>
-      pathname.replace(workspaceLink, originalTarget),
-    );
-    mocks.fsRealpath.mockImplementation(async (pathname: string) => {
+    mockSymlinkPaths(workspaceLink, originalTarget, journal.agentDir, (pathname) => {
       if (pathname === journal.sessionsDir) {
         throw createEnoentError();
       }
@@ -1556,10 +1529,7 @@ describe("agents.delete", () => {
 
 describe("agents.files.list", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.loadConfigReturn = {};
     mocks.isWorkspaceSetupCompleted.mockReset().mockResolvedValue(false);
-    mocks.fsReadlink.mockReset().mockResolvedValue("");
   });
 
   // Pins the derivation: a private copy of this list in the gateway is what let a
@@ -1666,7 +1636,6 @@ describe("agents.files.list", () => {
 
 describe("agents.files.get/set symlink safety", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.loadConfigReturn = agentConfig({ main: { workspace: "/workspace/test-agent" } });
     mocks.fsMkdir.mockResolvedValue(undefined);
   });

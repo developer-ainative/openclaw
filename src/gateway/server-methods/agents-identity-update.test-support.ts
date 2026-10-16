@@ -13,7 +13,9 @@ import {
 import type { AgentMutationHarness } from "./agents-mutate.test.js";
 
 export function registerAgentIdentityUpdateTests(harness: AgentMutationHarness): void {
-  const { mocks, makeCall, makeFileStat, createEnoentError } = harness;
+  const { mocks, makeCall, call, makeFileStat, createEnoentError } = harness;
+  const update = (params: Record<string, unknown>) =>
+    call("agents.update", { agentId: "test-agent", ...params });
   function identityRead(rootDir: string, relativePath: string, content: string): ReadResult {
     return {
       buffer: Buffer.from(content),
@@ -126,13 +128,11 @@ export function registerAgentIdentityUpdateTests(harness: AgentMutationHarness):
 
     it("writes combined identity fields to both config and IDENTITY.md", async () => {
       mocks.rootRead.mockRejectedValue(new FsSafeError("not-found", "file not found"));
-      const { respond, promise } = makeCall("agents.update", {
-        agentId: "test-agent",
+      const respond = await update({
         name: "New Name",
         emoji: "🤖",
         avatar: "https://example.com/new.png",
       });
-      await promise;
 
       expectRespondOk(respond, { ok: true, agentId: "test-agent" });
       expectRecordFields(mockCallArg(mocks.rootRead), { relativePath: "IDENTITY.md" });
@@ -180,11 +180,7 @@ export function registerAgentIdentityUpdateTests(harness: AgentMutationHarness):
           "/workspace/test-agent/IDENTITY.md": source,
           "/resolved/new/workspace/IDENTITY.md": destination,
         });
-        const { respond, promise } = makeCall("agents.update", {
-          agentId: "test-agent",
-          workspace: "/new/workspace",
-        });
-        await promise;
+        const respond = await update({ workspace: "/new/workspace" });
         expectRespondOk(respond, { ok: true, agentId: "test-agent" });
         const write = expectRecordFields(mockCallArg(mocks.rootWrite), {
           rootDir: "/resolved/new/workspace",
@@ -219,11 +215,7 @@ export function registerAgentIdentityUpdateTests(harness: AgentMutationHarness):
         } else {
           mocks.rootWrite.mockRejectedValueOnce(error);
         }
-        const { respond, promise } = makeCall("agents.update", {
-          agentId: "test-agent",
-          ...params,
-        });
-        await promise;
+        const respond = await update(params);
         expectRespondErrorContaining(respond, message);
         expect(mocks.writeConfigFile).not.toHaveBeenCalled();
         if (operation === "read") {

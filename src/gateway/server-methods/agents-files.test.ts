@@ -8,10 +8,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { GatewayRequestError } from "../../../ui/src/api/gateway.ts";
 import {
-  agentFileValues,
-  setAgentFileValues,
-} from "../../../ui/src/pages/agents/agent-file-state.test-helpers.ts";
-import {
   loadAgentFileContent,
   saveAgentFile,
   type AgentFilesState,
@@ -22,12 +18,7 @@ import { createRemoteShellSandboxFsBridge } from "../../agents/sandbox/remote-fs
 import { createLocalRemoteShellScriptRunner } from "../../agents/sandbox/remote-fs-bridge.test-helpers.js";
 import { registerAgentWorkspaceAccess } from "../../agents/workspace-access.js";
 import { agentsHandlers } from "./agents.js";
-
-type HandlerCall = {
-  ok: boolean;
-  payload?: unknown;
-  error?: ConstructorParameters<typeof GatewayRequestError>[0];
-};
+import type { RespondFn } from "./types.js";
 
 function hashContent(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
@@ -43,6 +34,7 @@ function registerFileTests(storage: "local" | "remote") {
   const original = "# Memory\n";
   const edited = "# Memory\n- operator note\n";
   const learned = "# Memory\n- agent learned a birthday\n";
+  const drafts = ["# Memory\n- first operator\n", "# Memory\n- second operator\n"] as const;
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
   let workspace: string;
   let storageDir: string;
@@ -59,7 +51,6 @@ function registerFileTests(storage: "local" | "remote") {
     broadcast.mockReset();
     workspace = fs.realpathSync(tempDirs.make("openclaw-agent-files-"));
     storageDir = workspace;
-    remoteBridge = undefined;
     if (storage === "remote") {
       storageDir = fs.realpathSync(tempDirs.make("openclaw-remote-agent-files-"));
       remoteBridge = createRemoteShellSandboxFsBridge({
@@ -77,23 +68,22 @@ function registerFileTests(storage: "local" | "remote") {
   async function invokeFiles(
     method: "agents.files.list" | "agents.files.get" | "agents.files.set",
     params: Record<string, unknown>,
-  ): Promise<HandlerCall> {
-    const calls: HandlerCall[] = [];
+  ) {
+    const respond = vi.fn<RespondFn>();
     await agentsHandlers[method]?.({
       req: { type: "req", id: method, method, params: {} },
       params,
       client: null,
       isWebchatConnect: () => false,
-      respond: (ok, payload, error) => {
-        calls.push({ ok, payload, error });
-      },
+      respond,
       context: {
         getRuntimeConfig: () => ({ agents: { defaults: { workspace } } }),
         broadcast,
       } as never,
     });
-    expect(calls).toHaveLength(1);
-    return calls[0] as HandlerCall;
+    expect(respond).toHaveBeenCalledTimes(1);
+    const [ok, payload, error] = expectDefined(respond.mock.calls[0], "handler response");
+    return { ok, payload, error };
   }
 
   function setFile(
@@ -104,12 +94,8 @@ function registerFileTests(storage: "local" | "remote") {
     return invokeFiles("agents.files.set", { agentId: "main", name, content, ...preconditions });
   }
   function saveDraft(editor: AgentFilesState) {
-    return saveAgentFile(
-      editor,
-      "main",
-      memory,
-      expectDefined(agentFileValues(editor, "draft")[memory], "editor draft"),
-    );
+    const draft = expectDefined(editor.agentFileEditors[memory]?.draft, "editor draft");
+    return saveAgentFile(editor, "main", memory, draft);
   }
   function readFile(name = memory): string {
     return fs.readFileSync(path.join(storageDir, name), "utf8");
@@ -118,14 +104,10 @@ function registerFileTests(storage: "local" | "remote") {
     fs.writeFileSync(path.join(storageDir, name), content);
   }
 
-  it.each([
-    ["ASCII", "x", 1],
-    ["multibyte", "é", 2],
-  ] as const)("bounds UTF-8 bytes (%s)", async (_, character, bytes) => {
+  it.each(["x", "é"])("bounds UTF-8 bytes (%s)", async (character) => {
     const name = "AGENTS.md";
-    const accepted = character.repeat((2 * 1024 * 1024) / bytes);
-    const saved = await setFile(accepted, {}, name);
-    expect(saved.ok).toBe(true);
+    const accepted = character.repeat((2 * 1024 * 1024) / Buffer.byteLength(character));
+    expect(await setFile(accepted, {}, name)).toMatchObject({ ok: true });
     expect(readFile(name)).toBe(accepted);
 
     await expect(setFile(`${accepted}x`, {}, name)).rejects.toThrow(
@@ -142,15 +124,9 @@ function registerFileTests(storage: "local" | "remote") {
     const originalIdentity = "- Name: Before\n";
     const replacement = "- Name: After\n";
     writeFile(originalIdentity, name);
-    let publishedContent: string | undefined;
-    broadcast.mockImplementation(() => {
-      publishedContent = readFile(name);
-    });
-    const result = await setFile(
-      replacement,
-      { expectedHash: hashContent(conflict ? "stale" : originalIdentity) },
-      name,
-    );
+    broadcast.mockImplementation(() => readFile(name));
+    const preconditions = { expectedHash: hashContent(conflict ? "stale" : originalIdentity) };
+    const result = await setFile(replacement, preconditions, name);
 
     expect(result.ok).toBe(!conflict);
     expect(readFile(name)).toBe(conflict ? originalIdentity : replacement);
@@ -158,7 +134,7 @@ function registerFileTests(storage: "local" | "remote") {
       expect(broadcast).toHaveBeenCalledExactlyOnceWith("agent.identity.changed", {
         agentId: "main",
       });
-      expect(publishedContent).toBe(replacement);
+      expect(broadcast.mock.results[0]?.value).toBe(replacement);
     } else {
       expect(broadcast).not.toHaveBeenCalled();
     }
@@ -188,20 +164,20 @@ function registerFileTests(storage: "local" | "remote") {
       agentFileWriteRevisions: new Map(),
     };
     expect(await loadAgentFileContent(editor, "main", memory)).toBe(true);
-    setAgentFileValues(editor, "draft", { [memory]: draft });
+    editor.agentFileEditors[memory] = { ...editor.agentFileEditors[memory], draft };
     return editor;
   }
 
   it("preserves the first creation when two editors loaded a missing document", async () => {
-    const first = await loadEditor("# Memory\n- first operator\n");
-    const second = await loadEditor("# Memory\n- second operator\n");
+    const first = await loadEditor(drafts[0]);
+    const second = await loadEditor(drafts[1]);
     expect(fs.existsSync(path.join(storageDir, memory))).toBe(false);
     expect(await saveDraft(first)).toBe(true);
-    expect(readFile()).toBe(agentFileValues(first, "draft")[memory]);
+    expect(readFile()).toBe(first.agentFileEditors[memory]?.draft);
     expect(await saveDraft(second)).toBe(false);
     expect(second.agentFileConflict).toBe(memory);
-    expect(agentFileValues(second, "draft")[memory]).toBe("# Memory\n- second operator\n");
-    expect(readFile()).toBe("# Memory\n- first operator\n");
+    expect(second.agentFileEditors[memory]?.draft).toBe(drafts[1]);
+    expect(readFile()).toBe(drafts[0]);
   });
 
   it.runIf(storage === "remote")("rejects unsupported create, permits blind writes", async () => {
@@ -217,11 +193,10 @@ function registerFileTests(storage: "local" | "remote") {
     const editor = await loadEditor("unsaved new memory");
     expect(await saveDraft(editor)).toBe(false);
     expect(editor.agentFilesError).toContain("Update its workspace provider");
-    expect(agentFileValues(editor, "draft")[memory]).toBe("unsaved new memory");
+    expect(editor.agentFileEditors[memory]?.draft).toBe("unsaved new memory");
     expect(fs.existsSync(path.join(storageDir, memory))).toBe(false);
 
-    const result = await setFile("explicit blind write");
-    expect(result.ok).toBe(true);
+    expect(await setFile("explicit blind write")).toMatchObject({ ok: true });
     expect(readFile()).toBe("explicit blind write");
   });
 
@@ -236,26 +211,34 @@ function registerFileTests(storage: "local" | "remote") {
     expect(file).not.toHaveProperty("size", expect.any(Number));
   });
 
-  it.each(["conflicting-preconditions", "expected-present", "stale", "gone"] as const)(
-    "rejects %s preconditions without overwriting",
+  it.each(["conflicting", "expected-present", "stale", "gone", "uppercase", "omitted"] as const)(
+    "honors %s write preconditions",
     async (variant) => {
       let expectedHash = hashContent(original);
-      if (variant === "stale") {
+      const success = variant === "uppercase" || variant === "omitted";
+      if (success || variant === "stale") {
         writeFile(original);
+      }
+      if (variant === "stale") {
         const opened = await invokeFiles("agents.files.get", { agentId: "main", name: memory });
-        expect(opened.ok).toBe(true);
-        const openedHash = (opened.payload as { file: { hash: string } }).file.hash;
-        expect(openedHash).toBe(expectedHash);
-        expectedHash = openedHash;
+        expect(opened).toMatchObject({ ok: true, payload: { file: { hash: expectedHash } } });
+        expectedHash = (opened.payload as { file: { hash: string } }).file.hash;
         fs.appendFileSync(path.join(storageDir, memory), "- agent learned a birthday\n");
       }
-      const preconditions =
-        variant === "conflicting-preconditions"
-          ? { expectedMissing: true, expectedHash: hashContent("old") }
-          : variant === "expected-present"
-            ? { expectedMissing: false }
-            : { expectedHash };
+      const preconditions = {
+        conflicting: { expectedMissing: true, expectedHash: hashContent("old") },
+        "expected-present": { expectedMissing: false },
+        stale: { expectedHash },
+        gone: { expectedHash },
+        uppercase: { expectedHash: expectedHash.toUpperCase() },
+        omitted: {},
+      }[variant];
       const call = await setFile(edited, preconditions);
+      if (success) {
+        expect(call).toMatchObject({ ok: true, payload: { file: { hash: hashContent(edited) } } });
+        expect(readFile()).toBe(edited);
+        return;
+      }
       expect(call).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
       if (variant === "stale" || variant === "gone") {
         expect(call.error?.details).toEqual({
@@ -272,34 +255,13 @@ function registerFileTests(storage: "local" | "remote") {
     },
   );
 
-  it.each(["uppercase", "omitted"] as const)(
-    "accepts %s hash and returns new hash",
-    async (hashCase) => {
-      writeFile(original);
-      const expectedHash = hashContent(original);
-
-      const call = await setFile(
-        edited,
-        hashCase === "uppercase" ? { expectedHash: expectedHash.toUpperCase() } : {},
-      );
-
-      expect(call.ok).toBe(true);
-      expect((call.payload as { file: { hash?: string } }).file.hash).toBe(hashContent(edited));
-      expect(readFile()).toBe(edited);
-    },
-  );
-
   it("admits only one of two concurrent saves that share an expectedHash", async () => {
     writeFile(original);
     const expectedHash = hashContent(original);
-
-    const calls = await Promise.all([
-      setFile("# Memory\n- first operator\n", { expectedHash }),
-      setFile("# Memory\n- second operator\n", { expectedHash }),
-    ]);
+    const calls = await Promise.all(drafts.map((content) => setFile(content, { expectedHash })));
 
     expect(calls.filter((call) => call.ok)).toHaveLength(1);
-    expect(["# Memory\n- first operator\n", "# Memory\n- second operator\n"]).toContain(readFile());
+    expect(drafts).toContain(readFile());
     expect(calls.find((call) => !call.ok)?.error?.details).toMatchObject({
       type: "agent_file_conflict",
       currentHash: hashContent(readFile()),
