@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { AbortController as TelegramAbortController } from "abort-controller";
 import { Bot } from "grammy";
@@ -34,9 +34,40 @@ import {
 type RecordedBotApiCall = { method: string; fields: Record<string, unknown> };
 type ReplyResolver = NonNullable<Parameters<typeof dispatchInboundMessage>[0]["replyResolver"]>;
 export type ReplyResolverOptions = Parameters<ReplyResolver>[1];
+type DispatchParams = Parameters<typeof dispatchTelegramMessage>[0];
+type DispatchScenario = {
+  mode: DispatchParams["streamMode"];
+  toolProgress: boolean;
+  finalReply?: ReplyPayload | ReplyPayload[];
+  producer?: NonNullable<Parameters<typeof dispatchInboundMessage>[0]["dispatchReplyFromConfig"]>;
+  replyToMode?: DispatchParams["replyToMode"];
+  accountId?: string;
+  telegramCfg?: DispatchParams["telegramCfg"];
+  cfg?: OpenClawConfig;
+  onDispatch?: (cfg: OpenClawConfig) => void;
+  context?: TelegramMessageContext;
+  textLimit?: number;
+  allowErrors?: boolean;
+  outcome?: "completed" | "failed-retryable";
+  turnAdoptionLifecycle?: DispatchParams["turnAdoptionLifecycle"];
+  suppressFailureFallback?: boolean;
+};
 
 const BOT_TOKEN = "123456:telegram-progress-http-fixture";
 const CHAT_ID = 123;
+const MESSAGE_METHODS = new Set([
+  "sendMessage",
+  "sendRichMessage",
+  "editMessageText",
+  "sendDocument",
+  "sendPhoto",
+  "sendAudio",
+  "sendVoice",
+  "sendVideo",
+]);
+function respondJson(response: ServerResponse, body: unknown, status = 200) {
+  response.writeHead(status).end(JSON.stringify(body));
+}
 
 export function createTelegramDispatchHttpFixture() {
   let server: Server;
@@ -118,11 +149,9 @@ export function createTelegramDispatchHttpFixture() {
         const rejection = await Promise.race([Promise.resolve(respondToCall?.(call)), stopped]);
         if (rejection) {
           if (rejection === "no-message-id") {
-            response.end(JSON.stringify({ ok: true, result: true }));
+            respondJson(response, { ok: true, result: true });
           } else {
-            response
-              .writeHead(rejection.error_code)
-              .end(JSON.stringify({ ok: false, ...rejection }));
+            respondJson(response, { ok: false, ...rejection }, rejection.error_code);
           }
           return;
         }
@@ -134,12 +163,14 @@ export function createTelegramDispatchHttpFixture() {
           "quote" in fields.reply_parameters
         ) {
           rejectNextQuote = false;
-          response.writeHead(400).end(
-            JSON.stringify({
+          respondJson(
+            response,
+            {
               ok: false,
               error_code: 400,
               description: "Bad Request: quote not found",
-            }),
+            },
+            400,
           );
           return;
         }
@@ -155,19 +186,10 @@ export function createTelegramDispatchHttpFixture() {
               }
             : { id: chatId, type: "private", first_name: "Fixture" };
         if (method === "getChat") {
-          response.end(JSON.stringify({ ok: true, result: chat }));
+          respondJson(response, { ok: true, result: chat });
           return;
         }
-        if (
-          method === "sendMessage" ||
-          method === "sendRichMessage" ||
-          method === "editMessageText" ||
-          method === "sendDocument" ||
-          method === "sendPhoto" ||
-          method === "sendAudio" ||
-          method === "sendVoice" ||
-          method === "sendVideo"
-        ) {
+        if (MESSAGE_METHODS.has(method)) {
           const messageId =
             fields.message_id === undefined ? ++nextMessageId : Number(fields.message_id);
           const caption = fields.caption;
@@ -184,21 +206,19 @@ export function createTelegramDispatchHttpFixture() {
           if (fields.reply_markup !== undefined) {
             visibleMarkup.set(messageId, fields.reply_markup);
           }
-          response.end(
-            JSON.stringify({
-              ok: true,
-              result: {
-                message_id: messageId,
-                date: 1_700_000_000,
-                chat,
-                text,
-                ...(caption === undefined ? {} : { caption }),
-                ...(fields.message_thread_id
-                  ? { message_thread_id: Number(fields.message_thread_id) }
-                  : {}),
-              },
-            }),
-          );
+          respondJson(response, {
+            ok: true,
+            result: {
+              message_id: messageId,
+              date: 1_700_000_000,
+              chat,
+              text,
+              ...(caption === undefined ? {} : { caption }),
+              ...(fields.message_thread_id
+                ? { message_thread_id: Number(fields.message_thread_id) }
+                : {}),
+            },
+          });
           return;
         }
         if (method === "editMessageReplyMarkup") {
@@ -208,7 +228,7 @@ export function createTelegramDispatchHttpFixture() {
           visibleMessages.delete(Number(fields.message_id));
           visibleMarkup.delete(Number(fields.message_id));
         }
-        response.end(JSON.stringify({ ok: true, result: true }));
+        respondJson(response, { ok: true, result: true });
       };
       request.on("end", () => {
         void respond().catch((error: unknown) =>
@@ -278,9 +298,9 @@ export function createTelegramDispatchHttpFixture() {
     });
     calls.length = 0;
     endpoints.length = 0;
+    acceptedCalls.length = 0;
     visibleMessages.clear();
     visibleMarkup.clear();
-    acceptedCalls.length = 0;
     respondToCall = undefined;
     resetPluginRuntimeStateForTest();
     setActivePluginRegistry(
@@ -360,7 +380,7 @@ export function createTelegramDispatchHttpFixture() {
     const text = "Run the failing command.";
     // Each turn is a new inbound message; a repeated id is dropped as a duplicate.
     const inboundMessageId = 456 + inboundSequence++;
-    const base = {
+    return {
       ctxPayload: {
         Body: text,
         BodyForAgent: text,
@@ -380,18 +400,13 @@ export function createTelegramDispatchHttpFixture() {
       chatId: CHAT_ID,
       isGroup: false,
       isForum: false,
-      groupConfig: undefined,
-      resolvedThreadId: undefined,
-      replyThreadId: undefined,
       threadSpec: { id: undefined, scope: "none" },
-      historyKey: undefined,
       historyLimit: 0,
       route: {
         agentId: "default",
         accountId: "default",
         sessionKey: `agent:default:telegram:direct:${CHAT_ID}`,
       },
-      skillFilter: undefined,
       sendTyping: async () => undefined,
       sendRecordVoice: async () => undefined,
       sendChatActionHandler: { sendChatAction: async () => undefined },
@@ -403,8 +418,7 @@ export function createTelegramDispatchHttpFixture() {
         recordInboundSession: async () => undefined,
         record: { onRecordError: () => undefined },
       },
-    };
-    return base as unknown as TelegramMessageContext;
+    } as unknown as TelegramMessageContext;
   }
 
   async function emitToolStart(
@@ -425,27 +439,7 @@ export function createTelegramDispatchHttpFixture() {
       options: ReplyResolverOptions,
       channelOptions: ReplyResolverOptions,
     ) => Promise<void>,
-    scenario?: {
-      mode: "off" | "partial" | "block" | "progress";
-      toolProgress: boolean;
-      finalReply?: ReplyPayload | ReplyPayload[];
-      producer?: NonNullable<
-        Parameters<typeof dispatchInboundMessage>[0]["dispatchReplyFromConfig"]
-      >;
-      replyToMode?: "off" | "all" | "first" | "batched";
-      accountId?: string;
-      telegramCfg?: Parameters<typeof dispatchTelegramMessage>[0]["telegramCfg"];
-      cfg?: OpenClawConfig;
-      onDispatch?: (cfg: OpenClawConfig) => void;
-      context?: TelegramMessageContext;
-      textLimit?: number;
-      allowErrors?: boolean;
-      outcome?: "completed" | "failed-retryable";
-      turnAdoptionLifecycle?: Parameters<
-        typeof dispatchTelegramMessage
-      >[0]["turnAdoptionLifecycle"];
-      suppressFailureFallback?: boolean;
-    },
+    scenario?: DispatchScenario,
   ) {
     const caseSignal = lifetime.signal;
     const work = (async () => {

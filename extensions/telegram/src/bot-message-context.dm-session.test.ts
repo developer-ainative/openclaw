@@ -1,7 +1,5 @@
-import { mkdirSync } from "node:fs";
-import path from "node:path";
 import type { Bot } from "grammy";
-import type { Update } from "grammy/types";
+import type { Message, Update } from "grammy/types";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   registerSessionBindingAdapter,
@@ -31,12 +29,16 @@ import {
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  contextConfig,
+  createContextStorePath,
+  receiveContextMessage,
+  topicService,
+} from "./bot-message-context.native.test-support.js";
+import {
   apiCalls,
   chat,
   commandMessage,
   createBot,
-  deliverTelegramUpdate,
-  groupChat,
   groupCommand,
   harness,
   photo,
@@ -47,30 +49,15 @@ import { resetTelegramTopicNameCacheForTest } from "./runtime.test-support.js";
 
 let cfg: OpenClawConfig;
 let storePath: string;
-let updateId = 6000;
 const session = (sessionKey: string) => getSessionEntry({ agentId: "main", storePath, sessionKey });
+const observed = (index = 0) => harness.replySpy.mock.calls[index]?.[0];
 function expectDestination(sessionKey: string, context: Record<string, unknown>) {
   expect(session(sessionKey)?.delivery).toMatchObject({ kind: "external", context });
 }
 
 beforeEach(() => {
-  const storeDir = harness.state.path("telegram-context-session");
-  mkdirSync(storeDir);
-  storePath = path.join(storeDir, "sessions.json");
-  cfg = {
-    session: { store: storePath },
-    commands: { native: false },
-    channels: {
-      telegram: {
-        dmPolicy: "open",
-        allowFrom: ["*"],
-        groupPolicy: "open",
-        autoTopicLabel: false,
-        streaming: { mode: "off" },
-        groups: { "*": { requireMention: false } },
-      },
-    },
-  };
+  storePath = createContextStorePath();
+  cfg = contextConfig(storePath, { requireMention: false });
   bindingTesting.resetSessionBindingAdaptersForTests();
   resetTelegramTopicNameCacheForTest();
 });
@@ -105,11 +92,15 @@ function bind(
 }
 
 async function receive(bot: Bot, message: NonNullable<Update["message"]>) {
-  await deliverTelegramUpdate(bot, {
-    update_id: ++updateId,
-    message: { ...message, entities: message.text?.startsWith("@") ? message.entities : [] },
+  await receiveContextMessage(bot, {
+    ...message,
+    entities: message.text?.startsWith("@") ? message.entities : [],
   });
 }
+const direct = (bot: Bot, text: string, extra: Partial<Message.TextMessage> = {}) =>
+  receive(bot, { ...commandMessage(text), ...extra });
+const group = (bot: Bot, text: string, extra: Partial<Message.TextMessage> = {}) =>
+  receive(bot, { ...groupCommand(text), ...extra });
 
 describe("Telegram recorded session destinations", () => {
   it.each([
@@ -123,14 +114,10 @@ describe("Telegram recorded session destinations", () => {
       }
       const bot = await createBot(false, true, cfg, thread !== undefined);
       if (thread === undefined) {
-        await receive(bot, commandMessage("first turn"));
+        await direct(bot, "first turn");
         await deleteSessionEntry({ storePath, sessionKey: key });
       }
-      await receive(bot, {
-        ...commandMessage("remember this destination"),
-        chat,
-        message_thread_id: thread,
-      });
+      await direct(bot, "remember this destination", { chat, message_thread_id: thread });
       const delivery = session(key)?.delivery;
       expect(delivery).toMatchObject({
         kind: "external",
@@ -181,26 +168,19 @@ describe("Telegram recorded session destinations", () => {
         return reply;
       });
       const startedAt = Date.now();
-      await receive(bot, {
-        ...commandMessage("/help"),
-        message_thread_id: 42,
-        is_topic_message: true,
-      });
+      await direct(bot, "/help", { message_thread_id: 42, is_topic_message: true });
       expect(harness.replySpy).toHaveBeenCalledOnce();
-      const sends = apiCalls.mock.calls.filter(([method]) => method === "sendMessage");
+      const sends = apiCalls.mock.calls
+        .filter(([method]) => method === "sendMessage")
+        .map(([, data]) => data);
       expect(sends).toEqual([
-        [
-          "sendMessage",
-          expect.objectContaining({
-            chat_id: String(chat.id),
-            text: expect.stringContaining("Help"),
-            message_thread_id: 42,
-          }),
-        ],
+        expect.objectContaining({
+          chat_id: String(chat.id),
+          text: expect.stringContaining("Help"),
+          message_thread_id: 42,
+        }),
       ]);
       const selected = session(selectedSessionKey);
-      // Inbound metadata can create a row before the resolver; only real reply
-      // initialization records the session start and interaction timestamps.
       expect(selected?.sessionStartedAt).toBeGreaterThanOrEqual(startedAt);
       expect(selected?.lastInteractionAt).toBeGreaterThanOrEqual(startedAt);
       for (const sessionKey of wrongSessionKeys) {
@@ -217,8 +197,7 @@ describe("Telegram recorded session destinations", () => {
     const atlas = await createBot(false, true, cfg, false, "atlas");
     const skynet = await createBot(false, true, cfg, false, "skynet");
     for (const bot of [atlas, skynet]) {
-      await receive(bot, {
-        ...commandMessage("hello from the linked sender"),
+      await direct(bot, "hello from the linked sender", {
         chat: { ...chat, id: 999999999 },
         from: { id: 814912386, is_bot: false, first_name: "Alice" },
       });
@@ -257,16 +236,8 @@ describe("Telegram recorded session destinations", () => {
       pluginId: "openclaw-codex-app-server",
       pluginRoot: "/tmp/context-plugin",
     });
-    await receive(bot, {
-      ...groupCommand("ambient plugin input"),
-      reply_to_message: {
-        message_id: 99,
-        date: 1736380700,
-        chat: groupChat,
-        from: telegramBotInfoForTest,
-        forum_topic_created: { name: "Plugin topic", icon_color: 7322096 },
-        reply_to_message: undefined,
-      },
+    await group(bot, "ambient plugin input", {
+      reply_to_message: topicService("Plugin topic", telegramBotInfoForTest),
     });
     expect(claim).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ content: "ambient plugin input" }),
@@ -279,8 +250,7 @@ describe("Telegram recorded session destinations", () => {
         }),
       }),
     );
-    await receive(bot, {
-      ...groupCommand(""),
+    await group(bot, "", {
       text: undefined,
       caption: "ambient plugin media",
       photo,
@@ -313,13 +283,12 @@ describe("Telegram recorded session destinations", () => {
         }),
       },
     });
-    await receive(bot, groupCommand("unmentioned ordinary binding"));
+    await group(bot, "unmentioned ordinary binding");
     expect(harness.replySpy).not.toHaveBeenCalled();
-    await receive(bot, {
-      ...groupCommand("@openclaw_bot hello"),
+    await group(bot, "@openclaw_bot hello", {
       entities: [{ type: "mention", offset: 0, length: 13 }],
     });
-    expect(harness.replySpy.mock.calls[0]?.[0].SessionKey).toBe("agent:ops:acp:bound");
+    expect(observed()?.SessionKey).toBe("agent:ops:acp:bound");
     expectDestination("agent:ops:acp:bound", {
       channel: "telegram",
       to: "telegram:555",
@@ -329,17 +298,10 @@ describe("Telegram recorded session destinations", () => {
 
   it("learns reply topic names and restores them after plugin-state reopen", async () => {
     const bot = await createBot(false, true, cfg);
-    await receive(bot, {
-      ...groupCommand("first topic message"),
-      reply_to_message: {
-        message_id: 3,
-        date: 1736380700,
-        chat: groupChat,
-        forum_topic_created: { name: "Deployments", icon_color: 0x6fb9f0 },
-        reply_to_message: undefined,
-      },
+    await group(bot, "first topic message", {
+      reply_to_message: topicService("Deployments", undefined, 3),
     });
-    expect(harness.replySpy.mock.calls[0]?.[0]).toMatchObject({
+    expect(observed()).toMatchObject({
       RawBody: "first topic message",
       TopicName: "Deployments",
     });
@@ -349,9 +311,9 @@ describe("Telegram recorded session destinations", () => {
     resetPluginStateStoreForTests();
     setTelegramPluginStateRuntimeForTests();
     const reopened = await createBot(false, true, cfg);
-    await receive(reopened, groupCommand("next message without service metadata"));
+    await group(reopened, "next message without service metadata");
     expect(harness.replySpy).toHaveBeenCalledTimes(2);
-    expect(harness.replySpy.mock.calls[1]?.[0]).toMatchObject({
+    expect(observed(1)).toMatchObject({
       RawBody: "next message without service metadata",
       TopicName: "Deployments",
       SessionKey: "agent:main:telegram:group:-10042001:topic:99",

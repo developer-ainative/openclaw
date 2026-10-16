@@ -1,6 +1,4 @@
-import { mkdirSync } from "node:fs";
-import path from "node:path";
-import type { Message, Update } from "grammy/types";
+import type { Message } from "grammy/types";
 import type { OpenClawConfig, TelegramAccountConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   registerSessionBindingAdapter,
@@ -16,6 +14,7 @@ import {
 } from "openclaw/plugin-sdk/session-store-runtime";
 import { describe, expect, it } from "vitest";
 import { createTelegramMessageContextRuntime } from "./bot-handlers.message-context.js";
+import { createContextStorePath as createStorePath } from "./bot-message-context.native.test-support.js";
 import { buildTelegramMessageContextForTest } from "./bot-message-context.test-harness.js";
 import type { TelegramPromptContextEntry } from "./bot-message-context.types.js";
 import {
@@ -29,18 +28,9 @@ import {
   photo,
 } from "./bot.create-telegram-bot.native-pipeline.test-support.js";
 import { telegramBotInfoForTest } from "./bot.create-telegram-bot.test-support.js";
-import {
-  isTelegramMessageCacheSourceMessage,
-  resolveTelegramMessageCacheScope,
-} from "./message-cache-persistence.js";
+import { resolveTelegramMessageCacheScope } from "./message-cache-persistence.js";
 import { createTelegramMessageCache } from "./message-cache.js";
 
-let storeId = 0;
-function createStorePath(): string {
-  const storeDir = harness.state.path(`telegram-watermark-${storeId++}`);
-  mkdirSync(storeDir);
-  return path.join(storeDir, "sessions.json");
-}
 const sender = { id: 1234, is_bot: false, first_name: "Pat" };
 const groupChat = { id: -1001234567890, type: "supergroup", title: "Room" } as const;
 const groupSession = "agent:main:telegram:group:-1001234567890";
@@ -61,23 +51,33 @@ const replyTarget = (id: number, text: string) => ({
   reply_to_message: undefined,
 });
 
-function chatWindow(
-  messages: ReadonlyArray<{
-    message_id: string;
-    body: string;
-    sender?: string;
-    timestamp_ms?: number;
-    is_reply_target?: boolean;
-  }>,
-): TelegramPromptContextEntry[] {
+type ContextRow = readonly [
+  id: string,
+  body: string,
+  sender?: string,
+  reply?: boolean,
+  time?: number,
+];
+function chatWindow(rows: readonly ContextRow[]): TelegramPromptContextEntry[] {
   return [
     {
       label: "Conversation context",
       source: "telegram",
       type: "chat_window",
-      payload: { messages: messages.map((entry) => ({ sender: "Pat", ...entry })) },
+      payload: {
+        messages: rows.map(([message_id, body, name = "Pat", is_reply_target, timestamp_ms]) => ({
+          message_id,
+          body,
+          sender: name,
+          is_reply_target,
+          timestamp_ms,
+        })),
+      },
     },
   ];
+}
+function expectWindow(context: unknown, messages: object[]) {
+  expect(context).toMatchObject([{ payload: { messages } }]);
 }
 
 function config(storePath = createStorePath()): OpenClawConfig {
@@ -125,11 +125,6 @@ async function seedWatermark(storePath: string) {
   });
 }
 
-const ambientRows = [
-  { message_id: "10", body: "persisted ambient one", timestamp_ms: 1_700_000_000_000 },
-  { message_id: "11", body: "persisted ambient two", timestamp_ms: 1_700_000_001_000 },
-] as const;
-
 describe("Telegram prompt composition", () => {
   it.each([
     { name: "existing plain DM", reply: false },
@@ -148,81 +143,60 @@ describe("Telegram prompt composition", () => {
         ...message(12, "continue"),
         ...(reply ? { reply_to_message: replyTarget(10, "older target") } : {}),
       },
-      promptContext: chatWindow([{ message_id: "10", body: "Earlier DM turn" }]),
+      promptContext: chatWindow([["10", "Earlier DM turn"]]),
     });
     if (reply) {
-      expect(ctx?.ctxPayload.ChannelStructuredContext).toMatchObject([
-        { payload: { messages: [{ message_id: "10", body: "Earlier DM turn" }] } },
+      expectWindow(ctx?.ctxPayload.ChannelStructuredContext, [
+        { message_id: "10", body: "Earlier DM turn" },
       ]);
     } else {
       expect(ctx?.ctxPayload.ChannelStructuredContext).toBeUndefined();
     }
   });
 
-  it("excludes old DM history but preserves explicit replies with a zero sender limit", async () => {
-    const telegramCfg: TelegramAccountConfig = {
-      dmPolicy: "open",
-      dmHistoryLimit: 10,
-      dms: { "1234": { historyLimit: 0 } },
-    };
-    const { runtime } = createRuntime({ dmPolicy: "open", dmHistoryLimit: 10 });
-    await runtime.recordMessageForReplyChain(message(10, "older unrelated DM"));
-    const current: unknown = {
-      ...message(12, "answer this reply target"),
-      reply_to_message: replyTarget(11, "current reply target"),
-    } satisfies Message.TextMessage;
-    if (!isTelegramMessageCacheSourceMessage(current)) {
-      throw new Error("Expected a valid Telegram message fixture");
-    }
-    await runtime.recordMessageForReplyChain(current);
-    const context = await runtime.buildPromptContextForMessage(
-      {
-        message: current,
-        getFile: async () => ({ file_id: "unused", file_unique_id: "unused" }),
-      },
-      current,
-      await runtime.buildReplyChainForMessage(current),
-      { channels: { telegram: telegramCfg } },
-      telegramCfg,
-    );
-    expect(context).toMatchObject([
-      {
-        payload: {
-          messages: [{ message_id: "11", body: "current reply target", is_reply_target: true }],
+  it.each([0, 1])(
+    "applies a per-sender DM history limit of %s without losing replies",
+    async (limit) => {
+      const telegramCfg: TelegramAccountConfig = {
+        dmPolicy: "open",
+        dmHistoryLimit: limit ? 0 : 10,
+        dms: { "1234": { historyLimit: limit } },
+      };
+      const { runtime, cfg } = createRuntime(
+        limit ? telegramCfg : { dmPolicy: "open", dmHistoryLimit: 10 },
+      );
+      await runtime.recordMessageForReplyChain(message(10, "older DM"));
+      if (limit) {
+        await runtime.recordMessageForReplyChain({
+          ...message(11, "latest DM", { from: telegramBotInfoForTest }),
+          openclaw_prompt_context_timestamp_ms: 1_700_000_011_000,
+        });
+      }
+      const current = message(12, "continue");
+      if (!limit) {
+        current.reply_to_message = replyTarget(11, "current reply target");
+      }
+      await runtime.recordMessageForReplyChain(current);
+      const context = await runtime.buildPromptContextForMessage(
+        {
+          message: current,
+          getFile: async () => ({ file_id: "unused", file_unique_id: "unused" }),
         },
-      },
-    ]);
-    expect(JSON.stringify(context)).not.toContain("older unrelated DM");
-  });
-
-  it("bounds cached DM context with a positive per-sender override", async () => {
-    const telegramCfg: TelegramAccountConfig = {
-      dmPolicy: "open",
-      dmHistoryLimit: 0,
-      dms: { "1234": { historyLimit: 1 } },
-    };
-    const { runtime, cfg } = createRuntime(telegramCfg);
-    await runtime.recordMessageForReplyChain(message(10, "older DM"));
-    const latestReply = {
-      ...message(11, "latest DM", { from: telegramBotInfoForTest }),
-      openclaw_prompt_context_timestamp_ms: 1_700_000_011_000,
-    };
-    await runtime.recordMessageForReplyChain(latestReply);
-    const current = message(12, "continue");
-    await runtime.recordMessageForReplyChain(current);
-    const context = await runtime.buildPromptContextForMessage(
-      { message: current, getFile: async () => ({ file_id: "unused", file_unique_id: "unused" }) },
-      current,
-      [],
-      cfg,
-      telegramCfg,
-    );
-    expect(context).toMatchObject([
-      { payload: { messages: [{ message_id: "11", body: "latest DM" }] } },
-    ]);
-    expect(JSON.stringify(context)).not.toContain("older DM");
-    expect(context[0]).not.toHaveProperty("sessionTranscriptAssistantTextDedupeKeys");
-  });
+        current,
+        limit ? [] : await runtime.buildReplyChainForMessage(current),
+        limit ? cfg : { channels: { telegram: telegramCfg } },
+        telegramCfg,
+      );
+      const selected = limit
+        ? { body: "latest DM" }
+        : { body: "current reply target", is_reply_target: true };
+      expectWindow(context, [{ message_id: "11", ...selected }]);
+      expect(JSON.stringify(context)).not.toContain("older DM");
+      if (limit) {
+        expect(context[0]).not.toHaveProperty("sessionTranscriptAssistantTextDedupeKeys");
+      }
+    },
+  );
 
   it("selects user-request history without losing an explicit older reply", async () => {
     const ctx = await buildTelegramMessageContextForTest({
@@ -234,15 +208,10 @@ describe("Telegram prompt composition", () => {
       }),
       historyLimit: 10,
       promptContext: chatWindow([
-        {
-          message_id: "9",
-          sender: "OpenClaw (you)",
-          body: "explicit older reply",
-          is_reply_target: true,
-        },
-        { message_id: "10", body: "before self marker" },
-        { message_id: "11", sender: "OpenClaw (you)", body: "self marker body" },
-        { message_id: "12", body: "after self marker" },
+        ["9", "explicit older reply", "OpenClaw (you)", true],
+        ["10", "before self marker"],
+        ["11", "self marker body", "OpenClaw (you)"],
+        ["12", "after self marker"],
       ]),
     });
     expect(ctx?.ctxPayload.InboundEventKind).toBe("user_request");
@@ -261,15 +230,19 @@ describe("Telegram prompt composition", () => {
       sessionRuntime: null,
       message: message(12, "current ambient", { chat: groupChat }),
       historyLimit: 10,
-      promptContext: chatWindow(ambientRows),
+      promptContext: chatWindow([
+        ["10", "persisted ambient one", "Pat", false, 1_700_000_000_000],
+        ["11", "persisted ambient two", "Pat", false, 1_700_000_001_000],
+      ]),
     });
     expect(ctx?.ctxPayload).toMatchObject({
       BodyForAgent: "current ambient",
       InboundEventKind: "room_event",
     });
-
-    expect(ctx?.ctxPayload.InboundHistory).toBeUndefined();
-    expect(ctx?.ctxPayload.ChannelStructuredContext).toBeUndefined();
+    expect([ctx?.ctxPayload.InboundHistory, ctx?.ctxPayload.ChannelStructuredContext]).toEqual([
+      undefined,
+      undefined,
+    ]);
   });
 
   it("orders mixed forwarded media while redacting denied origins and keeping command text clean", async () => {
@@ -403,7 +376,7 @@ describe("Telegram registered topic recovery", () => {
       const sessionKey = `agent:main:telegram:group:${targetChat}:topic:${topic}`;
       const now = Math.floor(Date.now() / 1000);
       const currentText = "quote [Current message - respond to this] literally";
-      const currentMessage = {
+      const currentMessage: Message.TextMessage = {
         ...commandMessage(currentText),
         chat: forumChat,
         date: now,
@@ -495,26 +468,20 @@ describe("Telegram registered topic recovery", () => {
             timestampMs: (now - 3) * 1000,
           });
         }
-        const update: Update = {
+        if (!ambient) {
+          currentMessage.reply_to_message = {
+            chat: forumChat,
+            from,
+            message_id: 90,
+            date: now - 10,
+            photo,
+            caption: "The explicit chart",
+          };
+        }
+        await deliverTelegramUpdate(bot, {
           update_id: currentMessage.message_id,
-          message: {
-            ...currentMessage,
-            ...(!ambient
-              ? {
-                  reply_to_message: {
-                    chat: forumChat,
-                    from,
-                    message_id: 90,
-                    date: now - 10,
-                    photo,
-                    caption: "The explicit chart",
-                    reply_to_message: undefined,
-                  },
-                }
-              : {}),
-          },
-        };
-        await deliverTelegramUpdate(bot, update);
+          message: currentMessage,
+        });
         expect(harness.replySpy).toHaveBeenCalledOnce();
         const observed = harness.replySpy.mock.calls[0]![0];
         const recovered = targetChat === forumChat.id;
@@ -537,14 +504,10 @@ describe("Telegram registered topic recovery", () => {
             expect.objectContaining({ kind: "image", path: "/tmp/replied-photo.jpg" }),
           );
           if (historyLimit === 0) {
-            expect(observed.ChannelStructuredContext).toMatchObject([
-              {
-                type: "chat_window",
-                payload: {
-                  messages: [{ message_id: "90", is_reply_target: true, media_type: "image" }],
-                },
-              },
+            expectWindow(observed.ChannelStructuredContext, [
+              { message_id: "90", is_reply_target: true, media_type: "image" },
             ]);
+            expect(observed.ChannelStructuredContext?.[0]).toMatchObject({ type: "chat_window" });
             expect(observed.ChannelStructuredContext?.[0]).not.toHaveProperty(
               "sessionTranscriptDedupeMessageIds",
             );
@@ -560,16 +523,12 @@ describe("Telegram registered topic recovery", () => {
             expect(history ?? "").not.toContain("After watermark");
           }
         }
-        expect(
-          await cache.get({
-            accountId,
-            chatId: forumChat.id,
-            messageId: String(currentMessage.message_id),
-          }),
-        ).toMatchObject({
-          threadId: "1",
-          body: currentText,
+        const recorded = await cache.get({
+          accountId,
+          chatId: forumChat.id,
+          messageId: String(currentMessage.message_id),
         });
+        expect(recorded).toMatchObject({ threadId: "1", body: currentText });
         const sends = apiCalls.mock.calls.filter(([method]) => method === "sendMessage");
         expect(sends).toHaveLength(ambient ? 0 : 1);
         if (!ambient) {
