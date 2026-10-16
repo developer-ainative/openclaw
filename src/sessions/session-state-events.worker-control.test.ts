@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
+import { publishSystemEventStoreResolver } from "../infra/system-event-ownership.js";
 import { resolveOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.paths.js";
 import type { OpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.types.js";
 import { recordSessionCreated } from "./session-created.js";
@@ -152,6 +153,8 @@ function recordSibling() {
 beforeEach(() => {
   vi.clearAllMocks();
   edge.phases.length = 0;
+  // Supply the accepted store without loading runtime config or native ownership metadata.
+  publishSystemEventStoreResolver(() => notice.watcherStorePath);
   edge.capture.mockImplementation(() => edge.context);
   edge.execute.mockImplementation(async (command) => {
     edge.phases.push(command.type === "sessionState.prune" ? "prune" : "record");
@@ -164,6 +167,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  publishSystemEventStoreResolver(undefined);
   expect(edge.forbidden).not.toHaveBeenCalled();
   vi.restoreAllMocks();
 });
