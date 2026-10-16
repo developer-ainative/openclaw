@@ -1,7 +1,7 @@
 // Covers trusted system binary resolution across platform install roots.
 import path from "node:path";
 import { importFreshModule } from "openclaw/plugin-sdk/test-fixtures";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 type ResolveSystemBin = typeof import("./resolve-system-bin.js").resolveSystemBin;
 
@@ -55,6 +55,11 @@ function addExecutables(...paths: string[]): void {
   }
 }
 
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
+
 beforeEach(async () => {
   executables = new Set<string>();
   windowsRoots.systemRoot = "C:\\Windows";
@@ -68,25 +73,10 @@ beforeEach(async () => {
 describe("resolveSystemBin", () => {
   if (process.platform !== "win32") {
     it.each([
-      {
-        name: "does NOT resolve a binary found in /usr/local/bin with strict trust",
-        executable: "/usr/local/bin/openssl",
-        command: "openssl",
-        checkStrict: true,
-      },
-      {
-        name: "does NOT resolve a binary found in /opt/homebrew/bin with strict trust",
-        executable: "/opt/homebrew/bin/ffmpeg",
-        command: "ffmpeg",
-        checkStrict: true,
-      },
-      {
-        name: "does NOT resolve a binary from a user-writable directory like ~/.local/bin",
-        executable: "/home/testuser/.local/bin/ffmpeg",
-        command: "ffmpeg",
-        checkStrict: false,
-      },
-    ])("$name", ({ executable, command, checkStrict }) => {
+      ["/usr/local/bin/openssl", "openssl", true],
+      ["/opt/homebrew/bin/ffmpeg", "ffmpeg", true],
+      ["/home/testuser/.local/bin/ffmpeg", "ffmpeg", false],
+    ] as const)("does not trust %s by default", (executable, command, checkStrict) => {
       addExecutables(executable);
       expect(resolveSystemBin(command)).toBeNull();
       if (checkStrict) {
@@ -155,19 +145,14 @@ describe("resolveSystemBin", () => {
   }
 
   it.each([
-    { name: "Unix strict", platform: "linux", trust: "strict", extension: "" },
-    { name: "Unix standard", platform: "linux", trust: "standard", extension: "" },
-    { name: "Windows extensionless strict", platform: "win32", trust: "strict", extension: "" },
-    {
-      name: "Windows explicit-extension standard",
-      platform: "win32",
-      trust: "standard",
-      extension: ".exe",
-    },
+    ["linux", "strict", ""],
+    ["linux", "standard", ""],
+    ["win32", "strict", ""],
+    ["win32", "standard", ".exe"],
   ] as const)(
-    "bounds $name success entries with LRU eviction and retries failures",
-    ({ platform, trust, extension }) => {
-      const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+    "bounds %s %s %s success entries with LRU eviction and retries failures",
+    (platform, trust, extension) => {
+      vi.spyOn(process, "platform", "get").mockReturnValue(platform);
       const systemDir =
         platform === "win32" ? path.win32.join("C:\\Windows", "System32") : "/usr/bin";
       const commandFor = (label: string) => `${label}${extension}`;
@@ -183,137 +168,85 @@ describe("resolveSystemBin", () => {
       const cold = commandFor("cold");
       const hot = commandFor("hot");
 
-      try {
-        expect(resolveSystemBin(cold, { trust })).toBeNull();
-        const coldCandidate = addCommand(cold);
-        const hotCandidate = addCommand(hot);
-        expect(resolveSystemBin(cold, { trust })).toBe(coldCandidate);
-        expect(resolveSystemBin(hot, { trust })).toBe(hotCandidate);
-        for (let index = 0; index < 510; index += 1) {
-          const filler = commandFor(`filler-${index}`);
-          const fillerCandidate = addCommand(filler);
-          expect(resolveSystemBin(filler, { trust })).toBe(fillerCandidate);
-        }
-
-        expect(resolveSystemBin(hot, { trust })).toBe(hotCandidate);
-        const newest = commandFor("newest");
-        const newestCandidate = addCommand(newest);
-        expect(resolveSystemBin(newest, { trust })).toBe(newestCandidate);
-        executables.delete(path.resolve(coldCandidate));
-        executables.delete(path.resolve(hotCandidate));
-
-        expect(resolveSystemBin(hot, { trust })).toBe(hotCandidate);
-        expect(resolveSystemBin(cold, { trust })).toBeNull();
-      } finally {
-        platformSpy.mockRestore();
+      expect(resolveSystemBin(cold, { trust })).toBeNull();
+      const coldCandidate = addCommand(cold);
+      const hotCandidate = addCommand(hot);
+      expect(resolveSystemBin(cold, { trust })).toBe(coldCandidate);
+      expect(resolveSystemBin(hot, { trust })).toBe(hotCandidate);
+      for (let index = 0; index < 510; index += 1) {
+        const filler = commandFor(`filler-${index}`);
+        const fillerCandidate = addCommand(filler);
+        expect(resolveSystemBin(filler, { trust })).toBe(fillerCandidate);
       }
+
+      expect(resolveSystemBin(hot, { trust })).toBe(hotCandidate);
+      const newest = commandFor("newest");
+      const newestCandidate = addCommand(newest);
+      expect(resolveSystemBin(newest, { trust })).toBe(newestCandidate);
+      executables.delete(path.resolve(coldCandidate));
+      executables.delete(path.resolve(hotCandidate));
+
+      expect(resolveSystemBin(hot, { trust })).toBe(hotCandidate);
+      expect(resolveSystemBin(cold, { trust })).toBeNull();
     },
   );
 });
 
 describe("trusted directory list", () => {
   it("resolves Windows system and Program Files tools through the public resolver", () => {
-    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     windowsRoots.systemRoot = "D:\\Windows";
     windowsRoots.programFilesRoots = ["D:\\Program Files", "E:\\Program Files (x86)"];
-    try {
-      const candidates = [
-        {
-          command: "pwsh",
-          expected: path.win32.join(
-            "D:\\Windows",
-            "System32",
-            "WindowsPowerShell",
-            "v1.0",
-            "pwsh.exe",
-          ),
-          trust: "strict" as const,
-        },
-        {
-          command: "openssl",
-          expected: path.win32.join("D:\\Program Files", "OpenSSL-Win64", "bin", "openssl.exe"),
-          trust: "strict" as const,
-        },
-        {
-          command: "ffmpeg",
-          expected: path.win32.join("E:\\Program Files (x86)", "ffmpeg", "bin", "ffmpeg.exe"),
-          trust: "strict" as const,
-        },
-        {
-          command: "magick",
-          expected: path.win32.join("D:\\Program Files", "ImageMagick", "magick.exe"),
-          trust: "standard" as const,
-        },
-        {
-          command: "gm",
-          expected: path.win32.join("E:\\Program Files (x86)", "GraphicsMagick", "gm.exe"),
-          trust: "standard" as const,
-        },
-      ];
-      addExecutables(...candidates.map(({ expected }) => path.resolve(expected)));
+    const candidates = [
+      ["pwsh", "D:\\Windows\\System32\\WindowsPowerShell\\v1.0\\pwsh.exe", "strict"],
+      ["openssl", "D:\\Program Files\\OpenSSL-Win64\\bin\\openssl.exe", "strict"],
+      ["ffmpeg", "E:\\Program Files (x86)\\ffmpeg\\bin\\ffmpeg.exe", "strict"],
+      ["magick", "D:\\Program Files\\ImageMagick\\magick.exe", "standard"],
+      ["gm", "E:\\Program Files (x86)\\GraphicsMagick\\gm.exe", "standard"],
+    ] as const;
+    addExecutables(...candidates.map(([, expected]) => path.resolve(expected)));
 
-      for (const { command, expected, trust } of candidates) {
-        expect(resolveSystemBin(command, { trust })).toBe(expected);
-      }
-      expect(resolveSystemBin("magick", { trust: "strict" })).toBeNull();
-
-      addExecutables(path.resolve("/usr/bin/unix-only.exe"));
-      expect(resolveSystemBin("unix-only", { trust: "standard" })).toBeNull();
-    } finally {
-      platformSpy.mockRestore();
+    for (const [command, expected, trust] of candidates) {
+      expect(resolveSystemBin(command, { trust })).toBe(expected);
     }
+    expect(resolveSystemBin("magick", { trust: "strict" })).toBeNull();
+
+    addExecutables(path.resolve("/usr/bin/unix-only.exe"));
+    expect(resolveSystemBin("unix-only", { trust: "standard" })).toBeNull();
   });
 
   it("resolves machine-wide Chocolatey shims only with standard trust on Windows", () => {
-    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    try {
-      const chocoFfmpeg = path.win32.join("C:\\", "ProgramData", "chocolatey", "bin", "ffmpeg.exe");
-      executables.add(path.resolve(chocoFfmpeg));
-      expect(resolveSystemBin("ffmpeg")).toBeNull();
-      expect(resolveSystemBin("ffmpeg", { trust: "standard" })).toBe(chocoFfmpeg);
-    } finally {
-      platformSpy.mockRestore();
-    }
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    const chocoFfmpeg = path.win32.join("C:\\", "ProgramData", "chocolatey", "bin", "ffmpeg.exe");
+    executables.add(path.resolve(chocoFfmpeg));
+    expect(resolveSystemBin("ffmpeg")).toBeNull();
+    expect(resolveSystemBin("ffmpeg", { trust: "standard" })).toBe(chocoFfmpeg);
   });
 
   it("uses fixed Linux system paths and ignores NIX_PROFILES", () => {
-    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("linux");
-    const previousNixProfiles = process.env.NIX_PROFILES;
-    process.env.NIX_PROFILES =
-      "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ffmpeg-7.1 /tmp/evil /home/user/.nix-profile";
-    try {
-      addExecutables(
-        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ffmpeg-7.1/bin/ffmpeg",
-        "/run/current-system/sw/bin/nix-tool",
-        "/snap/bin/snap-tool",
-        "/usr/local/bin/local-tool",
-      );
+    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    vi.stubEnv(
+      "NIX_PROFILES",
+      "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ffmpeg-7.1 /tmp/evil /home/user/.nix-profile",
+    );
+    addExecutables(
+      "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ffmpeg-7.1/bin/ffmpeg",
+      "/run/current-system/sw/bin/nix-tool",
+      "/snap/bin/snap-tool",
+      "/usr/local/bin/local-tool",
+    );
 
-      expect(resolveSystemBin("ffmpeg")).toBeNull();
-      expect(resolveSystemBin("nix-tool")).toBe("/run/current-system/sw/bin/nix-tool");
-      expect(resolveSystemBin("snap-tool")).toBe("/snap/bin/snap-tool");
-      expect(resolveSystemBin("local-tool")).toBeNull();
-      expect(resolveSystemBin("local-tool", { trust: "standard" })).toBe(
-        "/usr/local/bin/local-tool",
-      );
-    } finally {
-      if (previousNixProfiles === undefined) {
-        delete process.env.NIX_PROFILES;
-      } else {
-        process.env.NIX_PROFILES = previousNixProfiles;
-      }
-      platformSpy.mockRestore();
-    }
+    expect(resolveSystemBin("ffmpeg")).toBeNull();
+    expect(resolveSystemBin("nix-tool")).toBe("/run/current-system/sw/bin/nix-tool");
+    expect(resolveSystemBin("snap-tool")).toBe("/snap/bin/snap-tool");
+    expect(resolveSystemBin("local-tool")).toBeNull();
+    expect(resolveSystemBin("local-tool", { trust: "standard" })).toBe("/usr/local/bin/local-tool");
   });
 
   it("does not widen standard trust on unsupported Unix platforms", () => {
-    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("freebsd");
-    try {
-      addExecutables("/usr/local/bin/local-tool");
-      expect(resolveSystemBin("local-tool", { trust: "strict" })).toBeNull();
-      expect(resolveSystemBin("local-tool", { trust: "standard" })).toBeNull();
-    } finally {
-      platformSpy.mockRestore();
-    }
+    vi.spyOn(process, "platform", "get").mockReturnValue("freebsd");
+    addExecutables("/usr/local/bin/local-tool");
+    expect(resolveSystemBin("local-tool", { trust: "strict" })).toBeNull();
+    expect(resolveSystemBin("local-tool", { trust: "standard" })).toBeNull();
   });
 });

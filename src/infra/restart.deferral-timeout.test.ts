@@ -24,6 +24,29 @@ type RestartDeferralHooks = NonNullable<
 
 const restartSignalHandler = vi.fn();
 
+function forceAfterBudget(
+  emitHooks: NonNullable<Parameters<typeof deferGatewayRestartUntilIdle>[0]["emitHooks"]>,
+  hooks: RestartDeferralHooks,
+  getPendingCount = () => 0,
+) {
+  return deferGatewayRestartUntilIdle({
+    getPendingCount,
+    maxWaitMs: 100,
+    pollMs: 10,
+    hooks,
+    timeoutIntent: { force: true },
+    emitHooks,
+  });
+}
+
+function currentAuthority(isCurrent: () => boolean) {
+  return () => {
+    if (!isCurrent()) {
+      throw new Error("requester revoked");
+    }
+  };
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   restartSignalHandler.mockClear();
@@ -198,14 +221,7 @@ describe("deferGatewayRestartUntilIdle timeout", () => {
       beforeEmitCalls += 1;
       return beforeEmitCalls <= 2 ? new Promise<void>(() => {}) : Promise.resolve();
     });
-    deferGatewayRestartUntilIdle({
-      getPendingCount: () => 0,
-      maxWaitMs: 100,
-      pollMs: 10,
-      hooks,
-      timeoutIntent: { force: true },
-      emitHooks: { beforeEmit, emitRestart },
-    });
+    forceAfterBudget({ beforeEmit, emitRestart }, hooks);
     await vi.advanceTimersByTimeAsync(250);
     expect(hooks.onTimeout).toHaveBeenCalledOnce();
     expect(beforeEmitCalls).toBeGreaterThanOrEqual(3);
@@ -226,14 +242,7 @@ describe("deferGatewayRestartUntilIdle timeout", () => {
           });
     });
 
-    deferGatewayRestartUntilIdle({
-      getPendingCount: () => 0,
-      maxWaitMs: 100,
-      pollMs: 10,
-      hooks,
-      timeoutIntent: { force: true },
-      emitHooks: { beforeEmit, emitRestart },
-    });
+    forceAfterBudget({ beforeEmit, emitRestart }, hooks);
 
     await vi.advanceTimersByTimeAsync(100);
     expect(beforeEmitCalls).toBe(2);
@@ -257,14 +266,7 @@ describe("deferGatewayRestartUntilIdle timeout", () => {
       return { status: "emitted" as const };
     });
 
-    deferGatewayRestartUntilIdle({
-      getPendingCount: () => 1,
-      maxWaitMs: 100,
-      pollMs: 10,
-      hooks,
-      timeoutIntent: { force: true },
-      emitHooks: { emitRestart },
-    });
+    forceAfterBudget({ emitRestart }, hooks, () => 1);
 
     await vi.advanceTimersByTimeAsync(150);
 
@@ -343,11 +345,7 @@ describe("scheduled restart requester authority", () => {
         delayMs: stage === "timer" ? 1_000 : 0,
         sessionKey: "requester-a",
         emitHooks: {
-          assertCurrent: () => {
-            if (!current) {
-              throw new Error("linked administrator was demoted");
-            }
-          },
+          assertCurrent: currentAuthority(() => current),
           beforeEmit,
           afterEmitRejected,
         },
@@ -384,11 +382,7 @@ describe("scheduled restart requester authority", () => {
         delayMs: 1_000,
         sessionKey: "requester-a",
         emitHooks: {
-          assertCurrent: () => {
-            if (!firstCurrent) {
-              throw new Error("first requester revoked");
-            }
-          },
+          assertCurrent: currentAuthority(() => firstCurrent),
           beforeEmit: firstPreparation,
         },
       });
@@ -399,11 +393,7 @@ describe("scheduled restart requester authority", () => {
           ? {}
           : {
               emitHooks: {
-                assertCurrent: () => {
-                  if (!secondCurrent) {
-                    throw new Error("second requester revoked");
-                  }
-                },
+                assertCurrent: currentAuthority(() => secondCurrent),
                 beforeEmit: secondPreparation,
               },
             }),
@@ -429,11 +419,7 @@ describe("scheduled restart requester authority", () => {
       delayMs: 0,
       sessionKey: "requester-a",
       emitHooks: {
-        assertCurrent: () => {
-          if (!current) {
-            throw new Error("original requester revoked");
-          }
-        },
+        assertCurrent: currentAuthority(() => current),
         beforeEmit: async () => {
           entered.resolve();
           await release.promise;
