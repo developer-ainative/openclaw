@@ -184,10 +184,14 @@ export async function collectStateDatabasePaths(
 
 async function collectUpdateCandidateDatabasePaths(input: StateInput) {
   const files = await collectStateDatabasePaths(input);
-  if (input.config.database?.engine === "postgres") {
-    const { discoverBackupDatabasePaths } = await import("./backup-sqlite-snapshot.js");
-    // Capture already froze plugin roots before taking maintenance custody.
-    for (const file of input.additionalPaths ?? (await discoverBackupDatabasePaths(input))) {
+  const { discoverBackupDatabasePaths } = await import("./backup-sqlite-snapshot.js");
+  // The private snapshot below owns registry reads, including legacy schemas.
+  // Include declared retained plugin databases on either physical engine here.
+  for (const file of input.additionalPaths ??
+    (await discoverBackupDatabasePaths({ ...input, agentRegistry: [] }))) {
+    // Supplemental realpaths must not add aliases to the legacy versions inventory.
+    // Registry discovery below still preserves every explicitly recorded spelling.
+    if (!files.has(resolveUpdateCandidateStateIdentity(input.stateDir, file))) {
       queueStateDatabaseSpelling(files, input.stateDir, file);
     }
   }

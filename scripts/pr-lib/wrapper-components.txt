@@ -1,9 +1,11 @@
 .github/workflows/pr-crabbox-gate-publisher.yml
 cli-invocation.mjs
+cli-parent-lifetime.mjs
 cli-root-options.mjs
 config/ci-test-timings.json
 node-compile-cache.mjs
 gateway-prewarm.mjs
+gateway-shutdown-budget.mjs
 worker-heap-flag.mjs
 node-runtime-env.mjs
 node-sqlite.mjs
@@ -1472,6 +1474,7 @@ src/plugins/manifest-config-groups.ts
 src/plugins/manifest-contract-eligibility.ts
 src/plugins/manifest-contract-keys.ts
 src/plugins/manifest-control-ui.ts
+src/plugins/manifest-decision-catalog.ts
 src/plugins/manifest-install-owner.ts
 src/plugins/manifest-metadata-scan.ts
 src/plugins/manifest-model-id-normalization.ts
@@ -1639,6 +1642,7 @@ src/plugins/web-search-install-catalog.ts
 src/process/child-process-tree.ts
 src/process/child-process.ts
 src/process/command-error.ts
+src/process/darwin-process-inspection.ts
 src/process/exec-output.ts
 src/process/exec-result.ts
 src/process/exec-runner.ts
