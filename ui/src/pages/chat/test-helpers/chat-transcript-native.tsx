@@ -16,6 +16,7 @@ import {
 } from "../components/chat-thread-interactions.ts";
 import { ChatThread } from "../components/chat-thread-view.tsx";
 import type { ChatTranscript } from "../components/chat-transcript-controller.ts";
+import { withTranscriptTestLifecycle } from "../components/chat-transcript-owner.test-support.ts";
 import { TranscriptSearch } from "../components/chat-transcript-search.tsx";
 import type { ChatTranscriptSession } from "../components/chat-transcript-session.ts";
 import {
@@ -180,7 +181,7 @@ export class TranscriptTestHost extends HTMLElement implements SolidControllerHo
 export async function mountTestTranscript(
   paneId: string,
   initialRows: readonly TestContentRow[],
-  transcript = createTestTranscript(paneId),
+  transcript: ChatTranscript = createTestTranscript(paneId),
 ) {
   const container = document.body.appendChild(document.createElement("div"));
   let currentSession: ChatTranscriptSession;
@@ -199,16 +200,16 @@ export async function mountTestTranscript(
       }),
       container,
     );
-    transcript.hostUpdated();
+    transcript.update();
     flush();
   };
-  transcript.hostConnected();
+  transcript.start();
   renderRows(initialRows);
   await flushDeferredRowPrune();
   return {
     container,
     renderRows,
-    transcript,
+    transcript: withTranscriptTestLifecycle(transcript),
     get session() {
       return currentSession;
     },

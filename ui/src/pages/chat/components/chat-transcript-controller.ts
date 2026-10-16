@@ -81,14 +81,14 @@ export function createChatTranscript(
     syncViewportGeometry(): void {
       sessionVirtualizer?.syncViewportGeometry();
     },
-    start(): void {
+    start(this: void): void {
       connected = true;
       sessionVirtualizer?.connect();
     },
-    update(): void {
+    update(this: void): void {
       sessionVirtualizer?.update();
     },
-    dispose(): void {
+    dispose(this: void): void {
       connected = false;
       // A retained pane may reconnect with its existing session and saved geometry.
       sessionVirtualizer?.disconnect();
