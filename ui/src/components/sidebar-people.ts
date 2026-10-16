@@ -75,7 +75,7 @@ export function createSidebarPeople(
   });
   const profiles = createMemo(() => {
     const source = directory();
-    return source ? projectOwner(source, (current) => current) : null;
+    return source ? projectOwner(source, (profileState) => profileState) : null;
   });
   const clearPending = () => {
     pendingTarget = null;
