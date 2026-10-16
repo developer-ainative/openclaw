@@ -1,16 +1,13 @@
-// Release Check tests cover release check script behavior.
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
-  mkdtempSync,
   mkdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { create } from "tar";
@@ -35,6 +32,14 @@ import {
 import { createCommandTest, type CommandFixture } from "../helpers/command-fixture.js";
 
 const it = createCommandTest();
+const workerContractPath = "src/shared/worker-bundle-hash.ts";
+function writeFiles(root: string, files: Record<string, string>) {
+  for (const [name, contents] of Object.entries(files)) {
+    const destination = join(root, name);
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, contents);
+  }
+}
 
 const legacyWorkerContract =
   'export const WORKER_BUNDLE_ENTRY_PATH = "worker.mjs";\n' +
@@ -63,11 +68,7 @@ function createPackedTargetFixture(command: CommandFixture) {
     "dist/cli/run-main.js": "export {};",
     "dist/run-gateway.js": "const GATEWAY_AUTH_MODES = []; function addGatewayRunCommand() {}",
   };
-  for (const [relativePath, source] of Object.entries(packedFiles)) {
-    const destination = join(packedRoot, relativePath);
-    mkdirSync(dirname(destination), { recursive: true });
-    writeFileSync(destination, source);
-  }
+  writeFiles(packedRoot, packedFiles);
   mkdirSync(join(root, "scripts/lib"), { recursive: true });
   mkdirSync(join(root, "src/shared"), { recursive: true });
   mkdirSync(join(root, "src/worker"), { recursive: true });
@@ -249,7 +250,7 @@ require("node:module").syncBuiltinESMExports();
 
       diagnostics.stage("packed-fixture-setup");
       copyFileSync("appcast.xml", join(root, "appcast.xml"));
-      writeFileSync(join(root, "src/shared/worker-bundle-hash.ts"), launcherWorkerContract);
+      writeFileSync(join(root, workerContractPath), launcherWorkerContract);
       writeWorkerArtifacts(packedRoot, legacyArtifacts);
       const tarball = join(root, "target.tgz");
       create({ cwd: root, file: tarball, gzip: true, sync: true }, ["package"]);
@@ -289,20 +290,13 @@ require("node:module").syncBuiltinESMExports();
             "node -e \"require('node:fs').writeFileSync('compat-checked', 'yes')\"",
         },
       });
-      for (const [relativePath, contents] of Object.entries({
+      writeFiles(root, {
         ...packedFiles,
+        "package.json": packageJson,
         "dist/index.js": "export {};",
         "dist/control-ui/index.html": "<html></html>",
         "dist/control-ui/assets/app.js.br": "prepared Brotli fixture",
-      })) {
-        if (relativePath === "package.json") {
-          continue;
-        }
-        const destination = join(root, relativePath);
-        mkdirSync(dirname(destination), { recursive: true });
-        writeFileSync(destination, contents);
-      }
-      writeFileSync(join(root, "package.json"), packageJson);
+      });
       // Match the prepared source: scripts must not reconcile its existing install.
       expect(parse(readFileSync("pnpm-workspace.yaml", "utf8"))).toMatchObject({
         nodeLinker: "isolated",
@@ -332,7 +326,7 @@ require("node:module").syncBuiltinESMExports();
         join(root, "scripts/write-package-dist-inventory.ts"),
         `import(${JSON.stringify(inventoryUrl)}).then(({ writePackageDistInventoryForPublish }) => writePackageDistInventoryForPublish(process.cwd()));\n`,
       );
-      writeFileSync(join(root, "src/shared/worker-bundle-hash.ts"), launcherWorkerContract);
+      writeFileSync(join(root, workerContractPath), launcherWorkerContract);
       writeWorkerArtifacts(root, legacyArtifacts);
       const runtimeArgs = process.versions.bun
         ? []
@@ -369,14 +363,18 @@ require("node:module").syncBuiltinESMExports();
     const diagnostics = command.enableDiagnostics("release-check-contracts");
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      const cases = [
+      const cases: Array<{
+        name: string;
+        workerContract: string;
+        artifacts: string[];
+        declaresLocator?: boolean;
+        includesLocator?: boolean;
+        expected?: string;
+      }> = [
         {
           name: "legacy two-file worker contract",
           workerContract: legacyWorkerContract,
           artifacts: legacyArtifacts,
-          declaresLocator: false,
-          includesLocator: false,
-          expected: undefined,
         },
         {
           name: "current array overrides obsolete individual paths",
@@ -384,32 +382,22 @@ require("node:module").syncBuiltinESMExports();
             currentWorkerContract +
             'export const WORKER_BUNDLE_OBSOLETE_PATH = "../obsolete.mjs";\n',
           artifacts: currentArtifacts,
-          declaresLocator: false,
-          includesLocator: false,
-          expected: undefined,
         },
         {
           name: "legacy three-file contract requires the launcher",
           workerContract: launcherWorkerContract,
           artifacts: legacyArtifacts,
-          declaresLocator: false,
-          includesLocator: false,
           expected: "Worker deploy artifact dist/worker/github-exec-launcher.mjs is missing.",
         },
         {
           name: "legacy three-file worker contract",
           workerContract: launcherWorkerContract,
           artifacts: ["github-exec-launcher.mjs", ...legacyArtifacts],
-          declaresLocator: false,
-          includesLocator: false,
-          expected: undefined,
         },
         ...["service-child-group-anchor.mjs", "service-child-relay.mjs"].map((missingArtifact) => ({
           name: `current array requires ${missingArtifact}`,
           workerContract: currentWorkerContract,
           artifacts: currentArtifacts.filter((artifact) => artifact !== missingArtifact),
-          declaresLocator: false,
-          includesLocator: false,
           expected: `Worker deploy artifact dist/worker/${missingArtifact} is missing.`,
         })),
         {
@@ -417,7 +405,6 @@ require("node:module").syncBuiltinESMExports();
           workerContract: legacyWorkerContract,
           artifacts: legacyArtifacts,
           declaresLocator: true,
-          includesLocator: false,
           expected: "could not read gateway run chunk metadata",
         },
         {
@@ -426,22 +413,21 @@ require("node:module").syncBuiltinESMExports();
           artifacts: legacyArtifacts,
           declaresLocator: true,
           includesLocator: true,
-          expected: undefined,
         },
       ];
       for (const {
         name,
         workerContract,
         artifacts,
-        declaresLocator,
-        includesLocator,
+        declaresLocator = false,
+        includesLocator = false,
         expected,
       } of cases) {
         diagnostics.stage(name);
         // Separate targets keep module caches from reusing another frozen release's declarations.
         const { root, packedRoot, packedFiles } = createPackedTargetFixture(command);
         writeWorkerArtifacts(packedRoot, artifacts);
-        writeFileSync(join(root, "src/shared/worker-bundle-hash.ts"), workerContract);
+        writeFileSync(join(root, workerContractPath), workerContract);
         if (declaresLocator) {
           writeFileSync(
             join(root, "scripts/lib/gateway-run-chunk-metadata.mts"),
@@ -473,42 +459,36 @@ require("node:module").syncBuiltinESMExports();
           expect(errors, name).not.toHaveBeenCalled();
         }
       }
-      const invalidContracts = [
-        {
-          source: 'export const WORKER_BUNDLE_ENTRY_PATH = "";\n',
-          expected:
-            "release-check: target worker artifact WORKER_BUNDLE_ENTRY_PATH must be a non-empty path string.",
-        },
-        {
-          source: 'export const WORKER_BUNDLE_ENTRY_PATH = "../worker/main.mjs";\n',
-          expected:
-            "release-check: target worker artifact WORKER_BUNDLE_ENTRY_PATH must be a normalized relative path within dist/worker.",
-        },
-        ...["undefined", "[]"].map((value) => ({
-          source: legacyWorkerContract + `export const WORKER_BUNDLE_ARTIFACT_PATHS = ${value};\n`,
-          expected: "release-check: target WORKER_BUNDLE_ARTIFACT_PATHS must be a non-empty array.",
-        })),
-        {
-          source: 'export const WORKER_BUNDLE_ARTIFACT_PATHS = ["worker.mjs", ""];\n',
-          expected:
-            "release-check: target worker artifact WORKER_BUNDLE_ARTIFACT_PATHS[1] must be a non-empty path string.",
-        },
-        {
-          source:
-            'export const WORKER_BUNDLE_ARTIFACT_PATHS = ["worker.mjs", "../worker/main.mjs"];\n',
-          expected:
-            "release-check: target worker artifact WORKER_BUNDLE_ARTIFACT_PATHS[1] must be a normalized relative path within dist/worker.",
-        },
-        {
-          source: "export const OTHER_PATH = 1;\n",
-          expected:
-            "release-check: target worker producer is missing WORKER_BUNDLE_*_PATH declarations.",
-        },
+      const invalidContracts: Array<[string, string]> = [
+        [
+          'export const WORKER_BUNDLE_ENTRY_PATH = "";\n',
+          "release-check: target worker artifact WORKER_BUNDLE_ENTRY_PATH must be a non-empty path string.",
+        ],
+        [
+          'export const WORKER_BUNDLE_ENTRY_PATH = "../worker/main.mjs";\n',
+          "release-check: target worker artifact WORKER_BUNDLE_ENTRY_PATH must be a normalized relative path within dist/worker.",
+        ],
+        ...["undefined", "[]"].map((value): [string, string] => [
+          legacyWorkerContract + `export const WORKER_BUNDLE_ARTIFACT_PATHS = ${value};\n`,
+          "release-check: target WORKER_BUNDLE_ARTIFACT_PATHS must be a non-empty array.",
+        ]),
+        [
+          'export const WORKER_BUNDLE_ARTIFACT_PATHS = ["worker.mjs", ""];\n',
+          "release-check: target worker artifact WORKER_BUNDLE_ARTIFACT_PATHS[1] must be a non-empty path string.",
+        ],
+        [
+          'export const WORKER_BUNDLE_ARTIFACT_PATHS = ["worker.mjs", "../worker/main.mjs"];\n',
+          "release-check: target worker artifact WORKER_BUNDLE_ARTIFACT_PATHS[1] must be a normalized relative path within dist/worker.",
+        ],
+        [
+          "export const OTHER_PATH = 1;\n",
+          "release-check: target worker producer is missing WORKER_BUNDLE_*_PATH declarations.",
+        ],
       ];
-      for (const [index, { source, expected }] of invalidContracts.entries()) {
+      for (const [index, [source, expected]] of invalidContracts.entries()) {
         diagnostics.stage(`invalid-worker-contract-${index}`);
         const { root, packedRoot } = createPackedTargetFixture(command);
-        writeFileSync(join(root, "src/shared/worker-bundle-hash.ts"), source);
+        writeFileSync(join(root, workerContractPath), source);
         await expect(checkPackedTargetBootstrap(root, packedRoot), source).rejects.toThrow(
           expected,
         );
@@ -518,7 +498,7 @@ require("node:module").syncBuiltinESMExports();
       diagnostics.stage("target-without-worker-producer");
       const { root, packedRoot } = createPackedTargetFixture(command);
       writeFileSync(
-        join(root, "src/shared/worker-bundle-hash.ts"),
+        join(root, workerContractPath),
         "export const WORKER_BUNDLE_ARTIFACT_PATHS = [];\n",
       );
       rmSync(join(root, "src/worker/worker-deploy-entry.ts"));
@@ -541,173 +521,145 @@ require("node:module").syncBuiltinESMExports();
     ]);
   });
 
-  it("resolves prepacked publishable core package tarballs", () => {
-    const root = mkdtempSync(join(tmpdir(), "openclaw-release-check-tarball-test-"));
-    try {
-      writeFileSync(join(root, "openclaw-ai-2026.6.33.tgz"), "fixture");
-      writeFileSync(join(root, "openclaw-gateway-client-2026.6.33.tgz"), "fixture");
-      writeFileSync(join(root, "openclaw-gateway-protocol-2026.6.33.tgz"), "fixture");
-      writeFileSync(join(root, "SHA256SUMS"), "fixture");
-      expect(resolveReleaseCheckLocalPackageTarballs(root)).toEqual([
-        join(root, "openclaw-ai-2026.6.33.tgz"),
-        join(root, "openclaw-gateway-client-2026.6.33.tgz"),
-        join(root, "openclaw-gateway-protocol-2026.6.33.tgz"),
-      ]);
-      expect(resolveReleaseCheckLocalPackageTarballs(undefined)).toEqual([]);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+  it("resolves prepacked publishable core package tarballs", ({ command }) => {
+    const root = command.createTempDir("openclaw-release-check-tarball-test-");
+    writeFileSync(join(root, "openclaw-ai-2026.6.33.tgz"), "fixture");
+    writeFileSync(join(root, "openclaw-gateway-client-2026.6.33.tgz"), "fixture");
+    writeFileSync(join(root, "openclaw-gateway-protocol-2026.6.33.tgz"), "fixture");
+    writeFileSync(join(root, "SHA256SUMS"), "fixture");
+    expect(resolveReleaseCheckLocalPackageTarballs(root)).toEqual([
+      join(root, "openclaw-ai-2026.6.33.tgz"),
+      join(root, "openclaw-gateway-client-2026.6.33.tgz"),
+      join(root, "openclaw-gateway-protocol-2026.6.33.tgz"),
+    ]);
+    expect(resolveReleaseCheckLocalPackageTarballs(undefined)).toEqual([]);
   });
 
-  it("accepts gateway core packages when the root does not require AI", () => {
-    const root = mkdtempSync(join(tmpdir(), "openclaw-release-check-tarball-test-"));
-    try {
-      const gatewayTarball = join(root, "openclaw-gateway-protocol-2026.7.2.tgz");
-      const gatewayClientTarball = join(root, "openclaw-gateway-client-2026.7.2.tgz");
-      writeFileSync(gatewayTarball, "fixture");
-      writeFileSync(gatewayClientTarball, "fixture");
-      expect(resolveReleaseCheckLocalPackageTarballs(root, false)).toEqual([
-        gatewayClientTarball,
-        gatewayTarball,
-      ]);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+  it("accepts gateway core packages when the root does not require AI", ({ command }) => {
+    const root = command.createTempDir("openclaw-release-check-tarball-test-");
+    const gatewayTarball = join(root, "openclaw-gateway-protocol-2026.7.2.tgz");
+    const gatewayClientTarball = join(root, "openclaw-gateway-client-2026.7.2.tgz");
+    writeFileSync(gatewayTarball, "fixture");
+    writeFileSync(gatewayClientTarball, "fixture");
+    expect(resolveReleaseCheckLocalPackageTarballs(root, false)).toEqual([
+      gatewayClientTarball,
+      gatewayTarball,
+    ]);
   });
 
-  it("writes a gateway-packages-only local project when the root does not require AI", () => {
-    const root = mkdtempSync(join(tmpdir(), "openclaw-release-check-install-test-"));
-    try {
-      writePackedTarballInstallManifest(
-        root,
-        "/tmp/openclaw.tgz",
-        ["/tmp/openclaw-gateway-client.tgz", "/tmp/openclaw-gateway-protocol.tgz"],
-        false,
-      );
-      const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
-        dependencies?: Record<string, string>;
-        private?: boolean;
-      };
-      expect(manifest.private).toBe(true);
-      expect(manifest.dependencies).toEqual({
-        "@openclaw/gateway-client": "file:///tmp/openclaw-gateway-client.tgz",
-        "@openclaw/gateway-protocol": "file:///tmp/openclaw-gateway-protocol.tgz",
-        openclaw: "file:///tmp/openclaw.tgz",
-      });
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+  it("writes a gateway-packages-only local project when the root does not require AI", ({
+    command,
+  }) => {
+    const root = command.createTempDir("openclaw-release-check-install-test-");
+    writePackedTarballInstallManifest(
+      root,
+      "/tmp/openclaw.tgz",
+      ["/tmp/openclaw-gateway-client.tgz", "/tmp/openclaw-gateway-protocol.tgz"],
+      false,
+    );
+    const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
+      dependencies?: Record<string, string>;
+      private?: boolean;
+    };
+    expect(manifest.private).toBe(true);
+    expect(manifest.dependencies).toEqual({
+      "@openclaw/gateway-client": "file:///tmp/openclaw-gateway-client.tgz",
+      "@openclaw/gateway-protocol": "file:///tmp/openclaw-gateway-protocol.tgz",
+      openclaw: "file:///tmp/openclaw.tgz",
+    });
   });
 
-  it("packs the local AI workspace when no prepared tarball is supplied", () => {
-    const root = mkdtempSync(join(tmpdir(), "openclaw-release-check-ai-pack-test-"));
-    try {
-      const tarballs = prepareReleaseCheckLocalPackageTarballs({
-        tmpRoot: root,
-        packLocalAi: (packDestination) => {
-          const filename = "openclaw-ai-2026.7.1-beta.3.tgz";
-          writeFileSync(join(packDestination, filename), "fixture");
-          return [{ filename }];
-        },
-      });
-      expect(tarballs).toEqual([join(root, "ai-pack", "openclaw-ai-2026.7.1-beta.3.tgz")]);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+  it("packs the local AI workspace when no prepared tarball is supplied", ({ command }) => {
+    const root = command.createTempDir("openclaw-release-check-ai-pack-test-");
+    const tarballs = prepareReleaseCheckLocalPackageTarballs({
+      tmpRoot: root,
+      packLocalAi: (packDestination) => {
+        const filename = "openclaw-ai-2026.7.1-beta.3.tgz";
+        writeFileSync(join(packDestination, filename), "fixture");
+        return [{ filename }];
+      },
+    });
+    expect(tarballs).toEqual([join(root, "ai-pack", "openclaw-ai-2026.7.1-beta.3.tgz")]);
   });
 
-  it("prefers prepared core package tarballs over packing the AI workspace", () => {
-    const root = mkdtempSync(join(tmpdir(), "openclaw-release-check-ai-pack-test-"));
-    try {
-      const preparedDir = join(root, "prepared");
-      mkdirSync(preparedDir);
-      const preparedTarball = join(preparedDir, "openclaw-ai-2026.7.1-beta.3.tgz");
-      const gatewayProtocolTarball = join(
-        preparedDir,
-        "openclaw-gateway-protocol-2026.7.1-beta.3.tgz",
-      );
-      const gatewayClientTarball = join(preparedDir, "openclaw-gateway-client-2026.7.1-beta.3.tgz");
-      writeFileSync(preparedTarball, "fixture");
-      writeFileSync(gatewayClientTarball, "fixture");
-      writeFileSync(gatewayProtocolTarball, "fixture");
-      const tarballs = prepareReleaseCheckLocalPackageTarballs({
-        tmpRoot: root,
-        tarballDir: preparedDir,
-        packLocalAi: () => {
-          throw new Error("workspace pack should not run");
-        },
-      });
-      expect(tarballs).toEqual([preparedTarball, gatewayClientTarball, gatewayProtocolTarball]);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+  it("prefers prepared core package tarballs over packing the AI workspace", ({ command }) => {
+    const root = command.createTempDir("openclaw-release-check-ai-pack-test-");
+    const preparedDir = join(root, "prepared");
+    mkdirSync(preparedDir);
+    const preparedTarball = join(preparedDir, "openclaw-ai-2026.7.1-beta.3.tgz");
+    const gatewayProtocolTarball = join(
+      preparedDir,
+      "openclaw-gateway-protocol-2026.7.1-beta.3.tgz",
+    );
+    const gatewayClientTarball = join(preparedDir, "openclaw-gateway-client-2026.7.1-beta.3.tgz");
+    writeFileSync(preparedTarball, "fixture");
+    writeFileSync(gatewayClientTarball, "fixture");
+    writeFileSync(gatewayProtocolTarball, "fixture");
+    const tarballs = prepareReleaseCheckLocalPackageTarballs({
+      tmpRoot: root,
+      tarballDir: preparedDir,
+      packLocalAi: () => {
+        throw new Error("workspace pack should not run");
+      },
+    });
+    expect(tarballs).toEqual([preparedTarball, gatewayClientTarball, gatewayProtocolTarball]);
   });
 
-  it("rejects a packed install without the local AI tarball", () => {
-    const root = mkdtempSync(join(tmpdir(), "openclaw-release-check-install-test-"));
-    try {
-      expect(() => writePackedTarballInstallManifest(root, "/tmp/openclaw.tgz", [])).toThrow(
-        "requires exactly one @openclaw/ai tarball",
-      );
-      expect(() =>
-        writePackedTarballInstallManifest(root, "/tmp/openclaw.tgz", [
-          "/tmp/openclaw-ai-one.tgz",
-          "/tmp/openclaw-ai-two.tgz",
-        ]),
-      ).toThrow("requires exactly one @openclaw/ai tarball");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+  it("rejects a packed install without the local AI tarball", ({ command }) => {
+    const root = command.createTempDir("openclaw-release-check-install-test-");
+    expect(() => writePackedTarballInstallManifest(root, "/tmp/openclaw.tgz", [])).toThrow(
+      "requires exactly one @openclaw/ai tarball",
+    );
+    expect(() =>
+      writePackedTarballInstallManifest(root, "/tmp/openclaw.tgz", [
+        "/tmp/openclaw-ai-one.tgz",
+        "/tmp/openclaw-ai-two.tgz",
+      ]),
+    ).toThrow("requires exactly one @openclaw/ai tarball");
   });
 
-  it("rejects missing, incomplete, or ambiguous local package tarball directories", () => {
-    const root = mkdtempSync(join(tmpdir(), "openclaw-release-check-tarball-test-"));
-    try {
-      expect(() => resolveReleaseCheckLocalPackageTarballs(join(root, "missing"))).toThrow(
-        RELEASE_CHECK_LOCAL_PACKAGE_TARBALL_DIR_ENV,
-      );
-      const empty = join(root, "empty");
-      mkdirSync(empty);
-      expect(() => resolveReleaseCheckLocalPackageTarballs(empty)).toThrow(
-        "must contain exactly one @openclaw/ai tarball",
-      );
-      writeFileSync(join(empty, "one.tgz"), "fixture");
-      writeFileSync(join(empty, "two.tgz"), "fixture");
-      expect(() => resolveReleaseCheckLocalPackageTarballs(empty)).toThrow(
-        "contains an unsupported package tarball",
-      );
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+  it("rejects missing, incomplete, or ambiguous local package tarball directories", ({
+    command,
+  }) => {
+    const root = command.createTempDir("openclaw-release-check-tarball-test-");
+    expect(() => resolveReleaseCheckLocalPackageTarballs(join(root, "missing"))).toThrow(
+      RELEASE_CHECK_LOCAL_PACKAGE_TARBALL_DIR_ENV,
+    );
+    const empty = join(root, "empty");
+    mkdirSync(empty);
+    expect(() => resolveReleaseCheckLocalPackageTarballs(empty)).toThrow(
+      "must contain exactly one @openclaw/ai tarball",
+    );
+    writeFileSync(join(empty, "one.tgz"), "fixture");
+    writeFileSync(join(empty, "two.tgz"), "fixture");
+    expect(() => resolveReleaseCheckLocalPackageTarballs(empty)).toThrow(
+      "contains an unsupported package tarball",
+    );
   });
 
-  it("seeds packaged activation smoke with an included channel plugin", () => {
-    const homeDir = mkdtempSync(join(tmpdir(), "openclaw-release-check-test-"));
-    try {
-      writePackedBundledPluginActivationConfig(homeDir);
-      const config = JSON.parse(
-        readFileSync(join(homeDir, ".openclaw", "openclaw.json"), "utf8"),
-      ) as {
-        channels?: Record<string, unknown>;
-        plugins?: { entries?: Record<string, unknown> };
-      };
+  it("seeds packaged activation smoke with an included channel plugin", ({ command }) => {
+    const homeDir = command.createTempDir("openclaw-release-check-test-");
+    writePackedBundledPluginActivationConfig(homeDir);
+    const config = JSON.parse(
+      readFileSync(join(homeDir, ".openclaw", "openclaw.json"), "utf8"),
+    ) as {
+      channels?: Record<string, unknown>;
+      plugins?: { entries?: Record<string, unknown> };
+    };
 
-      const pluginEntries = requirePluginEntries(config);
-      const channels = Object.keys(config.channels ?? {});
-      expect(channels.length).toBeGreaterThan(0);
-      const excluded = collectRootPackageExcludedExtensionDirs();
-      const artifacts = listBundledPluginPackArtifacts();
-      for (const channel of channels) {
-        expect(pluginEntries).toHaveProperty(channel);
-        expect(excluded.has(channel)).toBe(false);
-        const manifest = JSON.parse(
-          readFileSync(join("extensions", channel, "openclaw.plugin.json"), "utf8"),
-        ) as { channels: string[] };
-        expect(manifest.channels).toContain(channel);
-        expect(artifacts).toContain(`dist/extensions/${channel}/openclaw.plugin.json`);
-      }
-    } finally {
-      rmSync(homeDir, { recursive: true, force: true });
+    const pluginEntries = requirePluginEntries(config);
+    const channels = Object.keys(config.channels ?? {});
+    expect(channels.length).toBeGreaterThan(0);
+    const excluded = collectRootPackageExcludedExtensionDirs();
+    const artifacts = listBundledPluginPackArtifacts();
+    for (const channel of channels) {
+      expect(pluginEntries).toHaveProperty(channel);
+      expect(excluded.has(channel)).toBe(false);
+      const manifest = JSON.parse(
+        readFileSync(join("extensions", channel, "openclaw.plugin.json"), "utf8"),
+      ) as { channels: string[] };
+      expect(manifest.channels).toContain(channel);
+      expect(artifacts).toContain(`dist/extensions/${channel}/openclaw.plugin.json`);
     }
   });
 });
