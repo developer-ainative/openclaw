@@ -500,9 +500,10 @@ describe("resolveSlackMedia", () => {
         await expect(fs.stat(savedPath)).rejects.toMatchObject({ code: "ENOENT" });
         expect(result?.files).toEqual([{ ...file, reason: "blocked: unexpected HTML content" }]);
         expect(result).toMatchObject({ unavailableMediaCount: 1 });
-        expect(mediaWarnMock).toHaveBeenCalledExactlyOnceWith(
-          expect.stringContaining("blocked: unexpected HTML content"),
-        );
+        expect(mediaWarnMock).toHaveBeenCalledExactlyOnceWith("slack: file unavailable", {
+          fileId: undefined,
+          reason: "download-failed",
+        });
       } finally {
         await fs.rm(dir, { recursive: true, force: true });
       }
