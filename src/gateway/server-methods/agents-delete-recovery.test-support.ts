@@ -65,7 +65,7 @@ type AgentDeleteRecoveryHarness = {
   ) => Promise<Mock>;
   resume: () => Promise<void>;
   expectTrashedWithinParent: (pathname: string, declaredPath?: string) => void;
-  expectNotTrashed: (pathname: string) => void;
+  expectNotTrashed: (...paths: string[]) => void;
 };
 
 export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecoveryHarness): void {

@@ -294,7 +294,7 @@ suite.define(() => {
             "openclaw.approval.resolved:applied",
           ]),
         );
-        expect(approvalUiSequence.at(-1)).toBe("openclaw.approval.resolved:applied");
+        expect(approvalUiSequence?.at(-1)).toBe("openclaw.approval.resolved:applied");
 
         const history = await gateway.call("chat.history", { sessionKey, limit: 30 });
         const results = readDelegationResults(history);
