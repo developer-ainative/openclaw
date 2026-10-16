@@ -35,6 +35,8 @@ import {
 } from "./session-accessor.sqlite-read.js";
 import {
   captureLifecycleDatabaseScope,
+  assertSqliteTranscriptWriteIdentity,
+  prepareSqliteScope,
   resolveSqliteTranscriptScope,
   runExclusiveSqliteSessionWrite,
   toDatabaseOptions,
@@ -148,7 +150,11 @@ export async function rewriteTranscriptEventRowsExact(
   if (params.rows.length === 0) {
     return null;
   }
-  const resolved = resolveSqliteTranscriptScope(scope);
+  assertSqliteTranscriptWriteIdentity(scope);
+  const resolved = {
+    ...(await prepareSqliteScope(scope, "session.transcript.rewrite-exact")),
+    sessionId: scope.sessionId,
+  };
   const { restoreSessionColdTranscript } = await import("./session-cold-storage.js");
   await restoreSessionColdTranscript({ ...scope, sessionId: resolved.sessionId });
   return await runExclusiveSqliteSessionWrite(
@@ -184,7 +190,9 @@ export async function appendTranscriptEvent(
   options: TranscriptEventAppendOptions = {},
 ): Promise<boolean> {
   assertNonMessageTranscriptEvent(event);
-  const resolved = resolveSqliteTranscriptScope(scope);
+  assertSqliteTranscriptWriteIdentity(scope);
+  const prepared = await prepareSqliteScope(scope, "session.transcript.event-append");
+  const resolved = { ...prepared, sessionId: scope.sessionId };
   if (isMainThread && supportsOpenClawAgentDatabaseExecution(toDatabaseOptions(resolved))) {
     if (options.beforeCommitInTransaction) {
       throw new Error(
@@ -399,7 +407,9 @@ async function withHostTranscriptWriteLock<T>(
   run: (context: SessionTranscriptWriteLockAccessorContext) => Promise<T> | T,
 ): Promise<T> {
   const fenced = withOwnedSessionTranscriptWriterFence(scope);
-  const resolved = resolveSqliteTranscriptScope(fenced);
+  assertSqliteTranscriptWriteIdentity(fenced);
+  const prepared = await prepareSqliteScope(fenced, "session.transcript.locked-write");
+  const resolved = { ...prepared, sessionId: fenced.sessionId };
   if (!isMainThread || !supportsOpenClawAgentDatabaseExecution(toDatabaseOptions(resolved))) {
     return runNativeTranscriptWriteLock(fenced, run);
   }

@@ -65,8 +65,8 @@ import {
 import { prepareSessionEntryReplacementDatabase } from "./session-accessor.sqlite-replacement-worker.js";
 import {
   captureLifecycleDatabaseScope,
+  prepareSqliteScope,
   resolveSqliteAgentId,
-  resolveSqliteScope,
   resolveSqliteStoreScope,
   resolveSqliteTranscriptArchiveDirectory,
   runExclusiveSqliteSessionWrite,
@@ -118,7 +118,10 @@ export async function resetSessionEntryLifecycle(
   }
   const agentId = params.agentId ?? parseAgentSessionKey(params.target.canonicalKey)?.agentId;
   const resolved = captureLifecycleDatabaseScope(
-    resolveSqliteStoreScope(params.storePath, { agentId }),
+    await prepareSqliteScope(
+      { agentId, sessionKey: "", storePath: params.storePath },
+      "session.lifecycle.reset",
+    ),
   );
   const databaseOptions = { ...toDatabaseOptions(resolved), path: resolved.path };
   if (isMainThread && supportsOpenClawAgentDatabaseExecution(databaseOptions)) {
@@ -242,8 +245,9 @@ async function deleteSqliteSessionEntryLifecycleInternal(
   expectedPluginOwnerId?: string,
 ): Promise<DeleteSessionEntryLifecycleResult> {
   const agentId = params.agentId ?? parseAgentSessionKey(params.target.canonicalKey)?.agentId;
+  const target = { agentId, env: params.env, sessionKey: "", storePath: params.storePath };
   const resolved = captureLifecycleDatabaseScope(
-    resolveSqliteScope({ agentId, env: params.env, sessionKey: "", storePath: params.storePath }),
+    await prepareSqliteScope(target, "session.lifecycle.delete-prepare"),
   );
   return await withCommittedHistoryMaintenance(
     { ...params, env: resolved.env },

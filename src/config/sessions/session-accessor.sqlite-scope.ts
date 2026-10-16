@@ -57,6 +57,7 @@ import {
   type ResolvedSqliteStoreTarget,
 } from "./session-sqlite-target.js";
 import { normalizeStoreSessionKey } from "./store-entry.js";
+import { captureSessionTranscriptStorageEnvironment } from "./transcript-target-binding.js";
 import type { InternalSessionEntry } from "./types.js";
 
 export {
@@ -514,8 +515,22 @@ export function resolveSqliteWriteAdmissionScope(
 /** Writers resolve physical ownership in the existing read worker inside exact-path admission. */
 export async function prepareSqliteScope(
   scope: SqliteScopeInput & { sessionKey: string },
+  writeOperation?: SqliteSessionWriteOperation,
 ): Promise<ResolvedSqliteScope> {
-  return resolveSqliteScope(scope, undefined, await prepareSqliteScopeTarget(scope));
+  if (writeOperation && !isMainThread) {
+    return resolveSqliteScope(scope);
+  }
+  const captured = {
+    ...scope,
+    env: captureSessionTranscriptStorageEnvironment(scope.env ?? process.env),
+  };
+  const prepare = async () =>
+    resolveSqliteScope(captured, undefined, await prepareSqliteScopeTarget(captured));
+  // Reserve exact-path FIFO before worker-owned discovery; commit custody remains with the caller.
+  const admission = writeOperation ? resolveSqliteWriteAdmissionScope(captured) : undefined;
+  return admission && writeOperation
+    ? runExclusiveSqliteSessionWrite(admission, prepare, writeOperation)
+    : prepare();
 }
 
 async function prepareSqliteScopeTarget(scope: SqliteScopeInput, signal?: AbortSignal) {

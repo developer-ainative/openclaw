@@ -41,6 +41,7 @@ import { kickSessionEntryMaintenanceAfterWrite } from "./session-accessor.sqlite
 import { createFallbackSessionEntry } from "./session-accessor.sqlite-normalize.js";
 import {
   resolveSqliteScope,
+  prepareSqliteScope,
   resolveSqliteTranscriptArchiveDirectory,
   resolveSqliteTranscriptReadScope,
   runExclusiveSqliteSessionWrite,
@@ -263,7 +264,7 @@ async function patchSessionEntryInScope(
   if (memory) {
     return (await memory).entry;
   }
-  const resolved = resolveSqliteScope(scope);
+  const resolved = await prepareSqliteScope(scope, "session-entry.patch");
   if (databaseAgentId) {
     resolved.databaseAgentId = databaseAgentId;
   }
@@ -333,12 +334,15 @@ async function patchSessionEntryTargetInScope(
         ownerStorePath: source.path,
         sessionKey: "",
       }
-    : resolveSqliteScope({
-        agentId: scope.agentId,
-        env: scope.env,
-        sessionKey: scope.target.canonicalKey,
-        storePath: scope.storePath,
-      });
+    : await prepareSqliteScope(
+        {
+          agentId: scope.agentId,
+          env: scope.env,
+          sessionKey: scope.target.canonicalKey,
+          storePath: scope.storePath,
+        },
+        "session-entry-target.patch",
+      );
   return await patchSqliteSessionEntrySnapshot({
     operationLabel: "session-entry-target.patch",
     capturedSource: source,
