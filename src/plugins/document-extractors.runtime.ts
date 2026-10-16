@@ -1,4 +1,5 @@
 /** Resolves bundled document extractor providers from enabled manifest contracts. */
+import { formatErrorMessage } from "@openclaw/normalization-core/error-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -70,7 +71,10 @@ export function resolvePluginDocumentExtractors(params?: {
     });
   }
   for (const error of loadErrors) {
-    log.warn("Unable to load some document extractor plugins; using healthy extractors", { error });
+    log.warn("Unable to load some document extractor plugins; using healthy extractors", {
+      error,
+      detail: formatErrorMessage(error),
+    });
   }
   return sortPluginEntriesForAutoDetect(extractors);
 }

@@ -171,37 +171,66 @@ describe("resolvePluginDocumentExtractors", () => {
     );
   });
 
-  it("reports a failed plugin while retaining another plugin's extractors", () => {
-    const error = new Error("broken-extract module failed");
-    const snapshot = mocks.loadPluginMetadataSnapshot();
-    mocks.loadPluginMetadataSnapshot.mockReturnValueOnce({
-      plugins: [
-        ...snapshot.plugins,
-        {
-          id: "broken-extract",
-          origin: "bundled",
-          enabledByDefault: true,
-          channels: [],
-          cliBackends: [],
-          providers: [],
-          legacyPluginIds: [],
-          contracts: { documentExtractors: ["broken"] },
-        },
-      ],
-    });
-    mocks.loadPublicArtifact.mockImplementation(({ dirName }) => {
-      if (dirName === "broken-extract") {
-        throw error;
-      }
-      return dirName === "document-extract" ? mocks.publicArtifactModule : null;
-    });
+  it.each(["module", "factory", "factories"])(
+    "reports failed %s initialization with healthy extractors",
+    (kind) => {
+      const error = new Error("broken-extract module failed");
+      const secondError = new Error("second extractor failed");
+      const snapshot = mocks.loadPluginMetadataSnapshot();
+      mocks.loadPluginMetadataSnapshot.mockReturnValueOnce({
+        plugins: [
+          ...snapshot.plugins,
+          {
+            id: "broken-extract",
+            origin: "bundled",
+            enabledByDefault: true,
+            channels: [],
+            cliBackends: [],
+            providers: [],
+            legacyPluginIds: [],
+            contracts: { documentExtractors: ["broken"] },
+          },
+        ],
+      });
+      mocks.loadPublicArtifact.mockImplementation(({ dirName }) => {
+        if (dirName === "broken-extract") {
+          if (kind === "module") {
+            throw error;
+          }
+          return {
+            createBrokenDocumentExtractor: () => {
+              throw error;
+            },
+            ...(kind === "factories"
+              ? {
+                  createSecondDocumentExtractor: () => {
+                    throw secondError;
+                  },
+                }
+              : {}),
+          };
+        }
+        return dirName === "document-extract" ? mocks.publicArtifactModule : null;
+      });
 
-    expect(resolvePluginDocumentExtractors().map((extractor) => extractor.id)).toEqual(["pdf"]);
-    expect(mocks.warn).toHaveBeenCalledExactlyOnceWith(
-      expect.stringContaining("using healthy extractors"),
-      { error },
-    );
-  });
+      expect(resolvePluginDocumentExtractors().map((extractor) => extractor.id)).toEqual(["pdf"]);
+      expect(mocks.warn).toHaveBeenCalledExactlyOnceWith(
+        expect.stringContaining("using healthy extractors"),
+        {
+          error:
+            kind === "module"
+              ? error
+              : expect.objectContaining({
+                  cause: kind === "factory" ? error : expect.any(AggregateError),
+                }),
+          detail:
+            kind === "module"
+              ? "broken-extract module failed"
+              : `Unable to initialize document extractors for plugin broken-extract | broken-extract module failed${kind === "factories" ? " | second extractor failed" : ""}`,
+        },
+      );
+    },
+  );
 
   it("surfaces initialization failure when every matching factory throws", () => {
     const cause = new Error("native probe failed");
