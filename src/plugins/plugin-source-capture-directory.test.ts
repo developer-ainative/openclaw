@@ -5,7 +5,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
-import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { createTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { cleanupStartupPluginSourceCaptures } from "../commands/startup-plugin-source-captures.js";
 import * as nodeSqlite from "../infra/node-sqlite.js";
 import * as census from "../infra/openclaw-process-census.js";
@@ -26,10 +26,13 @@ import {
 import { sweepPluginSourceCapturesForTest } from "./plugin-source-capture-directory.test-support.js";
 import { pluginProcessRuntimeEntrypoints } from "./process-runtime.test-support.js";
 
-const temp = useAutoCleanupTempDirTracker(afterEach);
+const temp = createTempDirTracker();
+const cleanups: (() => unknown)[] = [];
 const artifactUrl = resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.artifact);
 const artifactModule = artifactUrl.href;
 const runtimeArgs = resolveRuntimeWorkerArgv(artifactUrl).slice(0, -1);
+const moduleSpecifier = (name: keyof typeof pluginProcessRuntimeEntrypoints) =>
+  JSON.stringify(resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints[name]).href);
 const hour = 60 * 60 * 1_000;
 const capturedSource = "module.exports = 'captured';\n";
 let stateDir: string;
@@ -41,20 +44,31 @@ beforeEach(() => {
     vi.stubEnv(key, runtimeTemp);
   }
   stateDir = temp.make("plugin-capture-state-");
-  source = createSource();
+  source = temp.make("plugin-capture-input-");
+  fs.writeFileSync(path.join(source, "index.cjs"), capturedSource);
 });
 
-afterEach(() => {
-  vi.restoreAllMocks();
-  vi.unstubAllEnvs();
-  vi.useRealTimers();
+afterEach(async () => {
+  const failures: unknown[] = [];
+  try {
+    // Release capture owners before removing their state or restoring environment/mocks.
+    while (cleanups.length) {
+      try {
+        await cleanups.pop()!();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length) {
+      throw new AggregateError(failures, "Capture fixture cleanup failed");
+    }
+  } finally {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    vi.useRealTimers();
+    temp.cleanup();
+  }
 });
-
-function createSource(): string {
-  const input = temp.make("plugin-capture-input-");
-  fs.writeFileSync(path.join(input, "index.cjs"), capturedSource);
-  return input;
-}
 
 function age(directory: string): void {
   const timestamp = new Date(Date.now() - 2 * hour);
@@ -71,6 +85,11 @@ function exists(file: string, expected = false) {
 
 function captureFixture() {
   const instance = retainPluginSourceCaptureInstance(stateDir);
+  cleanups.push(async () => {
+    vi.restoreAllMocks();
+    await instance.releaseAsync();
+    await sweepPluginSourceCapturesForTest(stateDir);
+  });
   const capture = instance.createDirectory();
   const root = path.dirname(path.dirname(capture));
   const payload = path.join(capture, "index.cjs");
@@ -78,22 +97,23 @@ function captureFixture() {
   return { instance, capture, root, payload };
 }
 
-async function withMetadata(
-  run: (metadata: ReturnType<typeof retainGatewayPluginMetadata>) => Promise<void>,
-) {
-  const metadata = retainGatewayPluginMetadata(createTestGatewayScheduler());
-  try {
-    await run(metadata);
-  } finally {
-    await metadata.close();
-  }
+function metadataFixture(scheduler = createTestGatewayScheduler()) {
+  const metadata = retainGatewayPluginMetadata(scheduler);
+  cleanups.push(() => metadata.close());
+  return metadata;
 }
 
-function expectArtifactBytes(
-  artifact: ReturnType<typeof capturePluginGenerationArtifact>,
-  input = source,
-) {
-  expectBytes(artifact.resolve(path.join(input, "index.cjs")));
+function artifactFixture(directory?: string, managedRoot?: string) {
+  const create = () => capturePluginGenerationArtifact(source);
+  const artifact = directory
+    ? withPluginSourceCaptureDirectory(directory, create, managedRoot)
+    : create();
+  cleanups.push(() => artifact.disposeAsync());
+  return artifact;
+}
+
+function expectArtifactBytes(artifact: ReturnType<typeof capturePluginGenerationArtifact>) {
+  expectBytes(artifact.resolve(path.join(source, "index.cjs")));
 }
 
 function runChild(script: string, args: string[] = [], exitCode = 0) {
@@ -119,8 +139,8 @@ const childCapture = `
   import fs from "node:fs";
   import path from "node:path";
   import { capturePluginGenerationArtifact } from ${JSON.stringify(artifactModule)};
-  import { createPluginSourceCaptureRoot } from ${JSON.stringify(resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.captureDirectory).href)};
-  import { withPluginSourceCaptureDirectory } from ${JSON.stringify(resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.metadataCapture).href)};
+  import { createPluginSourceCaptureRoot } from ${moduleSpecifier("captureDirectory")};
+  import { withPluginSourceCaptureDirectory } from ${moduleSpecifier("metadataCapture")};
   const source = process.argv[1];
   const worker = process.argv[2] === "worker"
     ? createPluginSourceCaptureRoot(process.env.OPENCLAW_STATE_DIR, "openclaw-model-catalog-")
@@ -181,9 +201,9 @@ it("retains mapped addons through exit; reclaims at startup", async () => {
         module.exports = exports;
         return exports;
       };
-      const { createPluginSourceCapture } = await import(${JSON.stringify(resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.metadataCapture).href)});
-      const { createPluginNativeCaptureRoot, retainPluginSourceCaptureInstance } = await import(${JSON.stringify(resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.captureDirectory).href)});
-      const { GatewayScheduler } = await import(${JSON.stringify(resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.scheduler).href)});
+      const { createPluginSourceCapture } = await import(${moduleSpecifier("metadataCapture")});
+      const { createPluginNativeCaptureRoot, retainPluginSourceCaptureInstance } = await import(${moduleSpecifier("captureDirectory")});
+      const { GatewayScheduler } = await import(${moduleSpecifier("scheduler")});
       const captures = [createPluginSourceCapture(), createPluginSourceCapture(), createPluginNativeCaptureRoot(), createPluginNativeCaptureRoot()];
       const files = captures.map((capture, index) => path.join(capture.directory, "synthetic-addon-" + index + ".node"));
       for (const file of files) fs.writeFileSync(file, "synthetic mapped image");
@@ -254,7 +274,7 @@ it("disposes captures while sibling workers remain active", () => {
     `
       import { once } from "node:events";
       import { Worker } from "node:worker_threads";
-      import { createPluginSourceCapture } from ${JSON.stringify(resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.metadataCapture).href)};
+      import { createPluginSourceCapture } from ${moduleSpecifier("metadataCapture")};
       const workers = Array.from({ length: 2 }, () => new Worker(
         "const { parentPort } = require('node:worker_threads'); parentPort.on('message', () => parentPort.close()); parentPort.postMessage('ready');",
         { eval: true, execArgv: [] },
@@ -280,11 +300,10 @@ it("disposes captures while sibling workers remain active", () => {
 it.each(["natural", "failure", "explicit", "signal"])(
   "reclaims process-owned captures on %s exit",
   (mode) => {
-    const signalModule = resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.signalExit).href;
     const result = runChild(
       `${childCapture}
-      import { installCliSignalExitHandlers } from ${JSON.stringify(signalModule)};
-      import { createPluginNativeCaptureRoot } from ${JSON.stringify(resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.captureDirectory).href)};
+      import { installCliSignalExitHandlers } from ${moduleSpecifier("signalExit")};
+      import { createPluginNativeCaptureRoot } from ${moduleSpecifier("captureDirectory")};
       const retained = createPluginNativeCaptureRoot();
       const pending = createPluginNativeCaptureRoot();
       fs.writeFileSync(path.join(retained.directory, "native"), "published native bytes");
@@ -313,55 +332,34 @@ it.each(["natural", "failure", "explicit", "signal"])(
 
 it("reclaims on signal even when the process outlives its drain", async () => {
   const live = await startCliCapture(false);
-  const signalModule = resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.signalExit).href;
-  const child = spawn(
-    process.execPath,
-    [
-      ...runtimeArgs,
-      "--input-type=module",
-      "-e",
-      // Handlers precede the capture lines: the parent signals as soon as it reads them.
-      `import { installCliSignalExitHandlers, registerSignalExitFinalizer } from ${JSON.stringify(signalModule)};
+  cleanups.push(live.stop);
+  const signalled = await startCliCapture(false, false, true);
+  cleanups.push(signalled.stop);
+  exists(signalled.instanceRoot, true);
+  signalled.child.kill("SIGTERM");
+  expect(await signalled.nextLine()).toBe("drained");
+  expect(signalled.child.exitCode).toBeNull();
+  exists(signalled.instanceRoot);
+  expect(await live.read()).toBe(capturedSource.trimEnd());
+});
+
+async function startCliCapture(worker: boolean, legacy = false, signal = false) {
+  const script = signal
+    ? `import { installCliSignalExitHandlers, registerSignalExitFinalizer } from ${moduleSpecifier("signalExit")};
       installCliSignalExitHandlers();
       ${childCapture}
       registerSignalExitFinalizer(async () => fs.writeSync(1, "drained\\n"));
-      // Hung work keeps the process alive after the drain until its supervisor force-kills it.
-      setInterval(() => {}, 60_000);`,
-      source,
-      "cli",
-    ],
-    { env: { ...process.env, OPENCLAW_STATE_DIR: stateDir }, stdio: ["ignore", "pipe", "pipe"] },
-  );
-  const exited = new Promise((resolve) => {
-    child.once("close", resolve);
-  });
-  try {
-    const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();
-    const boundaryRoot = (await lines.next()).value as string;
-    const signalled = capturePaths(boundaryRoot, (await lines.next()).value as string);
-    exists(signalled.instanceRoot, true);
-    child.kill("SIGTERM");
-    expect((await lines.next()).value).toBe("drained");
-    expect(child.exitCode).toBeNull();
-    exists(signalled.instanceRoot);
-    expect(await live.read()).toBe(capturedSource.trimEnd());
-  } finally {
-    child.kill("SIGKILL");
-    await exited;
-    await live.stop();
-  }
-});
-
-async function startCliCapture(worker: boolean, legacy = false) {
+      setInterval(() => {}, 60_000);`
+    : `${legacy ? legacyChildCapture : childCapture}
+       process.stdin.on("data", () => fs.writeSync(1, fs.readFileSync(capturedFile)));
+       process.stdin.resume();`;
   const child = spawn(
     process.execPath,
     [
       ...(legacy ? [] : runtimeArgs),
       "--input-type=module",
       "-e",
-      `${legacy ? legacyChildCapture : childCapture}
-       process.stdin.on("data", () => fs.writeSync(1, fs.readFileSync(capturedFile)));
-       process.stdin.resume();`,
+      script,
       source,
       worker ? "worker" : "cli",
     ],
@@ -369,12 +367,10 @@ async function startCliCapture(worker: boolean, legacy = false) {
       env: {
         ...process.env,
         OPENCLAW_STATE_DIR: stateDir,
-        TMPDIR: stateDir,
-        TMP: stateDir,
-        TEMP: stateDir,
+        ...(signal ? {} : { TMPDIR: stateDir, TMP: stateDir, TEMP: stateDir }),
       },
       stdio: ["pipe", "pipe", "pipe"],
-      timeout: 15_000,
+      timeout: signal ? undefined : 15_000,
     },
   );
   const reader = createInterface({ input: child.stdout });
@@ -407,6 +403,8 @@ async function startCliCapture(worker: boolean, legacy = false) {
     const capturedFile = await nextLine();
     return {
       ...capturePaths(boundaryRoot, capturedFile, worker),
+      child,
+      nextLine,
       async read() {
         child.stdin.write("read\n");
         return await nextLine();
@@ -422,7 +420,8 @@ async function startCliCapture(worker: boolean, legacy = false) {
 it("metadata boot preserves recent and other producers' legacy captures", async () => {
   vi.spyOn(census, "inspectOtherOpenClawProcesses").mockReturnValue({ pids: [12345] });
   vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
-  const active = capturePluginGenerationArtifact(source);
+  const active = artifactFixture();
+  cleanups.unshift(() => sweepPluginSourceCapturesForTest(stateDir));
   await sweepPluginSourceCapturesForTest(stateDir);
   const old = await abandonCapture();
   const recent = await abandonCapture();
@@ -436,28 +435,19 @@ it("metadata boot preserves recent and other producers' legacy captures", async 
   const time = createGatewaySchedulerClock();
   const scheduler = createTestGatewayScheduler(time.clock);
   const readDirectories = vi.spyOn(fsPromises, "readdir");
-  const metadata = retainGatewayPluginMetadata(scheduler);
-  try {
-    expect(readDirectories).toHaveBeenCalled();
-    await sweepPluginSourceCapturesForTest(stateDir);
-    exists(old.instanceRoot);
-    expectArtifactBytes(active, source);
-    expectBytes(recent.capturedFile);
-    expectBytes(path.join(legacy, "sentinel"), "legacy files have no custody token");
-    readDirectories.mockClear();
-    const later = capturePluginGenerationArtifact(source);
-    try {
-      await time.advanceBy(0);
-      expect(readDirectories).not.toHaveBeenCalled();
-    } finally {
-      later.dispose();
-    }
-  } finally {
-    await scheduler.stop();
-    await metadata.close();
-    active.dispose();
-    await sweepPluginSourceCapturesForTest(stateDir);
-  }
+  metadataFixture(scheduler);
+  cleanups.push(() => scheduler.stop());
+  expect(readDirectories).toHaveBeenCalled();
+  await sweepPluginSourceCapturesForTest(stateDir);
+  exists(old.instanceRoot);
+  expectArtifactBytes(active);
+  expectBytes(recent.capturedFile);
+  expectBytes(path.join(legacy, "sentinel"), "legacy files have no custody token");
+  readDirectories.mockClear();
+  const later = artifactFixture();
+  await time.advanceBy(0);
+  expect(readDirectories).not.toHaveBeenCalled();
+  later.dispose();
 }, 30_000);
 
 it.each([
@@ -468,30 +458,26 @@ it.each([
   "preserves custody until SIGKILL (worker: $worker, legacy: $legacy)",
   async ({ worker, legacy }) => {
     const child = await startCliCapture(worker, legacy);
+    cleanups.push(child.stop);
     vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
-    try {
+    age(child.instanceRoot);
+    metadataFixture();
+    await sweepPluginSourceCapturesForTest(stateDir);
+    expect(await child.read()).toBe(capturedSource.trim());
+    exists(child.captureRoot, true);
+    expectBytes(child.capturedFile);
+    await child.stop();
+    expectBytes(child.capturedFile);
+    if (legacy) {
+      const recent = new Date();
+      fs.utimesSync(child.instanceRoot, recent, recent);
+      await sweepPluginSourceCapturesForTest(stateDir);
+      expectBytes(child.capturedFile);
       age(child.instanceRoot);
-      await withMetadata(async () => {
-        await sweepPluginSourceCapturesForTest(stateDir);
-        expect(await child.read()).toBe(capturedSource.trim());
-        exists(child.captureRoot, true);
-        expectBytes(child.capturedFile);
-        await child.stop();
-        expectBytes(child.capturedFile);
-        if (legacy) {
-          const recent = new Date();
-          fs.utimesSync(child.instanceRoot, recent, recent);
-          await sweepPluginSourceCapturesForTest(stateDir);
-          expectBytes(child.capturedFile);
-          age(child.instanceRoot);
-        }
-        await sweepPluginSourceCapturesForTest(stateDir);
-        exists(child.instanceRoot);
-        exists(child.captureRoot);
-      });
-    } finally {
-      await child.stop();
     }
+    await sweepPluginSourceCapturesForTest(stateDir);
+    exists(child.instanceRoot);
+    exists(child.captureRoot);
   },
   30_000,
 );
@@ -608,26 +594,18 @@ it("metadata retirement joins its sweep, not sibling schedules", async () => {
 it.each(["before command", "inside command"])(
   "allocates without timers after import %s",
   (importOrder) => {
-    const cleanupModule = resolveRuntimeWorkerUrl(
-      pluginProcessRuntimeEntrypoints.cleanupScope,
-    ).href;
     const result = runChild(
       `
         import { AsyncLocalStorage, createHook } from "node:async_hooks";
         import fs from "node:fs";
         import path from "node:path";
-        import {
-          getCliPluginInvocationResources, withCliCommandCleanup, withCliProcessScope,
-        } from ${JSON.stringify(cleanupModule)};
+        import { withCliCommandCleanup, withCliProcessScope } from ${moduleSpecifier("cleanupScope")};
         const load = () => import(${JSON.stringify(artifactModule)});
         if (process.argv[2] === "before command") await load();
         const request = new AsyncLocalStorage();
         const observed = [];
-        const hook = createHook({ init(id, type, trigger, resource) {
-          if (type === "Timeout") observed.push({
-            resource, context: request.getStore() ?? null,
-            cli: Boolean(getCliPluginInvocationResources()),
-          });
+        const hook = createHook({ init(id, type) {
+          if (type === "Timeout") observed.push(type);
         }});
         const { artifact: first, cleanup } = await request.run("first-command", () =>
           withCliProcessScope(() => withCliCommandCleanup(false, async (cleanup) => {
@@ -646,9 +624,7 @@ it.each(["before command", "inside command"])(
         await cleanup.pluginResources.release();
         try {
           process.stdout.write(JSON.stringify({
-            timers: observed.map(({ resource, context, cli }) => ({
-              context, cli, referenced: resource.hasRef(),
-            })),
+            timers: observed,
             source: fs.readFileSync(survivor.resolve(path.join(process.argv[1], "index.cjs")), "utf8"),
           }));
         } finally {
@@ -666,26 +642,21 @@ it.each(["before command", "inside command"])(
 
 it("retains bytes until metadata and artifact release", async () => {
   vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
-  await withMetadata(async (first) => {
-    const artifact = capturePluginGenerationArtifact(source);
-    try {
-      const { instanceRoot } = capturePaths(
-        artifact.boundaryRoot,
-        artifact.resolve(path.join(source, "index.cjs")),
-      );
-      age(instanceRoot);
-      await sweepPluginSourceCapturesForTest(stateDir);
-      expectArtifactBytes(artifact, source);
-      await first.close();
-      await first.close();
-      await sweepPluginSourceCapturesForTest(stateDir);
-      expectArtifactBytes(artifact, source);
-      await artifact.disposeAsync();
-      exists(instanceRoot);
-    } finally {
-      await artifact.disposeAsync();
-    }
-  });
+  const first = metadataFixture();
+  const artifact = artifactFixture();
+  const { instanceRoot } = capturePaths(
+    artifact.boundaryRoot,
+    artifact.resolve(path.join(source, "index.cjs")),
+  );
+  age(instanceRoot);
+  await sweepPluginSourceCapturesForTest(stateDir);
+  expectArtifactBytes(artifact);
+  await first.close();
+  await first.close();
+  await sweepPluginSourceCapturesForTest(stateDir);
+  expectArtifactBytes(artifact);
+  await artifact.disposeAsync();
+  exists(instanceRoot);
 });
 
 it.skipIf(process.platform === "win32").each([
@@ -712,36 +683,27 @@ it.skipIf(process.platform === "win32").each([
     fs.rmSync(removed === "directory" ? root : path.join(root, "owner.sqlite"), {
       recursive: true,
     });
-    try {
-      if (closeFails) {
-        await expect(instance.releaseAsync()).rejects.toBe(failure);
-        expect(database?.isOpen).toBe(true);
-        expect(() => retainPluginSourceCaptureInstance(stateDir)).toThrow(
-          "Plugin source instance cleanup is incomplete",
-        );
-      }
-      await expect(instance.releaseAsync()).resolves.toBeUndefined();
-      if (closeFails) {
-        expect(database?.isOpen).toBe(false);
-        vi.restoreAllMocks();
-      }
-      if (removed === "directory") {
-        exists(root);
-      } else {
-        expectBytes(payload);
-        exists(path.join(root, "owner.sqlite"));
-      }
-      const successor = retainPluginSourceCaptureInstance(stateDir);
-      try {
-        expect(successor.createDirectory()).not.toBe(capture);
-      } finally {
-        await successor.releaseAsync();
-      }
-    } finally {
-      vi.restoreAllMocks();
-      await instance.releaseAsync();
-      await sweepPluginSourceCapturesForTest(stateDir);
+    if (closeFails) {
+      await expect(instance.releaseAsync()).rejects.toBe(failure);
+      expect(database?.isOpen).toBe(true);
+      expect(() => retainPluginSourceCaptureInstance(stateDir)).toThrow(
+        "Plugin source instance cleanup is incomplete",
+      );
     }
+    await expect(instance.releaseAsync()).resolves.toBeUndefined();
+    if (closeFails) {
+      expect(database?.isOpen).toBe(false);
+      vi.restoreAllMocks();
+    }
+    if (removed === "directory") {
+      exists(root);
+    } else {
+      expectBytes(payload);
+      exists(path.join(root, "owner.sqlite"));
+    }
+    const successor = retainPluginSourceCaptureInstance(stateDir);
+    cleanups.push(() => successor.releaseAsync());
+    expect(successor.createDirectory()).not.toBe(capture);
   },
 );
 
@@ -757,20 +719,17 @@ it.skipIf(process.platform === "win32").each(["directory", "token"] as const)(
     }
     const replacement = replaced === "directory" ? path.join(target, "sentinel") : target;
     fs.writeFileSync(replacement, "replacement bytes");
-    try {
-      await expect(instance.releaseAsync()).rejects.toThrow(
-        "SQLite staging ownership changed before retirement",
-      );
-      expectBytes(replacement, "replacement bytes");
-      const originalCapture =
-        replaced === "directory" ? path.join(parked, path.relative(root, capture)) : capture;
-      expectBytes(path.join(originalCapture, "index.cjs"));
-    } finally {
+    cleanups.push(() => {
       fs.rmSync(target, { recursive: true, force: true });
       fs.renameSync(parked, target);
-      await instance.releaseAsync();
-      await sweepPluginSourceCapturesForTest(stateDir);
-    }
+    });
+    await expect(instance.releaseAsync()).rejects.toThrow(
+      "SQLite staging ownership changed before retirement",
+    );
+    expectBytes(replacement, "replacement bytes");
+    const originalCapture =
+      replaced === "directory" ? path.join(parked, path.relative(root, capture)) : capture;
+    expectBytes(path.join(originalCapture, "index.cjs"));
   },
 );
 
@@ -778,38 +737,24 @@ it("leaves worker directories under caller custody", async () => {
   const workerRoot = temp.make("plugin-capture-worker-");
   fs.writeFileSync(path.join(workerRoot, "sentinel"), "worker owns this directory");
   vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
-  const artifact = withPluginSourceCaptureDirectory(workerRoot, () =>
-    capturePluginGenerationArtifact(source),
-  );
-  try {
-    age(artifact.boundaryRoot);
-    await withMetadata(async () => {
-      await sweepPluginSourceCapturesForTest(stateDir);
-      expect(path.dirname(artifact.boundaryRoot)).toBe(workerRoot);
-      expectArtifactBytes(artifact, source);
-    });
-  } finally {
-    await artifact.disposeAsync();
-  }
+  const artifact = artifactFixture(workerRoot);
+  age(artifact.boundaryRoot);
+  const metadata = metadataFixture();
+  await sweepPluginSourceCapturesForTest(stateDir);
+  expect(path.dirname(artifact.boundaryRoot)).toBe(workerRoot);
+  expectArtifactBytes(artifact);
+  await metadata.close();
+  await artifact.disposeAsync();
   exists(artifact.boundaryRoot);
   expectBytes(path.join(workerRoot, "sentinel"), "worker owns this directory");
 });
 
 it("excludes worker output when state is also source", async () => {
   const root = createPluginSourceCaptureRoot(source, "openclaw-model-catalog-");
-  let artifact: ReturnType<typeof capturePluginGenerationArtifact> | undefined;
-  try {
-    artifact = withPluginSourceCaptureDirectory(
-      root.directory,
-      () => capturePluginGenerationArtifact(source),
-      root.managedRoot,
-    );
-    expectArtifactBytes(artifact, source);
-    exists(path.join(artifact.rootDir, "tmp", "plugin-captures"));
-  } finally {
-    await artifact?.disposeAsync();
-    await root.release();
-  }
+  cleanups.push(() => root.release());
+  const artifact = artifactFixture(root.directory, root.managedRoot);
+  expectArtifactBytes(artifact);
+  exists(path.join(artifact.rootDir, "tmp", "plugin-captures"));
 });
 
 it("boots metadata and captures when the state path is a file", async () => {
@@ -818,20 +763,15 @@ it("boots metadata and captures when the state path is a file", async () => {
   fs.writeFileSync(stateDir, "not a directory");
   vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
   vi.spyOn(process, "emitWarning").mockImplementation(() => {});
-  let instanceRoot: string | undefined;
-  await withMetadata(async () => {
-    await sweepPluginSourceCapturesForTest(stateDir);
-    const artifact = capturePluginGenerationArtifact(source);
-    try {
-      instanceRoot = path.dirname(path.dirname(artifact.boundaryRoot));
-      expectArtifactBytes(artifact, source);
-      expectBytes(stateDir, "not a directory");
-    } finally {
-      await artifact.disposeAsync();
-    }
-  });
-  expect(instanceRoot).toBeDefined();
-  exists(instanceRoot!);
+  const metadata = metadataFixture();
+  await sweepPluginSourceCapturesForTest(stateDir);
+  const artifact = artifactFixture();
+  const instanceRoot = path.dirname(path.dirname(artifact.boundaryRoot));
+  expectArtifactBytes(artifact);
+  expectBytes(stateDir, "not a directory");
+  await artifact.disposeAsync();
+  await metadata.close();
+  exists(instanceRoot);
 });
 
 it.each(["malformed", "symlink", "hardlink", "sidecar-symlink", "captures-symlink"])(

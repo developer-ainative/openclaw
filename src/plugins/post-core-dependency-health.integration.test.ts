@@ -22,7 +22,8 @@ import { packPlugins, startStaticRegistry } from "./test-helpers/npm-registry-fi
 
 const servers: http.Server[] = [];
 const dependency = "fixture-required-runtime";
-const readJson = async (file: string) => JSON.parse(await fs.readFile(file, "utf8"));
+const readPackage = async (root: string) =>
+  JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8"));
 const readFiles = (files: string[]) => Promise.all(files.map((file) => fs.readFile(file, "utf8")));
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -56,16 +57,14 @@ it.each([
   async (payload, workTimeoutMs) => {
     const expectedTimeoutMs = workTimeoutMs === null ? undefined : (workTimeoutMs ?? 120_000);
     // Ambient provider credentials must not add installs to this synthetic registry.
-    const env = Object.fromEntries(
-      listKnownProviderAuthEnvVarNamesCore({ config: {}, env: process.env }).map((key) => [
-        key,
-        undefined,
-      ]),
-    );
+    const credentialKeys = listKnownProviderAuthEnvVarNamesCore({ config: {}, env: process.env });
     await withOpenClawTestState(
       {
         label: `post-core-dependency-${payload}`,
-        env: { ...env, OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" },
+        env: {
+          ...Object.fromEntries(credentialKeys.map((key) => [key, undefined])),
+          OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
+        },
       },
       async (state) => {
         const control = state.path("control");
@@ -82,14 +81,12 @@ it.each([
             dependencies: { [dependency]: "1.0.0" },
             optionalDependencies: payload === "optional" ? { [dependency]: "1.0.0" } : undefined,
           },
-        ]);
-        const dependencyVersions = await packPlugins(state.path("dependencies"), [
           { packageName: dependency },
         ]);
         const registry = await startStaticRegistry(
           [
-            { packageName, latest: "2.0.0", versions },
-            { packageName: dependency, latest: "1.0.0", versions: dependencyVersions },
+            { packageName, latest: "2.0.0", versions: versions.slice(0, 2) },
+            { packageName: dependency, latest: "1.0.0", versions: versions.slice(2) },
           ],
           servers,
         );
@@ -120,7 +117,6 @@ it.each([
               path.join(installed.targetDir, file),
             ),
           ];
-          const before = await readFiles(protectedFiles);
           const config = {
             plugins: { allow: [packageName], entries: { [packageName]: { enabled: true } } },
           };
@@ -134,7 +130,8 @@ it.each([
           };
           await state.writeConfig(config);
           await seedInstalledPluginIndex(records, { config, env: process.env });
-          const configBefore = await fs.readFile(state.configPath, "utf8");
+          protectedFiles.push(state.configPath);
+          const before = await readFiles(protectedFiles);
           let successfulNpmInstalls = 0;
           const realRun = processExecution.runCommandWithTimeout;
           vi.spyOn(processExecution, "runCommandWithTimeout").mockImplementation(
@@ -156,13 +153,10 @@ it.each([
                 "real npm staging directory",
               );
               const pluginRoot = path.join(attemptRoot, "node_modules", packageName);
-              const manifest = await readJson(path.join(pluginRoot, "package.json"));
-              expect(manifest.version).toBe("2.0.0");
+              expect(await readPackage(pluginRoot)).toMatchObject({ version: "2.0.0" });
               successfulNpmInstalls += 1;
               const hoisted = path.join(attemptRoot, "node_modules", dependency);
-              expect(await readJson(path.join(hoisted, "package.json"))).toMatchObject({
-                name: dependency,
-              });
+              expect(await readPackage(hoisted)).toMatchObject({ name: dependency });
               if (payload === "empty-manifest" || payload === "malformed-manifest") {
                 await fs.writeFile(
                   path.join(hoisted, "package.json"),
@@ -223,14 +217,12 @@ it.each([
           );
           if (succeeds) {
             expect(persisted[packageName]?.version).toBe("2.0.0");
-            const manifest = await readJson(
-              path.join(persisted[packageName]!.installPath!, "package.json"),
-            );
-            expect(manifest.version).toBe("2.0.0");
+            expect(await readPackage(persisted[packageName]!.installPath!)).toMatchObject({
+              version: "2.0.0",
+            });
           } else {
             expect(onCapabilityConsent).not.toHaveBeenCalled();
             expect(persisted).toEqual(records);
-            expect(await fs.readFile(state.configPath, "utf8")).toBe(configBefore);
             expect(await readFiles(protectedFiles)).toEqual(before);
           }
         });

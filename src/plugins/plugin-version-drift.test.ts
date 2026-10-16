@@ -68,62 +68,59 @@ function expectNoRepair(entry: ReturnType<typeof firstDrift>) {
   expect(fetchClawHubPackageDetail).not.toHaveBeenCalled();
 }
 
-describe("detectPluginVersionDrift", () => {
-  it.each([
-    {
-      name: "treats build qualifiers as matching",
-      gatewayVersion: "2026.5.4-1",
-      installRecords: {
-        whatsapp: npmRecord("2026.5.4"),
-        discord: npmRecord("2026.5.4-1", { resolvedName: "@openclaw/discord" }),
-      },
-      expected: [],
+it.each([
+  {
+    name: "treats build qualifiers as matching",
+    gatewayVersion: "2026.5.4-1",
+    installRecords: {
+      whatsapp: npmRecord("2026.5.4"),
+      discord: npmRecord("2026.5.4-1", { resolvedName: "@openclaw/discord" }),
     },
-    {
-      name: "ignores exact catalog pins",
-      gatewayVersion: "2026.5.7",
-      installRecords: {
-        "wecom-openclaw-plugin": npmRecord("2026.5.6", {
-          resolvedName: "@wecom/wecom-openclaw-plugin",
-          spec: "@wecom/wecom-openclaw-plugin@2026.5.6",
-        }),
-      },
-      expected: [],
+    expected: [],
+  },
+  {
+    name: "ignores exact catalog pins",
+    gatewayVersion: "2026.5.7",
+    installRecords: {
+      "wecom-openclaw-plugin": npmRecord("2026.5.6", {
+        resolvedName: "@wecom/wecom-openclaw-plugin",
+        spec: "@wecom/wecom-openclaw-plugin@2026.5.6",
+      }),
     },
-    {
-      name: "falls back to version when resolvedVersion is absent",
-      installRecords: {
-        whatsapp: npmRecord("2026.5.3", { resolvedVersion: undefined, version: "2026.5.3" }),
-      },
-      expected: [expect.objectContaining({ installedVersion: "2026.5.3" })],
+    expected: [],
+  },
+  {
+    name: "falls back to version when resolvedVersion is absent",
+    installRecords: {
+      whatsapp: npmRecord("2026.5.3", { resolvedVersion: undefined, version: "2026.5.3" }),
     },
-    {
-      name: "skips plugins with no recorded version",
-      installRecords: {
-        whatsapp: { source: "npm", spec: "@openclaw/whatsapp@latest" } satisfies InstallRecord,
-      },
-      expected: [],
+    expected: [expect.objectContaining({ installedVersion: "2026.5.3" })],
+  },
+  {
+    name: "skips plugins with no recorded version",
+    installRecords: {
+      whatsapp: { source: "npm", spec: "@openclaw/whatsapp@latest" } satisfies InstallRecord,
     },
-    {
-      name: "skips explicitly disabled plugins",
-      installRecords: npmRecords(["whatsapp", "discord"]),
-      config: {
-        plugins: { entries: { whatsapp: { enabled: false }, discord: { enabled: true } } },
-      },
-      expected: [expect.objectContaining({ pluginId: "discord" })],
+    expected: [],
+  },
+  {
+    name: "skips explicitly disabled plugins",
+    installRecords: npmRecords(["whatsapp", "discord"]),
+    config: {
+      plugins: { entries: { whatsapp: { enabled: false }, discord: { enabled: true } } },
     },
-    {
-      name: "sorts drifts by pluginId",
-      installRecords: npmRecords(["whatsapp", "discord", "matrix"]),
-      expected: ["discord", "matrix", "whatsapp"].map((pluginId) =>
-        expect.objectContaining({ pluginId }),
-      ),
-    },
-  ])("$name", ({ expected, ...input }) => {
-    expect(detectDrift({ gatewayVersion: "2026.5.4", ...input }).drifts).toEqual(expected);
-  });
+    expected: [expect.objectContaining({ pluginId: "discord" })],
+  },
+  {
+    name: "sorts drifts by pluginId",
+    installRecords: npmRecords(["whatsapp", "discord", "matrix"]),
+    expected: ["discord", "matrix", "whatsapp"].map((pluginId) =>
+      expect.objectContaining({ pluginId }),
+    ),
+  },
+])("detectPluginVersionDrift: $name", ({ expected, ...input }) => {
+  expect(detectDrift({ gatewayVersion: "2026.5.4", ...input }).drifts).toEqual(expected);
 });
-
 describe("resolvePluginVersionDriftTargets", () => {
   beforeEach(() => vi.mocked(fetchNpmPackageTargetStatus).mockReset());
 

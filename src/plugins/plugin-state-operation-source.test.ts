@@ -13,6 +13,7 @@ const temp = useAutoCleanupTempDirTracker(afterEach);
 const instances: PluginInstance[] = [];
 const caches: ReturnType<typeof createPluginCache>[] = [];
 const missing = "absent from its captured source family";
+const operation = "state-operation-api.js";
 
 afterEach(async () => {
   for (const instance of instances.splice(0).toReversed()) {
@@ -49,7 +50,7 @@ function fixture(files: Record<string, string>, entry = "index.ts", bundled = fa
 const capture = (instance: PluginInstance, assertCurrent = () => {}) =>
   capturePluginStateOperationModuleSource(instance, assertCurrent)!;
 
-function load(source: ReturnType<typeof capture>, moduleName = "state-operation-api.js") {
+function load(source: ReturnType<typeof capture>, moduleName = operation) {
   return loadValidatedPublicSurfaceModule({
     ...source.resolve(moduleName),
     capturedSource: true,
@@ -81,8 +82,7 @@ it("keeps a dist entry in its build family and rejects paths and URLs", () => {
     },
     "dist/index.js",
   );
-  const selected = "state-operation-api.js";
-  expect(load(source, selected)).toMatchObject({ version: "selected build" });
+  expect(load(source)).toMatchObject({ version: "selected build" });
   expect(() => source.resolve("source-only-operation-api.js")).toThrow(missing);
   for (const name of [
     "https://example.invalid/state-operation-api.js",
@@ -93,8 +93,8 @@ it("keeps a dist entry in its build family and rejects paths and URLs", () => {
     "..\\other\\state-operation-api.js",
     "private.js",
     pathToFileURL(path.join(root, "../other/state-operation-api.js")).href,
-    `${selected}?replacement=1`,
-    `${selected}#replacement`,
+    `${operation}?replacement=1`,
+    `${operation}#replacement`,
   ]) {
     expect(() => source.resolve(name)).toThrow("Plugin state operations require");
   }
@@ -111,13 +111,12 @@ it("rejects captured operations after owner or instance revocation", async () =>
       throw failure;
     }
   });
-  const moduleName = "state-operation-api.js";
-  source.resolve(moduleName);
+  source.resolve(operation);
   current = false;
-  expect(() => source.resolve(moduleName)).toThrow(failure);
+  expect(() => source.resolve(operation)).toThrow(failure);
   current = true;
   await instance.dispose();
-  expect(() => source.resolve(moduleName)).toThrow("Plugin operation-fixture is retiring");
+  expect(() => source.resolve(operation)).toThrow("Plugin operation-fixture is retiring");
 });
 
 it("recovers bundled closures without requiring bundled-away dependencies", async () => {

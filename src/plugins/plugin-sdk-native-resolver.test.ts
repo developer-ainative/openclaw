@@ -379,37 +379,30 @@ describe("installOpenClawPluginSdkNativeResolver", () => {
 
   it("resolves internal core packages only for OpenClaw-owned source parents", () => {
     const { root, options, requireFromPlugin } = sdkFixture();
-    const sources = (
-      [
-        ["normalization-core", "string-coerce.ts"],
-        ["normalization-core", "boolean-coercion.ts"],
-        ["normalization-core", "result.ts"],
-        ["normalization-core", "agent-id.ts"],
-        ["media-core", "mime.ts"],
-        ["media-core", "attachment-classify.ts"],
-        ["markdown-core", "code-spans.ts"],
-        ["ai", "transports.ts"],
-        ["ai", "internal/tool-schema.ts"],
-        ["ai", "internal/runtime.ts"],
-        ["ai", "internal/openai-responses-payload-policy.ts"],
-        ["ai", "internal/google-model-family.ts"],
-        ["ai", "internal/retry-after.ts"],
-        ["acp-core", "runtime/types.ts"],
-        ["llm-core", "index.ts"],
-        ["llm-core", "model-contracts/anthropic.ts"],
-      ] as const
-    ).map(([packageDir, sourceFile]) => ({
-      specifier: `@openclaw/${packageDir}${sourceFile === "index.ts" ? "" : `/${sourceFile.slice(0, -3)}`}`,
-      sourcePath: writeInternalCorePackageSource(root, packageDir, sourceFile),
-    }));
-    writeInternalCorePackageExports(root, "normalization-core", [
-      "agent-id",
-      "boolean-coercion",
-      "result",
-      "string-coerce",
-    ]);
-    writeInternalCorePackageExports(root, "media-core", ["attachment-classify", "mime"]);
-    writeInternalCorePackageExports(root, "acp-core", ["runtime/types"]);
+    const packages = {
+      "normalization-core": ["string-coerce", "boolean-coercion", "result", "agent-id"],
+      "media-core": ["mime", "attachment-classify"],
+      "markdown-core": ["code-spans"],
+      ai: [
+        "transports",
+        "internal/tool-schema",
+        "internal/runtime",
+        "internal/openai-responses-payload-policy",
+        "internal/google-model-family",
+        "internal/retry-after",
+      ],
+      "acp-core": ["runtime/types"],
+      "llm-core": ["", "model-contracts/anthropic"],
+    };
+    const sources = Object.entries(packages).flatMap(([packageDir, subpaths]) => {
+      if (["normalization-core", "media-core", "acp-core"].includes(packageDir)) {
+        writeInternalCorePackageExports(root, packageDir, subpaths.toSorted());
+      }
+      return subpaths.map((subpath) => ({
+        specifier: `@openclaw/${packageDir}${subpath ? `/${subpath}` : ""}`,
+        sourcePath: writeInternalCorePackageSource(root, packageDir, `${subpath || "index"}.ts`),
+      }));
+    });
     const coreSourceParent = writeFile(path.join(root, "src/config/plugin-web-search-config.ts"));
     installOpenClawPluginSdkNativeResolver({ ...options, pluginSdkResolution: "dist" });
     for (const { specifier, sourcePath } of sources) {
