@@ -50,10 +50,11 @@ function attachStderrLogging(serverName: string, transport: OpenClawStdioClientT
   let progressTimer: ReturnType<typeof setTimeout> | undefined;
   const emit = (text: string) => {
     const tail = truncateUtf8Suffix(text, MAX_MCP_STDERR_LINE_BYTES);
-    const message = `${truncated || tail !== text ? "[stderr line truncated] " : ""}${tail}`.trim();
+    const marker = truncated || tail !== text ? "[stderr line truncated] " : "";
     truncated = false;
-    if (message) {
-      logDebug(`bundle-mcp:${serverName}: ${message}`);
+    if (marker || tail.trim()) {
+      // External server output can contain message text or tool arguments.
+      logDebug(`bundle-mcp:${serverName}: ${marker}stderr output omitted`);
     }
   };
   const flushProgress = () => {

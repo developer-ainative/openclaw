@@ -35,7 +35,7 @@ describe("MCP stderr diagnostics", () => {
         probe.stderr.write("loading ");
         vi.advanceTimersByTime(index === 2 ? 50 : 100);
       }
-      expect(logDebug.mock.calls).toEqual([["bundle-mcp:probe: loading loading loading"]]);
+      expect(logDebug.mock.calls).toEqual([["bundle-mcp:probe: stderr output omitted"]]);
     } finally {
       probe.detachStderr?.();
     }
@@ -49,12 +49,12 @@ describe("MCP stderr diagnostics", () => {
       const bytes = Buffer.from("loading 你");
       probe.stderr.write(bytes.subarray(0, -1));
       vi.advanceTimersByTime(250);
-      expect(logDebug.mock.calls).toEqual([["bundle-mcp:probe: loading"]]);
+      expect(logDebug.mock.calls).toEqual([["bundle-mcp:probe: stderr output omitted"]]);
       probe.stderr.write(bytes.subarray(-1));
       probe.stderr.write("\n");
       expect(logDebug.mock.calls).toEqual([
-        ["bundle-mcp:probe: loading"],
-        ["bundle-mcp:probe: 你"],
+        ["bundle-mcp:probe: stderr output omitted"],
+        ["bundle-mcp:probe: stderr output omitted"],
       ]);
     } finally {
       probe.detachStderr?.();
@@ -62,7 +62,7 @@ describe("MCP stderr diagnostics", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("marks a UTF-8-safe bounded tail on newline", () => {
+  it("reports truncation without copying the UTF-8-safe bounded tail", () => {
     const probe = createStderrProbe();
     try {
       probe.stderr.write(`xx😀${"y".repeat(4000)}`);
@@ -70,7 +70,23 @@ describe("MCP stderr diagnostics", () => {
       probe.stderr.write("\n");
       probe.detachStderr?.();
       expect(logDebug.mock.calls).toEqual([
-        [`bundle-mcp:probe: [stderr line truncated] ${"y".repeat(8189)}`],
+        ["bundle-mcp:probe: [stderr line truncated] stderr output omitted"],
+      ]);
+    } finally {
+      probe.detachStderr?.();
+    }
+  });
+
+  it("omits message and tool content from newline and final stderr records", () => {
+    const probe = createStderrProbe();
+    try {
+      probe.stderr.write("private-message-marker\rprivate-tool-argument-marker\n");
+      probe.stderr.write("private-tool-result-marker");
+      probe.detachStderr?.();
+      expect(logDebug.mock.calls).toEqual([
+        ["bundle-mcp:probe: stderr output omitted"],
+        ["bundle-mcp:probe: stderr output omitted"],
+        ["bundle-mcp:probe: stderr output omitted"],
       ]);
     } finally {
       probe.detachStderr?.();
@@ -91,7 +107,7 @@ describe("MCP stderr diagnostics", () => {
       await vi.advanceTimersByTimeAsync(50);
       await expect(disposing).resolves.toBe("closed");
       expect(forceClose).toHaveBeenCalledOnce();
-      expect(logDebug.mock.calls).toEqual([["bundle-mcp:probe: forced shutdown tail"]]);
+      expect(logDebug.mock.calls).toEqual([["bundle-mcp:probe: stderr output omitted"]]);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       close.mockRestore();
@@ -100,12 +116,12 @@ describe("MCP stderr diagnostics", () => {
     }
   });
 
-  it("retains a real child process's unterminated shutdown diagnostic", async () => {
+  it("reports a real child's unterminated shutdown stderr without copying it", async () => {
     const probe = createStderrProbe([
       "-e",
       `process.stdin.resume();
        process.stdin.on("end", () => {
-         const message = Buffer.from("shutdown 你好");
+         const message = Buffer.from("shutdown 你好 private-message-marker private-tool-marker");
          process.stderr.write(message.subarray(0, 10));
          setImmediate(() => process.stderr.end(message.subarray(10)));
        });`,
@@ -113,7 +129,7 @@ describe("MCP stderr diagnostics", () => {
     try {
       await probe.transport.start();
       await disposeMcpClient({ ...probe, client: { close: async () => {} } });
-      expect(logDebug.mock.calls).toEqual([["bundle-mcp:probe: shutdown 你好"]]);
+      expect(logDebug.mock.calls).toEqual([["bundle-mcp:probe: stderr output omitted"]]);
       expect(probe.transport.pid).toBeNull();
     } finally {
       await probe.transport.forceClose();

@@ -140,7 +140,7 @@ Run `openclaw mcp doctor <name> --probe`. Doctor validates the saved definition 
 
 Confirm the `command` resolves in the Gateway process environment and that `cwd` exists. Arguments belong in `args`, and an explicit `transport: "stdio"` requires a non-empty command.
 
-For servers launched by OpenClaw's built-in MCP client, debug logs prefix stderr diagnostics with `bundle-mcp:<name>:`. Unicode characters survive split writes, and shutdown diagnostics are retained. Output without a newline is briefly buffered for up to 250 ms before being logged as progress fragments; this does not wait for the server to stop writing. A diagnostic exceeding the 8 KiB buffer retains its Unicode-safe tail with a `[stderr line truncated]` marker.
+For servers launched by OpenClaw's built-in MCP client, debug logs report stderr activity as `bundle-mcp:<name>: stderr output omitted`. Server output is not copied into ordinary logs because it can contain message text or tool content. Stderr is still drained through shutdown using an 8 KiB UTF-8-safe buffer. Output without a newline produces an activity marker within 250 ms, without waiting for the server to stop writing; oversized output adds a `[stderr line truncated]` marker. Startup and connection failures retain their normal diagnostics. Explicit SDK stderr collectors and their returned failure tails are unchanged.
 
 ### An HTTP server needs authorization
 
