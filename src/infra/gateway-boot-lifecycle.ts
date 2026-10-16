@@ -18,7 +18,6 @@ import { createSqliteWorkerWriteAdmission } from "./sqlite-worker-store.js";
 
 export {
   GATEWAY_CRASH_LOOP_BREAKER_REASON,
-  GATEWAY_CRASH_LOOP_RECOVERED_REASON,
   GATEWAY_SIGNAL_REPEAT_WINDOW_MS,
 } from "./gateway-boot-lifecycle.kernel.js";
 

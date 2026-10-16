@@ -327,7 +327,6 @@ vi.mock("../../logging/diagnostic-stability-bundle.js", () => ({
 vi.mock("../../infra/gateway-boot-lifecycle.js", () => ({
   GATEWAY_CRASH_LOOP_BREAKER_REASON: "gateway.crash_loop_breaker",
   formatGatewayCrashLoopManualChannelStartHint: () => bootLifecycle.manualChannelStartHint,
-  GATEWAY_CRASH_LOOP_RECOVERED_REASON: "gateway.crash_loop_recovered",
   beginGatewayBootLifecycle: (env?: NodeJS.ProcessEnv, nowMs?: number) =>
     bootLifecycle.begin(env, nowMs),
   inspectGatewayCrashLoopBreakerAsync: async (env?: NodeJS.ProcessEnv, nowMs?: number) =>
