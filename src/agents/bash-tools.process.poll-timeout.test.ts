@@ -65,6 +65,11 @@ function onExit(session: ProcessSession) {
   recordNotifyOnExitRemoval(session, remove);
   return remove;
 }
+function complete(session: ProcessSession, output: string, exitCode = 0) {
+  appendOutput(session, "stdout", output);
+  markExited(session, exitCode, null, "completed");
+  return onExit(session);
+}
 
 function writableSession() {
   const stdin = {
@@ -177,11 +182,7 @@ test("sorts by start time then registration order across terminal transitions", 
       ["middle", 2_000],
       ["newest-tie", 2_000],
     ] as const
-  ).map(([id, startedAt]) => {
-    const session = createProcessSessionFixture({ id, startedAt, backgrounded: true });
-    addSession(session);
-    return session;
-  });
+  ).map(([id, startedAt]) => harness({ id, startedAt }).session);
   const expected = ["later", "newest-tie", "middle", "oldest"];
   const expectOrder = async () => {
     const result = await inputCall("list");
@@ -250,14 +251,11 @@ test("a waiting poll cannot adopt a same-id successor after removal", async () =
   session.backgrounded = false;
   deleteSession(session.id);
   markExited(session, 0, null, "completed");
-  const successor = createProcessSessionFixture({ id: session.id, backgrounded: true });
-  addSession(successor);
-  appendOutput(successor, "stdout", "successor output\n");
-  markExited(successor, 0, null, "completed");
-  const remove = onExit(successor);
+  const { session: successor } = harness();
+  const remove = complete(successor, "successor output\n");
   await tick();
   const original = await pending;
-  expect(original.details).toMatchObject({ status: "failed" });
+  check(original, { status: "failed" });
   expect(text(original)).toBe(`No session found for ${session.id}`);
   expect(remove).not.toHaveBeenCalled();
   const result = await poll();
@@ -272,15 +270,10 @@ test("an evicted completion keeps its receipt without recommending successor log
   const pending = poll(2_000);
   const output = `[earlier]${"x".repeat(30_000)}[latest]`;
   session.maxOutputChars = output.length;
-  appendOutput(session, "stdout", output);
-  markExited(session, 0, null, "completed");
-  const originalRemove = onExit(session);
+  const originalRemove = complete(session, output);
   deleteSession(session.id);
-  const successor = createProcessSessionFixture({ id: session.id, backgrounded: true });
-  addSession(successor);
-  appendOutput(successor, "stdout", "successor output\n");
-  markExited(successor, 7, null, "completed");
-  const successorRemove = onExit(successor);
+  const { session: successor } = harness();
+  const successorRemove = complete(successor, "successor output\n", 7);
   await tick();
   const original = await pending;
   check(
@@ -298,8 +291,7 @@ test("an evicted completion keeps its receipt without recommending successor log
 
 test("capped stream output stays ordered, compact, and frozen through terminal drains", async () => {
   const { session, poll, call } = harness();
-  session.maxOutputChars = 3_000;
-  session.pendingMaxOutputChars = 1_000;
+  Object.assign(session, { maxOutputChars: 3_000, pendingMaxOutputChars: 1_000 });
   const appendChunks = () => {
     for (let index = 0; index < 2_000; index += 1) {
       appendOutput(session, "stdout", "o");
@@ -350,20 +342,21 @@ test.each([
       timedOut,
       noOutputTimedOut,
     };
-    expect(raced.details).toMatchObject({ ...details, aggregated: "terminal output\n" });
-    expect(text(raced)).toContain(`Process exited with ${label}.`);
-    expect(text(raced).includes("Verify the resulting state before retrying")).toBe(timedOut);
+    check(raced, { ...details, aggregated: "terminal output\n" }, [
+      `Process exited with ${label}.`,
+    ]);
     const listed = await call("list");
     expect(listed.details).toMatchObject({ sessions: [details] });
     expect(text(listed).includes(`[${reason}]`)).toBe(timedOut);
     const log = await call("log");
-    expect(log.details).toMatchObject(details);
-    expect(text(log)).toContain("terminal output");
-    expect(text(log).includes("Verify the resulting state before retrying")).toBe(timedOut);
+    check(log, details, ["terminal output"]);
+    const warning = "Verify the resulting state before retrying";
+    expect([raced, log].map((result) => text(result).includes(warning))).toEqual([
+      timedOut,
+      timedOut,
+    ]);
     const retained = await poll();
-    expect(retained.details).toMatchObject(details);
-    expect(text(retained)).toContain(`Process exited with ${label}.`);
-    expect(text(retained)).not.toContain("terminal output");
+    check(retained, details, [`Process exited with ${label}.`], ["terminal output"]);
     expect(remove).not.toHaveBeenCalled();
     acknowledgeInternalToolResult(raced);
     expect(remove).toHaveBeenCalledOnce();

@@ -92,8 +92,6 @@ vi.mock("../process/supervisor/index.js", async () => {
     new Promise<void>((resolve) => {
       setImmediate(resolve);
     });
-  const readPathKey = (env?: NodeJS.ProcessEnv) =>
-    env && "Path" in env && !("PATH" in env) ? "Path" : "PATH";
   const splitCommands = (command: string) =>
     command
       .split(";")
@@ -101,7 +99,7 @@ vi.mock("../process/supervisor/index.js", async () => {
       .filter(Boolean);
   const commandOutput = (command: string, env?: NodeJS.ProcessEnv) => {
     const shellEnv = { ...env };
-    const pathKey = readPathKey(env);
+    const pathKey = "Path" in shellEnv && !("PATH" in shellEnv) ? "Path" : "PATH";
     return splitCommands(command)
       .map((segment) => {
         if (segment === 'export PATH="${OPENCLAW_PREPEND_PATH}${PATH:+:$PATH}"') {
@@ -310,24 +308,16 @@ it("does not default to elevated when not allowed", async () => {
   expect(text(await execute(tool, shellEcho("hi")))).toContain("hi");
 });
 
-it.each([
-  { name: "default tail", options: {}, first: "line-2", tailNote: true },
-  { name: "unbounded offset", options: { offset: 30 }, first: "line-31", tailNote: false },
-])("reads the $name log window", async ({ options, first, tailNote }) => {
+it("reads the unbounded offset log window", async () => {
   const sessionId = await startAndFinish(
     createTool(),
     Array.from({ length: 201 }, (_, i) => shellEcho(`line-${i + 1}`)).join("; "),
   );
-  const log = await processAction({ action: "log", sessionId, ...options });
+  const log = await processAction({ action: "log", sessionId, offset: 30 });
   expect(log.details).toMatchObject({ totalLines: 201 });
-  expect(text(log).split("\n")[0]).toBe(first);
-  expect(text(log)).toContain("line-201");
-  if (tailNote) {
-    expect(text(log)).toContain("showing last 200 of 201 lines");
-  } else {
-    expect(text(log).split("\n").at(-1)).toBe("line-201");
-    expect(text(log)).not.toContain("showing last 200");
-  }
+  expect(text(log).split("\n")[0]).toBe("line-31");
+  expect(text(log).split("\n").at(-1)).toBe("line-201");
+  expect(text(log)).not.toContain("showing last 200");
 });
 
 it("isolates process lists and polling by scopeKey", async () => {

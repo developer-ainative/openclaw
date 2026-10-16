@@ -32,13 +32,11 @@ import {
   type DiagnosticEventPayload,
 } from "../infra/diagnostic-events.js";
 import { readExecApprovalsSnapshot, updateExecApprovals } from "../infra/exec-approvals-store.js";
-import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 import * as workerAdmission from "../infra/sqlite-worker-operation-admission.js";
 import { resetGatewayWorkAdmission } from "../process/gateway-work-admission.js";
 import { getProcessSupervisor } from "../process/supervisor/index.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { closeOpenClawAgentDatabasesAsync } from "../state/openclaw-agent-db-lifecycle.js";
-import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
 import {
   closeOpenClawStateDatabaseAsync,
   closeOpenClawStateDatabaseByPathAsync,
@@ -212,16 +210,13 @@ async function mintStandingGrant(revision: string, expiresAtMs: number | null): 
         agentId: "main",
         allowedDecisions: ["allow-once", "allow-always", "deny"],
       },
-      reviewerDeviceIds: [],
       source: {
         agentId: "main",
         sessionKey: "agent:main:cron:job-1",
         sessionId: "session-1",
         runId: "cron-run-0",
-        toolCallId: null,
         toolName: "exec",
       },
-      audienceSessionKeys: [],
       runtimeEpoch: "epoch-1",
       createdAtMs: Date.now() - 500,
       expiresAtMs: Date.now() + 60_000,
@@ -249,16 +244,8 @@ async function mintStandingGrant(revision: string, expiresAtMs: number | null): 
   expect(resolved.outcome).toBe("resolved");
 }
 
-function readGrantUseCounts(): number[] {
-  const database = openOpenClawStateDatabase(databaseOptions());
-  const stateDb = getNodeSqliteKysely<
-    Pick<OpenClawStateKyselyDatabase, "operator_approval_standing_grants">
-  >(database.db);
-  return executeSqliteQuerySync(
-    database.db,
-    stateDb.selectFrom("operator_approval_standing_grants").select(["use_count"]),
-  ).rows.map((row) => row.use_count);
-}
+const readGrantUseCounts = async () =>
+  (await listCronStandingGrants()).map((grant) => grant.useCount);
 
 async function prepareCronRun(mintGrant = true, expiresAtMs: number | null = null) {
   const job = seedCronJobRow();
@@ -369,9 +356,9 @@ function readNativeEffects() {
     .replace(/^\uFEFF/, "")
     .trim();
 }
-function expectNoNativeEffects(uses: number) {
+async function expectNoNativeEffects(uses: number) {
   expect(fs.existsSync(path.join(workdir, "cron-native-effects.txt"))).toBe(false);
-  expect(readGrantUseCounts()).toEqual([uses]);
+  expect(await readGrantUseCounts()).toEqual([uses]);
 }
 function expectApproved(result: Awaited<ReturnType<typeof runCron>>) {
   expect(result.pendingResult).toBeUndefined();
@@ -412,7 +399,7 @@ it("executes a cron occurrence via a standing grant without prompting", async ()
   await expect(runNativeCron(result)).rejects.toThrow("exec denied by final preflight");
   expect(readNativeEffects()).toBe("cron-native-launch");
   expect(JSON.stringify(security.events)).toContain("standing-grant");
-  expect(readGrantUseCounts()).toEqual([1]);
+  expect(await readGrantUseCounts()).toEqual([1]);
 });
 
 it.each(["revoked grant", "finished receipt", "replacement receipt"] as const)(
@@ -438,7 +425,7 @@ it.each(["revoked grant", "finished receipt", "replacement receipt"] as const)(
     }
     await expectNativeDenied(runNativeCron(result), "standing grant no longer valid");
     security.stop();
-    expectNoNativeEffects(0);
+    await expectNoNativeEffects(0);
     expect(JSON.stringify(security.events)).toContain("standing-grant-invalidated");
   },
 );
@@ -518,7 +505,7 @@ it.each([
       // Revocation after committed consumption does not fence a checked native launch.
       expect(order).toEqual(["revoked", "launch"]);
     }
-    expect(readGrantUseCounts()).toEqual([1]);
+    expect(await readGrantUseCounts()).toEqual([1]);
   },
 );
 
@@ -559,7 +546,7 @@ it("denies native execution when a committed grant expires before its consume re
       awaitGateBeforeSettlement(consumed.promise, execution, "Exec missed the consume reply gate"),
       signal,
     );
-    expect(readGrantUseCounts()).toEqual([1]);
+    expect(await readGrantUseCounts()).toEqual([1]);
     expect(approved()).toEqual([]);
     clock.mockReturnValue(expiresAtMs);
     releaseReply.resolve();
@@ -568,7 +555,7 @@ it("denies native execution when a committed grant expires before its consume re
       result: { content: [{ type: "text" }] },
     });
     expect(approved()).toEqual([]);
-    expectNoNativeEffects(1);
+    await expectNoNativeEffects(1);
   } finally {
     releaseReply.resolve();
     await Promise.allSettled([execution]);
@@ -599,7 +586,7 @@ it("refuses policy tightening until a consumed remote launch acknowledges initia
     acknowledgement.resolve();
     await acknowledgement.promise;
     await expect(deny()).resolves.not.toBeNull();
-    expect(readGrantUseCounts()).toEqual([1]);
+    expect(await readGrantUseCounts()).toEqual([1]);
   } finally {
     acknowledgement.resolve();
     result.releaseSpawn?.();
@@ -627,7 +614,7 @@ it("never launches or reconsumes after an unknown committed-use publication", as
   const launch = vi.fn();
   expect(() => result.initiateSpawn?.(launch)).toThrow();
   expect(launch).not.toHaveBeenCalled();
-  expect(readGrantUseCounts()).toEqual([1]);
+  expect(await readGrantUseCounts()).toEqual([1]);
 });
 
 it("skips the JSON allowlist digest when a cron allow-always resolves", async () => {

@@ -15,10 +15,9 @@ import { createExecTool as createExecToolImpl } from "./bash-tools.exec-run.js";
 import { makeProviderModelFixture } from "./test-helpers/provider-model-fixture.js";
 import { callGatewayTool } from "./tools/gateway.js";
 
-const createExecTool = (
-  defaults?: Parameters<typeof createExecToolImpl>[0],
-): ReturnType<typeof createExecToolImpl> => createExecToolImpl({ agentId: "main", ...defaults });
 type ToolOptions = Parameters<typeof createExecToolImpl>[0];
+const createExecTool = (defaults?: ToolOptions) =>
+  createExecToolImpl({ agentId: "main", ...defaults });
 const elevated = { enabled: true, allowed: true, defaultLevel: "full" } as const;
 const approvalCalls = ["exec.approval.request", "exec.approval.waitDecision"];
 const text = (result: { content: Array<{ type: string; text?: string }> }) =>
@@ -28,6 +27,11 @@ const makeReviewer = (
   risk: "low" | "medium" | "high",
   rationale: string,
 ) => vi.fn<ExecAutoReviewer>(async () => ({ decision, risk, rationale }));
+const transcript = (message: string): ExecAutoReviewTranscript => ({
+  entries: [{ kind: "user", origin: "operator", text: message }],
+  omittedEntries: 0,
+  truncated: false,
+});
 const run = (options: ToolOptions, command: string, args = {}) =>
   createExecTool(options).execute("security-floor", { command, ...args });
 const expectOutput = (
@@ -104,18 +108,11 @@ function mockApprovalGateway(decision: "allow-once" | "deny" | null = null): str
 function createAutoTool(defaults?: ToolOptions) {
   return createExecTool({ host: "gateway", mode: "auto", safeBins: [], ...defaults });
 }
+const runAuto = (options: ToolOptions, command: string, args = {}) =>
+  createAutoTool(options).execute("auto-review", { command, ...args });
 
 let envSnapshot: ReturnType<typeof captureEnv>;
 let tempRoot: string;
-const allowlistedTool = (options: ToolOptions = {}) =>
-  createExecTool({
-    host: "gateway",
-    security: "allowlist",
-    ask: "off",
-    safeBins: [],
-    pathPrepend: [installAllowlistedGogFixture(tempRoot)],
-    ...options,
-  });
 
 beforeEach(() => {
   envSnapshot = captureEnv([
@@ -147,11 +144,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  const dir = tempRoot;
   closeOpenClawStateDatabaseForTest();
   envSnapshot.restore();
-  if (dir) {
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  if (tempRoot) {
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   }
 });
 
@@ -177,32 +173,34 @@ it("records elevated execution without logging the command payload", async () =>
   }
 });
 
-it.each([false, true])(
-  "honors ask hardening only for trusted callers (trusted=%s)",
-  async (trusted) => {
-    const calls = trusted ? mockApprovalGateway("deny") : [];
-    const tool = allowlistedTool(
-      trusted
-        ? {}
-        : {
-            messageProvider: "telegram",
-            currentChannelId: "telegram:12345",
-            accountId: "default",
-          },
-    );
-    const result = await tool.execute("ask-override", {
-      command: "gog tasks add tasklist --title test",
-      ask: "always",
-    });
-    if (trusted) {
-      expect(calls).toEqual(approvalCalls);
-      expectOutput(result, "user-denied", { status: "failed", timedOut: false });
-    } else {
-      expectOutput(result, "gog-ok tasks add tasklist --title test");
-      expect(callGatewayTool).not.toHaveBeenCalled();
-    }
-  },
-);
+it.each([false, true])("honors ask overrides only for trusted callers (%s)", async (trusted) => {
+  const calls = trusted ? mockApprovalGateway("deny") : [];
+  const tool = createExecTool({
+    host: "gateway",
+    security: "allowlist",
+    ask: "off",
+    safeBins: [],
+    pathPrepend: [installAllowlistedGogFixture(tempRoot)],
+    ...(trusted
+      ? {}
+      : {
+          messageProvider: "telegram",
+          currentChannelId: "telegram:12345",
+          accountId: "default",
+        }),
+  });
+  const result = await tool.execute("ask-override", {
+    command: "gog tasks add tasklist --title test",
+    ask: "always",
+  });
+  if (trusted) {
+    expect(calls).toEqual(approvalCalls);
+    expectOutput(result, "user-denied", { status: "failed", timedOut: false });
+  } else {
+    expectOutput(result, "gog-ok tasks add tasklist --title test");
+    expect(callGatewayTool).not.toHaveBeenCalled();
+  }
+});
 
 it("ignores model-supplied full security when configured security is deny", async () => {
   await expect(
@@ -247,12 +245,9 @@ it.each([undefined, "deny"] as const)(
 it("intersects normalized gateway auto mode with host approval deny defaults", async () => {
   writePolicy("deny");
   const autoReviewer = makeReviewer("allow-once", "low", "would otherwise run");
-  const tool = createAutoTool({ autoReviewer });
-  await expect(
-    tool.execute("call-auto-mode-host-deny", {
-      command: "echo blocked",
-    }),
-  ).rejects.toThrow(/security=deny|exec denied/i);
+  await expect(runAuto({ autoReviewer }, "echo blocked")).rejects.toThrow(
+    /security=deny|exec denied/i,
+  );
   expect(autoReviewer).not.toHaveBeenCalled();
 });
 
@@ -270,25 +265,16 @@ it("reviews current conversation context and retains Guardian approval without a
     sessionKey: "agent:main:main",
   });
   expect(reviewTranscript).not.toHaveBeenCalled();
-  const currentTranscript: ExecAutoReviewTranscript = {
-    entries: [{ kind: "user", origin: "operator", text: "Check the Node version." }],
-    omittedEntries: 0,
-    truncated: false,
-  };
+  const currentTranscript = transcript("Check the Node version.");
   const liveReviews: unknown[] = [];
   const unsubscribe = onAgentEvent((event) => {
     if (event.data.phase === "review") {
       liveReviews.push(event.data);
     }
   });
-  let result: Awaited<ReturnType<typeof tool.execute>>;
-  try {
-    result = await tool.execute("call-guardian-review", {
-      command: "node --version",
-    });
-  } finally {
-    unsubscribe();
-  }
+  const result = await tool
+    .execute("call-guardian-review", { command: "node --version" })
+    .finally(unsubscribe);
   expect(liveReviews).toEqual([]);
   expect(reviewTranscript).toHaveBeenCalledTimes(1);
   expect(autoReviewer).toHaveBeenCalledWith(
@@ -339,42 +325,33 @@ it("reviews current conversation context and retains Guardian approval without a
   });
 });
 
-it.runIf(process.platform !== "win32")(
-  "executes reviewed globs and chains as written",
-  async () => {
-    const workdir = tempRoot;
-    fs.writeFileSync(path.join(workdir, "first.review-fixture"), "fixture");
-    const command = "ls *.review-fixture; echo chain-complete";
-    const calls = mockApprovalGateway();
-    const autoReviewer = makeReviewer("allow-once", "medium", "project inspection");
-    const tool = createAutoTool({
-      autoReviewer,
-      cwd: workdir,
-    });
-    const result = await tool.execute("call-reviewed-glob", { command });
-    expect(autoReviewer).toHaveBeenCalledWith(
-      expect.objectContaining({ command, reason: "execution-plan-miss" }),
-    );
-    expect(calls).toEqual([]);
-    expect(result.details).toMatchObject({
-      status: "completed",
-      exitCode: 0,
-      approvalReviewOutcome: "approved",
-    });
-    expect(text(result)).toContain("first.review-fixture\nchain-complete");
-  },
-);
+it.runIf(process.platform !== "win32")("runs reviewed globs and chains as written", async () => {
+  fs.writeFileSync(path.join(tempRoot, "first.review-fixture"), "fixture");
+  const command = "ls *.review-fixture; echo chain-complete";
+  const calls = mockApprovalGateway();
+  const autoReviewer = makeReviewer("allow-once", "medium", "project inspection");
+  const result = await runAuto({ autoReviewer, cwd: tempRoot }, command);
+  expect(autoReviewer).toHaveBeenCalledWith(
+    expect.objectContaining({ command, reason: "execution-plan-miss" }),
+  );
+  expect(calls).toEqual([]);
+  expect(result.details).toMatchObject({
+    status: "completed",
+    exitCode: 0,
+    approvalReviewOutcome: "approved",
+  });
+  expect(text(result)).toContain("first.review-fixture\nchain-complete");
+});
 
 it("retains Guardian evidence and denies script drift in reviewed chains", async () => {
   const command = "sh script.sh; ls *.sh";
-  const workdir = tempRoot;
-  const script = path.join(workdir, "script.sh");
+  const script = path.join(tempRoot, "script.sh");
   fs.writeFileSync(script, "#!/bin/sh\necho approved\n");
   const autoReviewer = makeReviewer("allow-once", "low", "approved script");
   const tool = createAutoTool({
     autoReviewer,
     runId: "run-guardian-script",
-    cwd: workdir,
+    cwd: tempRoot,
   });
   let changedAfterApproval = false;
   const unsubscribe = onAgentEvent((event) => {
@@ -383,12 +360,7 @@ it("retains Guardian evidence and denies script drift in reviewed chains", async
       changedAfterApproval = true;
     }
   });
-  let result: Awaited<ReturnType<typeof tool.execute>>;
-  try {
-    result = await tool.execute("tool-guardian-script", { command });
-  } finally {
-    unsubscribe();
-  }
+  const result = await tool.execute("tool-guardian-script", { command }).finally(unsubscribe);
   expect(changedAfterApproval).toBe(true);
   expect(text(result)).toContain("approval script operand changed before execution");
   expect(result.details).toMatchObject({
@@ -409,61 +381,33 @@ it("uses agent-scoped host policy when clamping normalized modes", async () => {
   expect((text(result) ?? "").trim()).toContain("agent-ok");
 });
 
-it("preserves host ask floors for elevated full gateway exec", async () => {
-  writePolicy("full", "always");
-  const calls = mockApprovalGateway();
+it.each([
+  ["elevated", { security: "full", ask: "off", elevated }],
+  ["session", { mode: "full", bypassHostApprovalFloors: true }],
+  ["tightened", { security: "full", ask: "always", bypassHostApprovalFloors: true }],
+] as const)("applies host approval floors to %s full execution", async (kind, options) => {
+  writePolicy(kind === "tightened" ? "deny" : "full", kind === "tightened" ? "off" : "always");
+  const calls = mockApprovalGateway(kind === "tightened" ? "allow-once" : null);
   const result = await run(
-    { host: "gateway", security: "full", ask: "off", approvalRunningNoticeMs: 0, elevated },
-    "echo ok",
-    { elevated: true },
-  );
-  expectOutput(result, "approval-timeout", { status: "failed", timedOut: true });
-  expect(calls).toEqual(approvalCalls);
-});
-
-it("does not prompt explicit full sessions despite host ask floors", async () => {
-  writePolicy("full", "always");
-  const result = await run(
-    {
-      host: "gateway",
-      mode: "full",
-      bypassHostApprovalFloors: true,
-      approvalRunningNoticeMs: 0,
-    },
+    { host: "gateway", approvalRunningNoticeMs: 0, ...options },
     "echo session-full-ok",
+    kind === "elevated" ? { elevated: true } : {},
   );
-  expectOutput(result, "session-full-ok");
-  expect(callGatewayTool).not.toHaveBeenCalled();
-});
-
-it("honors ask-only tightening without restoring full-session host floors", async () => {
-  writePolicy("deny");
-  const calls = mockApprovalGateway("allow-once");
-  const result = await run(
-    {
-      host: "gateway",
-      security: "full",
-      ask: "always",
-      bypassHostApprovalFloors: true,
-      approvalRunningNoticeMs: 0,
-    },
-    "echo ok",
-  );
-  expectOutput(result, "ok", { status: "completed", exitCode: 0 });
-  expect(calls).toEqual(approvalCalls);
+  if (kind === "elevated") {
+    expectOutput(result, "approval-timeout", { status: "failed", timedOut: true });
+  } else {
+    expectOutput(result, "session-full-ok");
+    if (kind === "tightened") {
+      expect(result.details).toMatchObject({ exitCode: 0 });
+    }
+  }
+  expect(calls).toEqual(kind === "session" ? [] : approvalCalls);
 });
 
 it("honors normalized auto mode before elevated full bypass", async () => {
   const calls = mockApprovalGateway();
   const autoReviewer = makeReviewer("ask", "high", "test reviewer asks for approval");
-  const tool = createAutoTool({
-    autoReviewer,
-    elevated,
-  });
-  const result = await tool.execute("call-elevated-full-auto-mode", {
-    command: "whoami",
-    elevated: true,
-  });
+  const result = await runAuto({ autoReviewer, elevated }, "whoami", { elevated: true });
   expect(autoReviewer).toHaveBeenCalledWith(
     expect.objectContaining({
       command: expect.stringMatching(/(?:^|[/\\])whoami(?:\.exe)?$/u),
@@ -477,11 +421,7 @@ it("honors normalized auto mode before elevated full bypass", async () => {
 
 it("keeps default reviewer settings, conversation and cancellation scoped to each execution", async () => {
   let userRequest = "Check the Node version before building.";
-  const reviewTranscript = vi.fn((): ExecAutoReviewTranscript => ({
-    entries: [{ kind: "user", origin: "operator", text: userRequest }],
-    omittedEntries: 0,
-    truncated: false,
-  }));
+  const reviewTranscript = vi.fn(() => transcript(userRequest));
   const reviewer = { model: "synthetic/reviewer-first" };
   const config: OpenClawConfig = {
     tools: { exec: { reviewer: { model: "synthetic/reviewer-global" } } },
@@ -515,11 +455,7 @@ it("keeps default reviewer settings, conversation and cancellation scoped to eac
   expect(reviewTranscript).not.toHaveBeenCalled();
   const first = new AbortController();
   const second = new AbortController();
-  const firstRun = tool.execute(
-    "default-review-first",
-    { command: "node --version" },
-    first.signal,
-  );
+  const firstRun = tool.execute("first", { command: "node --version" }, first.signal);
   try {
     await Promise.race([completionEntered.promise, firstRun]);
     first.abort(new Error("first execution cancelled"));
@@ -530,11 +466,7 @@ it("keeps default reviewer settings, conversation and cancellation scoped to eac
     );
     userRequest = "Check the Node version after building.";
     reviewer.model = "synthetic/reviewer-second";
-    const result = await tool.execute(
-      "default-review-second",
-      { command: "node --version" },
-      second.signal,
-    );
+    const result = await tool.execute("second", { command: "node --version" }, second.signal);
     expect(reviewerRuntime.prepare.mock.calls.map(([params]) => params.modelRef)).toEqual([
       "synthetic/reviewer-first",
       "synthetic/reviewer-second",

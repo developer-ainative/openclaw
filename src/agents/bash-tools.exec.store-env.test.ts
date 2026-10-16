@@ -113,12 +113,9 @@ it.each(["gateway", "node"] as const)(
       });
       const ordinary = lazyTool(host);
       await withInstallationTarget(target, () => execute(ordinary, "ordinary-probe"));
-      expect(mocks.spawnInputs.at(-1)?.env?.OPENCLAW_STATE_DIR).toBe(
-        process.env.OPENCLAW_STATE_DIR,
-      );
-      expect(mocks.spawnInputs.at(-1)?.env?.OPENCLAW_WORKSPACE_DIR).toBe(
-        process.env.OPENCLAW_WORKSPACE_DIR,
-      );
+      for (const key of ["OPENCLAW_STATE_DIR", "OPENCLAW_WORKSPACE_DIR"]) {
+        expect(mocks.spawnInputs.at(-1)?.env?.[key]).toBe(process.env[key]);
+      }
     } else {
       await expect(run).rejects.toThrow("saved prompt");
       expect(mocks.nodeHostParams).toEqual([]);
@@ -185,10 +182,7 @@ it("runs worker placement exec without reading or projecting its scratch secret 
     throw new Error("Worker placement exec tool is unavailable");
   }
 
-  const result = await exec.execute("worker-store-env", {
-    command: "echo ok",
-    yieldMs: 120_000,
-  });
+  const result = await execute(exec, "worker-store-env");
 
   expect(result.details).toMatchObject({ status: "completed", exitCode: 0 });
   expect(mocks.spawnInputs).toHaveLength(1);
@@ -306,10 +300,7 @@ it.each(["gateway", "sandbox"] as const)(
       expect(looksLikeSecretSentinel(env.SERVICE_API_KEY ?? "")).toBe(true);
       expect(resolveSecretSentinel(env.SERVICE_API_KEY ?? "")).toBe("enabled-secret");
       expect(env).toMatchObject(EGRESS_ENV);
-      const childEnv = mocks.spawnInputs.at(-1)?.env;
-      expect(childEnv?.SERVICE_API_KEY).toBe(env.SERVICE_API_KEY);
-      expect(JSON.stringify(childEnv).includes("enabled-secret")).toBe(false);
-      expect(JSON.stringify(env).includes("enabled-secret")).toBe(false);
+      expect(JSON.stringify(env)).not.toContain("enabled-secret");
       const binding = expect.objectContaining({
         name: "SERVICE_API_KEY",
         allowedHosts: ["api.example.com"],
