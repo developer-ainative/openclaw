@@ -155,8 +155,8 @@ it.each([1, 2] as const)(
       }
       expect(calls).toBe(6);
     } finally {
-      for (const callback of release) {
-        callback.resolve();
+      for (const releaseGate of release) {
+        releaseGate.resolve();
       }
       await Promise.allSettled(pending);
     }
