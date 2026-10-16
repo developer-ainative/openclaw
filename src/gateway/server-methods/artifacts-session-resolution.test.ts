@@ -29,11 +29,11 @@ vi.mock("../server-session-key.js", () => ({
 
 async function resolveSession(
   query: ArtifactQuery,
-  getRuntimeConfig: () => OpenClawConfig | undefined,
+  cfg: OpenClawConfig | undefined,
   client: GatewayClient | null,
 ) {
   using access = createArtifactSessionAccess({
-    getRuntimeConfig: () => getRuntimeConfig() ?? {},
+    getRuntimeConfig: () => cfg ?? {},
     client,
   });
   const resolve = await prepareArtifactSessionResolution(query);
@@ -41,22 +41,30 @@ async function resolveSession(
   return selected ? { sessionKey: selected.sessionKey, agentId: selected.agentId } : undefined;
 }
 
+function expectSession(
+  sessionKey: string,
+  query: ArtifactQuery,
+  cfg: OpenClawConfig | undefined,
+  client: GatewayClient | null,
+) {
+  return expect(resolveSession(query, cfg, client)).resolves.toMatchObject({ sessionKey });
+}
+
+function putSession(sessionKey: string, entry: Parameters<typeof upsertSessionEntryCore>[1]) {
+  return upsertSessionEntryCore(
+    { agentId: "main", sessionKey },
+    {
+      sessionId: `session-${sessionKey.split(":").at(-1)}`,
+      updatedAt: 1,
+      ...entry,
+    },
+  );
+}
+
 function identifiedClient(scopes: string[], profileId = "viewer@example.com"): GatewayClient {
   return {
-    connect: {
-      minProtocol: 1,
-      maxProtocol: 1,
-      client: { id: "openclaw-control-ui", version: "test", platform: "test", mode: "webchat" },
-      role: "operator",
-      scopes,
-    },
+    ...sharingPolicyClient({ user: profileId, scopes }),
     authenticatedUserId: "viewer@example.com",
-    authenticatedUserProfile: {
-      profileId,
-      displayName: null,
-      hasAvatar: false,
-      updatedAt: 1,
-    },
   };
 }
 
@@ -67,18 +75,7 @@ describe("artifact session authorization", () => {
 
   it("waits for indirect artifact topology without waiting for unrelated row enrichment", async () => {
     const unavailable = new Error("session projection is unavailable");
-    const projection: Pick<
-      SessionRowProjection,
-      | "ensureMaterialized"
-      | "findBySessionId"
-      | "sharingRevision"
-      | "sharingTarget"
-      | "sharingTargetState"
-      | "readSource"
-      | "readMembership"
-      | "needsMembershipPreparation"
-      | "prepareMembership"
-    > = {
+    const projection = {
       sharingRevision: undefined,
       sharingTarget: vi.fn(),
       sharingTargetState: vi.fn(),
@@ -90,7 +87,7 @@ describe("artifact session authorization", () => {
         .fn<SessionRowProjection["ensureMaterialized"]>()
         .mockRejectedValue(unavailable),
       findBySessionId: vi.fn<SessionRowProjection["findBySessionId"]>(),
-    };
+    } satisfies NonNullable<Parameters<typeof prepareArtifactSessionResolution>[1]>;
     await expect(
       prepareArtifactSessionResolution({ sessionKey: "agent:main:main" }, projection),
     ).resolves.toBeTypeOf("function");
@@ -109,45 +106,33 @@ describe("artifact session authorization", () => {
       const sessionKey = "agent:main:dashboard:incognito-artifacts";
       const cfg = { agents: { entries: { main: {} } } };
       setRuntimeConfigSnapshot(cfg);
-      await upsertSessionEntryCore(
-        { agentId: "main", sessionKey },
-        {
-          sessionId: "session-incognito-artifacts",
-          updatedAt: 1,
-          incognito: true,
-          visibility: "shared",
-        },
-      );
+      await putSession(sessionKey, {
+        incognito: true,
+        visibility: "shared",
+      });
       mocks.resolveRunSession.mockReturnValue({ sessionKey, agentId: "main" });
       const viewer = identifiedClient(["operator.read"]);
 
       await expect(
         resolveSession(
           { sessionKey: "dashboard:incognito-artifacts", agentId: "main" },
-          () => cfg,
+          cfg,
           viewer,
         ),
       ).rejects.toThrow('Incognito session "dashboard:incognito-artifacts" was not found.');
-      for (const query of [{ runId: "run-private" }]) {
-        try {
-          await resolveSession(query, () => cfg, viewer);
-          throw new Error("expected incognito artifact selector to be denied");
-        } catch (error) {
-          expect(error).toBeInstanceOf(ArtifactSessionResolutionError);
-          expect((error as ArtifactSessionResolutionError).shape).toMatchObject({
-            message: "no session found for artifact query",
-            details: { type: "artifact_scope_not_found" },
-          });
-        }
-      }
-
-      expect(
-        await resolveSession(
-          { sessionKey: "dashboard:incognito-artifacts", agentId: "main" },
-          () => cfg,
-          identifiedClient(["operator.admin"]),
-        ),
-      ).toMatchObject({ sessionKey });
+      await expect(resolveSession({ runId: "run-private" }, cfg, viewer)).rejects.toMatchObject({
+        constructor: ArtifactSessionResolutionError,
+        shape: {
+          message: "no session found for artifact query",
+          details: { type: "artifact_scope_not_found" },
+        },
+      });
+      await expectSession(
+        sessionKey,
+        { sessionKey: "dashboard:incognito-artifacts", agentId: "main" },
+        cfg,
+        identifiedClient(["operator.admin"]),
+      );
     });
   });
 
@@ -175,22 +160,17 @@ describe("artifact session authorization", () => {
         const ownerProfile = ensureProfileForEmail("owner@example.com");
         using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
         const sessionKey = "agent:main:foreign-artifacts";
-        await upsertSessionEntryCore(
-          { agentId: "main", sessionKey },
-          {
-            sessionId: "session-foreign-artifacts",
-            updatedAt: 1,
-            createdActor: { type: "human", source: "profile", id: ownerProfile.id },
-            visibility,
-          },
-        );
+        await putSession(sessionKey, {
+          createdActor: { type: "human", source: "profile", id: ownerProfile.id },
+          visibility,
+        });
         mocks.resolveRunSession.mockReturnValue({ sessionKey, agentId: "main" });
         const viewer = role
           ? roleClient(role, "artifact-viewer")
           : identifiedClient(["operator.read"], viewerProfile.id);
 
         for (const query of [{ sessionKey }, { runId: "run-foreign" }]) {
-          await expect(resolveSession(query, () => cfg, viewer)).rejects.toThrowError(
+          await expect(resolveSession(query, cfg, viewer)).rejects.toThrowError(
             expect.objectContaining({
               shape: {
                 code: "INVALID_REQUEST",
@@ -201,20 +181,18 @@ describe("artifact session authorization", () => {
           );
         }
 
-        expect(
-          await resolveSession(
-            { sessionKey },
-            () => cfg,
-            identifiedClient(["operator.read"], ownerProfile.id),
-          ),
-        ).toMatchObject({ sessionKey });
-        expect(
-          await resolveSession(
-            { runId: "run-foreign" },
-            () => cfg,
-            identifiedClient(["operator.admin"], viewerProfile.id),
-          ),
-        ).toMatchObject({ sessionKey });
+        await expectSession(
+          sessionKey,
+          { sessionKey },
+          cfg,
+          identifiedClient(["operator.read"], ownerProfile.id),
+        );
+        await expectSession(
+          sessionKey,
+          { runId: "run-foreign" },
+          cfg,
+          identifiedClient(["operator.admin"], viewerProfile.id),
+        );
       });
     },
   );
@@ -228,20 +206,13 @@ describe("artifact session authorization", () => {
         const viewer = roleClient("view", "artifact-reader");
         using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
         const sessionKey = "agent:main:readable-artifacts";
-        await upsertSessionEntryCore(
-          { agentId: "main", sessionKey },
-          {
-            sessionId: "session-readable-artifacts",
-            updatedAt: 1,
-            createdActor: { type: "human", source: "profile", id: owner.id },
-            visibility,
-          },
-        );
+        await putSession(sessionKey, {
+          createdActor: { type: "human", source: "profile", id: owner.id },
+          visibility,
+        });
 
         for (const cfg of [undefined, {}, rolePolicyConfig()]) {
-          expect(await resolveSession({ sessionKey }, () => cfg, viewer)).toMatchObject({
-            sessionKey,
-          });
+          await expectSession(sessionKey, { sessionKey }, cfg, viewer);
         }
       });
     },
@@ -251,27 +222,22 @@ describe("artifact session authorization", () => {
     await withOpenClawTestState(profileState, async () => {
       setRuntimeConfigSnapshot({});
       const sessionKey = "agent:main:solo-artifacts";
-      await upsertSessionEntryCore(
-        { agentId: "main", sessionKey },
-        { sessionId: "session-solo-artifacts", updatedAt: 1, visibility: "draft" },
-      );
+      await putSession(sessionKey, {
+        visibility: "draft",
+      });
       const identityless = sharingPolicyClient({});
       for (const client of [null, identityless, sharingPolicyClient({ user: "gateway-owner" })]) {
-        expect(await resolveSession({ sessionKey }, () => ({}), client)).toMatchObject({
-          sessionKey,
-        });
+        await expectSession(sessionKey, { sessionKey }, {}, client);
       }
       const cfg = rolePolicyConfig();
-      await expect(resolveSession({ sessionKey }, () => cfg, identityless)).rejects.toThrow(
+      await expect(resolveSession({ sessionKey }, cfg, identityless)).rejects.toThrow(
         "no session found for artifact query",
       );
       const system: GatewayClient = {
         ...identityless,
         internal: { operatorRoleActor: { kind: "system" } },
       };
-      expect(await resolveSession({ sessionKey }, () => cfg, system)).toMatchObject({
-        sessionKey,
-      });
+      await expectSession(sessionKey, { sessionKey }, cfg, system);
     });
   });
 });

@@ -31,7 +31,7 @@ import * as transcriptImageArtifacts from "./artifacts-transcript-images.js";
 import { artifactsHandlers } from "./artifacts.js";
 import { chatHistoryHandlers } from "./chat-history-handler.js";
 import { createHistoryReadContext } from "./chat-history.test-helpers.js";
-import type { GatewayClient, GatewayRequestContext, GatewayRequestHandler } from "./types.js";
+import type { GatewayClient, GatewayRequestContext } from "./types.js";
 
 const scope = {
   agentId: "main",
@@ -40,17 +40,18 @@ const scope = {
 };
 
 async function invoke(
-  method: "artifacts.list" | "artifacts.download",
+  method: "chat.history" | "artifacts.list" | "artifacts.get" | "artifacts.download",
   params: Record<string, unknown>,
   client: GatewayClient | null = null,
   context: GatewayRequestContext = createDirectChatContext(),
+  sessionKey = scope.sessionKey,
 ) {
   let result: { ok: boolean; payload?: unknown; error?: unknown } | undefined;
   await expectDefined(
-    artifactsHandlers[method],
+    method === "chat.history" ? chatHistoryHandlers[method] : artifactsHandlers[method],
     "artifact handler",
   )({
-    params: { sessionKey: scope.sessionKey, ...params },
+    params: { sessionKey, ...params },
     context,
     req: { type: "req", id: "images", method },
     client,
@@ -71,15 +72,47 @@ function page(result: Awaited<ReturnType<typeof list>>): ArtifactsListResult {
   return result.payload as ArtifactsListResult;
 }
 
+function imageUrls(result: ArtifactsListResult) {
+  return result.artifacts.map((artifact) => artifact.image?.url);
+}
+
 async function append(content: unknown) {
   await appendTranscriptMessage(scope, { message: { role: "assistant", content } });
 }
 
+function withImages(run: () => Promise<void>) {
+  return withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
+    await captureRuntimeConfigAsyncReader()();
+    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+    await run();
+  });
+}
+
+function expectArtifactError(result: Awaited<ReturnType<typeof invoke>>, type: string) {
+  expect(result).toMatchObject({ ok: false, error: { details: { type } } });
+}
+
+function fileMessage(title: string, data = "aGVsbG8=", runId?: string) {
+  return {
+    role: "assistant",
+    content: [{ type: "file", data, mimeType: "text/plain", title }],
+    ...(runId ? { __openclaw: { runId } } : {}),
+  };
+}
+
+async function seedMessage(
+  target: typeof scope,
+  message: unknown,
+  eventId?: string,
+  updatedAt = 1,
+) {
+  await upsertSessionEntryCore(target, { sessionId: target.sessionId, updatedAt });
+  return appendTranscriptMessage(target, { message, eventId });
+}
+
 describe("bounded Activity image discovery", () => {
   it("pages canonical uploaded images from mixed user media with Chat's path preference", async () => {
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
-      await captureRuntimeConfigAsyncReader()();
-      await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+    await withImages(async () => {
       const urls = Array.from({ length: 5 }, (_, index) => `media://inbound/upload-${index}.png`);
       const localPath = "/synthetic/nonexistent/upload.png";
       await appendTranscriptMessage(scope, {
@@ -113,16 +146,11 @@ describe("bounded Activity image discovery", () => {
       } finally {
         reads.restore();
       }
-      expect(first.artifacts.map((artifact) => artifact.image?.url)).toEqual([
-        localPath,
-        ...urls.slice(2).toReversed(),
-      ]);
+      expect(imageUrls(first)).toEqual([localPath, ...urls.slice(2).toReversed()]);
       const second = page(
         await list({ cursor: expectDefined(first.nextCursor, "uploaded image cursor") }),
       );
-      expect(second.artifacts.map((artifact) => artifact.image?.url)).toEqual(
-        urls.slice(0, 2).toReversed(),
-      );
+      expect(imageUrls(second)).toEqual(urls.slice(0, 2).toReversed());
       expect(second.artifacts[1]).toMatchObject({
         title: "upload-0.png",
         mimeType: "image/png",
@@ -136,9 +164,7 @@ describe("bounded Activity image discovery", () => {
   });
 
   it("honors assistant image filters and binds pagination to the same role", async () => {
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
-      await captureRuntimeConfigAsyncReader()();
-      await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+    await withImages(async () => {
       const urls = Array.from(
         { length: 6 },
         (_, index) => `https://images.example.test/assistant-${index}.png`,
@@ -158,29 +184,20 @@ describe("bounded Activity image discovery", () => {
         "https://images.example.test/user.png",
       ]);
       const filtered = page(await list({ messageRole: "assistant" }));
-      expect(filtered.artifacts.map((artifact) => artifact.image?.url)).toEqual(
-        urls.toReversed().slice(0, 4),
+      expect(imageUrls(filtered)).toEqual(urls.toReversed().slice(0, 4));
+      expectArtifactError(await list({ cursor: filtered.nextCursor }), "artifact_cursor_invalid");
+      expectArtifactError(
+        await list({ cursor: all.nextCursor, messageRole: "assistant" }),
+        "artifact_cursor_invalid",
       );
-      expect(await list({ cursor: filtered.nextCursor })).toMatchObject({
-        ok: false,
-        error: { details: { type: "artifact_cursor_invalid" } },
-      });
-      expect(await list({ cursor: all.nextCursor, messageRole: "assistant" })).toMatchObject({
-        ok: false,
-        error: { details: { type: "artifact_cursor_invalid" } },
-      });
       const remaining = page(await list({ cursor: filtered.nextCursor, messageRole: "assistant" }));
-      expect(remaining.artifacts.map((artifact) => artifact.image?.url)).toEqual(
-        urls.slice(0, 2).toReversed(),
-      );
+      expect(imageUrls(remaining)).toEqual(urls.slice(0, 2).toReversed());
       expect(remaining.nextCursor).toBeUndefined();
     });
   });
 
   it("pages newest images within one message and includes Markdown local images without reading files", async () => {
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
-      await captureRuntimeConfigAsyncReader()();
-      await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+    await withImages(async () => {
       await append([{ type: "image", data: "aGVsbG8=", mimeType: "image/png", alt: "inline" }]);
       await append(
         Array.from({ length: 5 }, (_, index) => ({
@@ -193,7 +210,7 @@ describe("bounded Activity image discovery", () => {
         "![Screenshot](/synthetic/nonexistent/screenshot.png)\n`![code](/private/code.png)`\n```md\n![fenced](/private/fenced.png)\n```",
       );
       const first = page(await list());
-      expect(first.artifacts.map((artifact) => artifact.image?.url)).toEqual([
+      expect(imageUrls(first)).toEqual([
         "/synthetic/nonexistent/screenshot.png",
         "https://images.example.test/4.png",
         "https://images.example.test/3.png",
@@ -202,7 +219,7 @@ describe("bounded Activity image discovery", () => {
       expect(first.artifacts[0]?.download.mode).toBe("unsupported");
       await append([{ type: "image", url: "https://images.example.test/new.png" }]);
       const second = page(await list({ cursor: first.nextCursor }));
-      expect(second.artifacts.map((artifact) => artifact.image?.url)).toEqual([
+      expect(imageUrls(second)).toEqual([
         "https://images.example.test/1.png",
         "https://images.example.test/0.png",
         "data:image/png;base64,aGVsbG8=",
@@ -224,63 +241,54 @@ describe("bounded Activity image discovery", () => {
   it.each(["sparse", "oversized"] as const)(
     "bounds a %s image scan and continues from its cursor",
     async (kind) => {
-      await withOpenClawTestState(
-        { scenario: "minimal", prepareProfileCatalog: true },
-        async () => {
-          await captureRuntimeConfigAsyncReader()();
-          await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-          const data =
-            kind === "oversized"
-              ? Buffer.alloc(1.5 * 1024 * 1024, 1).toString("base64")
-              : undefined;
-          await append([
-            data
-              ? { type: "image", data, mimeType: "image/png", title: "Screenshot" }
-              : { type: "image", url: "https://images.example.test/old.png" },
-          ]);
-          for (let index = 0; index < (data ? 2 : 40); index++) {
-            await append(`text-${index}`);
-          }
-          const first = page(await list());
-          expect(first.artifacts).toEqual([]);
-          expect(first.nextCursor).toEqual(expect.any(String));
-          const second = page(
-            await list({ cursor: expectDefined(first.nextCursor, "image cursor") }),
-          );
-          expect(second.artifacts).toHaveLength(1);
-          expect(await list({ limit: 5 })).toMatchObject({ ok: false });
-          expect(await list({ type: undefined, limit: 2 })).toMatchObject({ ok: false });
-          if (data) {
-            const image = expectDefined(second.artifacts[0], "inline image reference");
-            expect(image).toMatchObject({
-              id: expect.stringMatching(/^artifact_transcript_image_/),
-              type: "image",
-              title: "Screenshot",
-              mimeType: "image/png",
-              sizeBytes: 1.5 * 1024 * 1024,
-              source: "session-transcript",
-              download: { mode: "bytes" },
-            });
-            expect(image).not.toHaveProperty("image");
-            expect(second).not.toHaveProperty("omittedOversized");
-            expect(Buffer.byteLength(JSON.stringify(second))).toBeLessThan(2 * 1024);
-            expect(second.nextCursor).toBeUndefined();
-            expect(await invoke("artifacts.download", { artifactId: image.id })).toMatchObject({
-              ok: true,
-              payload: { encoding: "base64", data },
-            });
-          } else {
-            expect(second.artifacts[0]?.image?.url).toBe("https://images.example.test/old.png");
-          }
-        },
-      );
+      await withImages(async () => {
+        const data =
+          kind === "oversized" ? Buffer.alloc(1.5 * 1024 * 1024, 1).toString("base64") : undefined;
+        await append([
+          data
+            ? { type: "image", data, mimeType: "image/png", title: "Screenshot" }
+            : { type: "image", url: "https://images.example.test/old.png" },
+        ]);
+        for (let index = 0; index < (data ? 2 : 40); index++) {
+          await append(`text-${index}`);
+        }
+        const first = page(await list());
+        expect(first.artifacts).toEqual([]);
+        expect(first.nextCursor).toEqual(expect.any(String));
+        const second = page(
+          await list({ cursor: expectDefined(first.nextCursor, "image cursor") }),
+        );
+        expect(second.artifacts).toHaveLength(1);
+        expect(await list({ limit: 5 })).toMatchObject({ ok: false });
+        expect(await list({ type: undefined, limit: 2 })).toMatchObject({ ok: false });
+        if (data) {
+          const image = expectDefined(second.artifacts[0], "inline image reference");
+          expect(image).toMatchObject({
+            id: expect.stringMatching(/^artifact_transcript_image_/),
+            type: "image",
+            title: "Screenshot",
+            mimeType: "image/png",
+            sizeBytes: 1.5 * 1024 * 1024,
+            source: "session-transcript",
+            download: { mode: "bytes" },
+          });
+          expect(image).not.toHaveProperty("image");
+          expect(second).not.toHaveProperty("omittedOversized");
+          expect(Buffer.byteLength(JSON.stringify(second))).toBeLessThan(2 * 1024);
+          expect(second.nextCursor).toBeUndefined();
+          expect(await invoke("artifacts.download", { artifactId: image.id })).toMatchObject({
+            ok: true,
+            payload: { encoding: "base64", data },
+          });
+        } else {
+          expect(second.artifacts[0]?.image?.url).toBe("https://images.example.test/old.png");
+        }
+      });
     },
   );
 
   it("bounds inline previews for images without transcript download references", async () => {
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
-      await captureRuntimeConfigAsyncReader()();
-      await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+    await withImages(async () => {
       const url = "data:image/png;base64,aGVsbG8=";
       await append([
         { type: "image", url },
@@ -321,9 +329,7 @@ describe("bounded Activity image discovery", () => {
   });
 
   it("rejects copied, retargeted, and reset cursors while rechecking current session access", async () => {
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
-      await captureRuntimeConfigAsyncReader()();
-      await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+    await withImages(async () => {
       await append(
         Array.from({ length: 6 }, (_, index) => ({
           type: "image",
@@ -333,21 +339,19 @@ describe("bounded Activity image discovery", () => {
       const client = sharingPolicyClient({ user: "image-viewer", scopes: ["operator.read"] });
       const first = page(await list({}, client));
       const cursor = expectDefined(first.nextCursor, "image cursor");
-      expect(
+      expectArtifactError(
         await list(
           { cursor },
           sharingPolicyClient({ user: "image-viewer", scopes: ["operator.read"] }),
         ),
-      ).toMatchObject({
-        ok: false,
-        error: { details: { type: "artifact_cursor_invalid" } },
-      });
+        "artifact_cursor_invalid",
+      );
       const other = { ...scope, sessionKey: "agent:main:other-images", sessionId: "other-images" };
       await upsertSessionEntryCore(other, { sessionId: other.sessionId, updatedAt: 1 });
-      expect(await list({ cursor, sessionKey: other.sessionKey }, client)).toMatchObject({
-        ok: false,
-        error: { details: { type: "artifact_cursor_invalid" } },
-      });
+      expectArtifactError(
+        await list({ cursor, sessionKey: other.sessionKey }, client),
+        "artifact_cursor_invalid",
+      );
       await upsertSessionEntryCore(scope, {
         sessionId: scope.sessionId,
         updatedAt: 2,
@@ -364,10 +368,7 @@ describe("bounded Activity image discovery", () => {
         id: "reset-image-window",
         timestamp: new Date().toISOString(),
       });
-      expect(await list({ cursor }, client)).toMatchObject({
-        ok: false,
-        error: { details: { type: "artifact_cursor_invalid" } },
-      });
+      expectArtifactError(await list({ cursor }, client), "artifact_cursor_invalid");
     });
   });
 });
@@ -393,16 +394,12 @@ it("keeps an admitted run on its stored main row when the public alias becomes g
         sessionKey: "agent:research:main",
         sessionId: "qualified-main-window",
       };
-      await upsertSessionEntryCore(stored, { sessionId: stored.sessionId, updatedAt: Date.now() });
-      await appendTranscriptMessage(stored, {
-        message: {
-          role: "assistant",
-          content: [
-            { type: "file", data: "aGVsbG8=", mimeType: "text/plain", title: "stored-main.txt" },
-          ],
-          __openclaw: { runId },
-        },
-      });
+      await seedMessage(
+        stored,
+        fileMessage("stored-main.txt", "aGVsbG8=", runId),
+        undefined,
+        Date.now(),
+      );
       const admitted = expectDefined(
         await prepareAgentSession({
           cfg: initial,
@@ -431,18 +428,7 @@ it("keeps an admitted run on its stored main row when the public alias becomes g
         const current = materialize(globalSource);
         setRuntimeConfigSnapshot(current, globalSource);
         const global = { agentId: "research", sessionKey: "global", sessionId: "global-window" };
-        await upsertSessionEntryCore(global, {
-          sessionId: global.sessionId,
-          updatedAt: Date.now(),
-        });
-        await appendTranscriptMessage(global, {
-          message: {
-            role: "assistant",
-            content: [
-              { type: "file", data: "Z2xvYmFs", mimeType: "text/plain", title: "global.txt" },
-            ],
-          },
-        });
+        await seedMessage(global, fileMessage("global.txt", "Z2xvYmFs"), undefined, Date.now());
         const context = createDirectChatContext({ getRuntimeConfig: () => current });
         const client = sharingPolicyClient({ user: "artifact-viewer", scopes: ["operator.read"] });
         const aliased = await invoke(
@@ -509,64 +495,31 @@ describe("artifact run ownership", () => {
           agentId: "research",
           sessionKey: "global",
           sessionId: "research-raw-global",
+          runId: rawRunId,
+          title: "raw-global.txt",
         };
         const literal = {
           agentId: "research",
           sessionKey: "agent:research:global",
           sessionId: "research-literal-global",
+          runId: literalRunId,
+          title: "literal-qualified-global.txt",
         };
-        for (const [target, title, runId] of [
-          [raw, "raw-global.txt", rawRunId],
-          [literal, "literal-qualified-global.txt", literalRunId],
-        ] as const) {
-          await upsertSessionEntryCore(target, { sessionId: target.sessionId, updatedAt: 1 });
-          await appendTranscriptMessage(target, {
-            message: {
-              role: "assistant",
-              content: [{ type: "file", data: "aGVsbG8=", mimeType: "text/plain", title }],
-              __openclaw: { runId },
-            },
-          });
+        for (const target of [raw, literal]) {
+          await seedMessage(target, fileMessage(target.title, "aGVsbG8=", target.runId));
         }
         registerAgentRunContext(rawRunId, raw);
         registerAgentRunContext(literalRunId, literal);
         try {
           const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
           const outcomes = [];
-          for (const { name, params, title, sessionKey, runId, control } of [
-            {
-              name: "explicit raw run owner",
-              params: { runId: rawRunId, agentId: "research" },
-              title: "raw-global.txt",
-              sessionKey: raw.sessionKey,
-              runId: rawRunId,
-              control: true,
-            },
-            {
-              name: "literal qualified namespace",
-              params: { sessionKey: literal.sessionKey, agentId: "research" },
-              title: "literal-qualified-global.txt",
-              sessionKey: literal.sessionKey,
-              runId: literalRunId,
-              control: true,
-            },
-            {
-              name: "implicit raw run owner",
-              params: { runId: rawRunId },
-              title: "raw-global.txt",
-              sessionKey: raw.sessionKey,
-              runId: rawRunId,
-              control: false,
-            },
-            {
-              name: "explicit literal run namespace",
-              params: { runId: literalRunId, agentId: "research" },
-              title: "literal-qualified-global.txt",
-              sessionKey: literal.sessionKey,
-              runId: literalRunId,
-              control: false,
-            },
-          ]) {
+          for (const [params, target, control] of [
+            [{ runId: rawRunId, agentId: "research" }, raw, true],
+            [{ sessionKey: literal.sessionKey, agentId: "research" }, literal, true],
+            [{ runId: rawRunId }, raw, false],
+            [{ runId: literalRunId, agentId: "research" }, literal, false],
+          ] as const) {
+            const name = JSON.stringify(params);
             const response = await invoke(
               "artifacts.list",
               { sessionKey: undefined, ...params },
@@ -575,7 +528,11 @@ describe("artifact run ownership", () => {
             );
             const expected = {
               ok: true,
-              payload: { artifacts: [{ title, sessionKey, runId }] },
+              payload: {
+                artifacts: [
+                  { title: target.title, sessionKey: target.sessionKey, runId: target.runId },
+                ],
+              },
             };
             if (control) {
               expect(response, name).toMatchObject(expected);
@@ -602,28 +559,13 @@ describe("persisted chat image artifact recovery", () => {
     sessionId: "computer-images",
   };
 
-  async function invokeTranscriptArtifact(
+  function invokeTranscriptArtifact(
     method: "chat.history" | "artifacts.get" | "artifacts.download",
     params: Record<string, unknown>,
     client: GatewayClient | null = null,
     context?: GatewayRequestContext,
   ) {
-    const handler: GatewayRequestHandler = expectDefined(
-      method === "chat.history" ? chatHistoryHandlers[method] : artifactsHandlers[method],
-      "RPC handler",
-    );
-    let result: { ok: boolean; payload?: unknown; error?: unknown } | undefined;
-    await handler({
-      params: { sessionKey: transcriptScope.sessionKey, ...params },
-      context: context ?? createDirectChatContext(),
-      req: { type: "req", id: method, method },
-      client,
-      isWebchatConnect: () => false,
-      respond: (ok, payload, error) => {
-        result = { ok, payload, error };
-      },
-    });
-    return expectDefined(result, "RPC response");
+    return invoke(method, params, client, context, transcriptScope.sessionKey);
   }
 
   function imageIds(message: unknown): string[] {
@@ -642,6 +584,21 @@ describe("persisted chat image artifact recovery", () => {
           return [String(image.artifactId)];
         })
       : [];
+  }
+
+  async function imageReference(target: typeof scope, messageId: string) {
+    const { message } = await transcriptReaders.readSessionMessageByIdAsync(target, messageId);
+    return expectDefined(
+      imageIds(projectChatDisplayMessage(message))[0],
+      "projected image reference",
+    );
+  }
+
+  async function expectDownload(artifactId: string, data: string) {
+    expect(await invokeTranscriptArtifact("artifacts.download", { artifactId })).toMatchObject({
+      ok: true,
+      payload: { encoding: "base64", data },
+    });
   }
 
   it("recovers each visible legacy image when transcript rows reuse a message id", async () => {
@@ -675,12 +632,7 @@ describe("persisted chat image artifact recovery", () => {
       const reads = observeSqliteReadSql(StatementSync.prototype);
       try {
         for (const [index, artifactId] of ids.entries()) {
-          expect(
-            await invokeTranscriptArtifact("artifacts.download", { artifactId }),
-          ).toMatchObject({
-            ok: true,
-            payload: { encoding: "base64", data: images[index] },
-          });
+          await expectDownload(artifactId, expectDefined(images[index], "legacy image bytes"));
         }
         expect(reads.queries.filter((sql) => /\btranscript_events\b/i.test(sql))).toEqual([]);
       } finally {
@@ -692,15 +644,9 @@ describe("persisted chat image artifact recovery", () => {
   it("downloads the exact image bytes referenced by history and committed live messages", async () => {
     await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
       await captureRuntimeConfigAsyncReader()();
-      await upsertSessionEntryCore(transcriptScope, {
-        sessionId: transcriptScope.sessionId,
-        updatedAt: 1,
-      });
-      await appendTranscriptMessage(transcriptScope, {
-        message: {
-          role: "assistant",
-          content: [{ type: "image", data: "b2xk", mimeType: "image/png" }],
-        },
+      await seedMessage(transcriptScope, {
+        role: "assistant",
+        content: [{ type: "image", data: "b2xk", mimeType: "image/png" }],
       });
       const images = [Buffer.alloc(300 * 1024, 1).toString("base64"), "c2Vjb25k"];
       const message = {
@@ -752,16 +698,14 @@ describe("persisted chat image artifact recovery", () => {
           ok: true,
           payload: { artifact: { id: artifactId, type: "image", download: { mode: "bytes" } } },
         });
-        expect(await invokeTranscriptArtifact("artifacts.download", { artifactId })).toMatchObject({
-          ok: true,
-          payload: { encoding: "base64", data: images[index] },
-        });
-        expect(
+        await expectDownload(artifactId, expectDefined(images[index], "image bytes"));
+        expectArtifactError(
           await invokeTranscriptArtifact("artifacts.download", {
             artifactId,
             messageRole: "assistant",
           }),
-        ).toMatchObject({ ok: false, error: { details: { type: "artifact_not_found" } } });
+          "artifact_not_found",
+        );
       }
       // An uncommitted tool event has no transcript identity to authorize a later fetch.
       expect(projectChatDisplayMessage(message)).not.toHaveProperty("content.2.artifactId");
@@ -775,47 +719,28 @@ describe("persisted chat image artifact recovery", () => {
         role: "assistant",
         content: [{ type: "image", data: "b3JpZ2luYWw=", mimeType: "image/png" }],
       };
-      await upsertSessionEntryCore(transcriptScope, {
-        sessionId: transcriptScope.sessionId,
-        updatedAt: 1,
-      });
-      await appendTranscriptMessage(transcriptScope, { eventId: "shared-message-id", message });
-      const original = await transcriptReaders.readSessionMessageByIdAsync(
-        transcriptScope,
-        "shared-message-id",
-      );
-      const artifactId = expectDefined(
-        imageIds(projectChatDisplayMessage(original.message))[0],
-        "projected image reference",
-      );
+      await seedMessage(transcriptScope, message, "shared-message-id");
+      const artifactId = await imageReference(transcriptScope, "shared-message-id");
       const other = {
         ...transcriptScope,
         sessionKey: "agent:main:other-images",
         sessionId: "other-images",
       };
-      await upsertSessionEntryCore(other, { sessionId: other.sessionId, updatedAt: 1 });
-      await appendTranscriptMessage(other, { eventId: "shared-message-id", message });
-      expect(
+      await seedMessage(other, message, "shared-message-id");
+      expectArtifactError(
         await invokeTranscriptArtifact("artifacts.download", {
           sessionKey: other.sessionKey,
           artifactId,
         }),
-      ).toMatchObject({ ok: false, error: { details: { type: "artifact_not_found" } } });
+        "artifact_not_found",
+      );
       const replacement = { ...transcriptScope, sessionId: "replacement-images" };
-      await upsertSessionEntryCore(replacement, { sessionId: replacement.sessionId, updatedAt: 2 });
-      await appendTranscriptMessage(replacement, { eventId: "shared-message-id", message });
-      expect(await invokeTranscriptArtifact("artifacts.download", { artifactId })).toMatchObject({
-        ok: false,
-        error: { details: { type: "artifact_not_found" } },
-      });
-      const current = await transcriptReaders.readSessionMessageByIdAsync(
-        replacement,
-        "shared-message-id",
+      await seedMessage(replacement, message, "shared-message-id", 2);
+      expectArtifactError(
+        await invokeTranscriptArtifact("artifacts.download", { artifactId }),
+        "artifact_not_found",
       );
-      const currentId = expectDefined(
-        imageIds(projectChatDisplayMessage(current.message))[0],
-        "replacement reference",
-      );
+      const currentId = await imageReference(replacement, "shared-message-id");
       expect(currentId).not.toBe(artifactId);
       expect(
         await invokeTranscriptArtifact("artifacts.download", { artifactId: currentId }),
@@ -850,14 +775,7 @@ describe("persisted chat image artifact recovery", () => {
           content: [{ type: "image", data: "cHJpdmF0ZQ==", mimeType: "image/png" }],
         },
       });
-      const stored = await transcriptReaders.readSessionMessageByIdAsync(
-        transcriptScope,
-        appended.messageId,
-      );
-      const artifactId = expectDefined(
-        imageIds(projectChatDisplayMessage(stored.message))[0],
-        "shared reference",
-      );
+      const artifactId = await imageReference(transcriptScope, appended.messageId);
       const client = sharingPolicyClient({ user: viewer.id, scopes: ["operator.read"] });
       expect(
         await invokeTranscriptArtifact("artifacts.download", { artifactId }, client, context),

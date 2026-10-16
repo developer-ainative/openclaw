@@ -22,9 +22,16 @@ import { auditHandlers } from "./audit.js";
 const tempDirs: string[] = [];
 
 function createDatabaseOptions(): OpenClawStateDatabaseOptions {
-  return { env: { OPENCLAW_STATE_DIR: makeTempDir(tempDirs, "openclaw-audit-trim-") } };
+  const stateDir = makeTempDir(tempDirs, "openclaw-audit-trim-");
+  process.env.OPENCLAW_STATE_DIR = stateDir;
+  return { env: { OPENCLAW_STATE_DIR: stateDir } };
 }
 
+async function callAudit(method: keyof typeof auditHandlers, params: object) {
+  const respond = vi.fn();
+  await expectDefined(auditHandlers[method], "audit handler")({ params, respond } as never);
+  return respond;
+}
 afterEach(async () => {
   await closeOpenClawStateDatabaseAsync();
   vi.restoreAllMocks();
@@ -41,7 +48,6 @@ describe("audit methods against a real audit store", () => {
     "inspects retained execution identity without host SQLite (writable actor: %s)",
     async (warmActor) => {
       const database = createDatabaseOptions();
-      process.env.OPENCLAW_STATE_DIR = database.env!.OPENCLAW_STATE_DIR;
       const clear = configureExecutionIdentityAdmissionSink((work) => {
         processExecutionIdentityAdmissionWorkInDatabase(work, {
           ...database,
@@ -70,14 +76,10 @@ describe("audit methods against a real audit store", () => {
       }
       requireNodeSqlite();
       const counters = observeMainThreadSql({ includeClose: true });
-      const respond = vi.fn();
-      await expectDefined(
-        auditHandlers["audit.run.inspect"],
-        "audit inspection handler",
-      )({
-        params: { executionId: "inspection-execution", decisionLimit: 1 },
-        respond,
-      } as never);
+      const respond = await callAudit("audit.run.inspect", {
+        executionId: "inspection-execution",
+        decisionLimit: 1,
+      });
       expect(respond).toHaveBeenCalledWith(
         true,
         expect.objectContaining({
@@ -98,15 +100,7 @@ describe("audit methods against a real audit store", () => {
     async (params) => {
       const database = createDatabaseOptions();
       const stateDir = expectDefined(database.env?.OPENCLAW_STATE_DIR, "temp state dir");
-      process.env.OPENCLAW_STATE_DIR = stateDir;
-      const respond = vi.fn();
-      await expectDefined(
-        auditHandlers["audit.run.inspect"],
-        "audit inspection handler",
-      )({
-        params,
-        respond,
-      } as never);
+      const respond = await callAudit("audit.run.inspect", params);
       expect(respond).toHaveBeenCalledWith(
         true,
         expect.objectContaining({
@@ -122,9 +116,6 @@ describe("audit methods against a real audit store", () => {
     "%s returns padded filters without host SQLite",
     async (method) => {
       const database = createDatabaseOptions();
-      const stateDir = expectDefined(database.env?.OPENCLAW_STATE_DIR, "temp state dir");
-      process.env.OPENCLAW_STATE_DIR = stateDir;
-
       const input = {
         sourceId: "audit-trim-run-source",
         occurredAt: Date.now(),
@@ -164,19 +155,12 @@ describe("audit methods against a real audit store", () => {
       await closeOpenClawStateDatabaseAsync();
       requireNodeSqlite();
       const counters = observeMainThreadSql();
-      const respond = vi.fn();
-      await expectDefined(
-        auditHandlers[method],
-        "audit.list handler",
-      )({
-        params: {
-          limit: 1,
-          agentId: " main ",
-          sessionKey: " agent:main:main ",
-          runId: " run-trim-1 ",
-        },
-        respond,
-      } as never);
+      const respond = await callAudit(method, {
+        limit: 1,
+        agentId: " main ",
+        sessionKey: " agent:main:main ",
+        runId: " run-trim-1 ",
+      });
 
       counters.expectIdle();
       expect(respond).toHaveBeenCalledWith(
@@ -192,15 +176,8 @@ describe("audit methods against a real audit store", () => {
           ],
         }),
       );
-      respond.mockClear();
-      await expectDefined(
-        auditHandlers[method],
-        "audit list handler",
-      )({
-        params: { limit: 1, cursor: String(finished?.sequence) },
-        respond,
-      } as never);
-      expect(respond).toHaveBeenCalledWith(true, {
+      const next = await callAudit(method, { limit: 1, cursor: String(finished?.sequence) });
+      expect(next).toHaveBeenCalledWith(true, {
         events: [expect.objectContaining({ action: "agent.run.started" })],
       });
       counters.expectIdle();
