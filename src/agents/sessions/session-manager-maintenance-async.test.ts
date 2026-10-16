@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
@@ -52,21 +53,52 @@ async function appendUser(manager: SessionManager, text: string): Promise<string
   return (await manager.appendMessageWithTranscriptAnchorAsync(makeUserMessage(text, 1))).entryId;
 }
 
+async function prepareUserRewrite(manager: SessionManager, text = "replacement") {
+  const rewrite = await manager.prepareTranscriptRewriteAsync();
+  await rewrite.sessionManager.resetLeafAsync();
+  const replacementId = await appendUser(rewrite.sessionManager, text);
+  return { ...rewrite, replacementId };
+}
+
+function afterWorkerCommand(type: string, after: () => void | Promise<void>) {
+  const original = metadataRuntime.withSessionMetadataWorker;
+  const intercept: typeof original = (options, database, assertCurrent, operation, controls) =>
+    original(
+      options,
+      database,
+      assertCurrent,
+      (worker) =>
+        operation({
+          execute: async (command, commandOptions) => {
+            const result = await worker.execute(command, commandOptions);
+            if (command.type === type) {
+              const pending = after();
+              if (pending) {
+                await pending;
+              }
+            }
+            return result;
+          },
+        }),
+      controls,
+    );
+  return intercept;
+}
+
 it("shares admitted immutable payloads when preparing and publishing a rewrite", async () => {
   const manager = SessionManager.inMemory("/synthetic");
   const id = await manager.appendCustomEntryAsync("large-tool-output", {
     chunks: Array.from({ length: 1024 }, () => ({ text: "x".repeat(1024) })),
   });
   const original = manager.getEntry(id);
-  if (original?.type !== "custom" || !isRecord(original.data)) {
-    throw new Error("Missing large transcript payload");
-  }
+  assert(
+    original?.type === "custom" && isRecord(original.data),
+    "Missing large transcript payload",
+  );
   const rewrite = await manager.prepareTranscriptRewriteAsync();
   expect(rewrite.sessionManager.getEntry(id)).not.toBe(original);
   const prepared = rewrite.sessionManager.getEntry(id);
-  if (prepared?.type !== "custom") {
-    throw new Error("Missing prepared transcript payload");
-  }
+  assert(prepared?.type === "custom", "Missing prepared transcript payload");
   expect(prepared.data).toBe(original.data);
   expect(Object.isFrozen(original.data)).toBe(true);
   expect(Reflect.set(original.data, "chunks", [])).toBe(false);
@@ -74,9 +106,7 @@ it("shares admitted immutable payloads when preparing and publishing a rewrite",
   expect(manager.getEntry(replacementId)).toBeUndefined();
   await rewrite.commit(new Map());
   const published = manager.getEntry(id);
-  if (published?.type !== "custom") {
-    throw new Error("Missing published transcript payload");
-  }
+  assert(published?.type === "custom", "Missing published transcript payload");
   expect(published.data).toBe(original.data);
   expect(manager.getEntry(replacementId)).toMatchObject({
     appendMode: "side",
@@ -101,20 +131,14 @@ it.each([false, true])("isolates rewrite payloads with opaque SDK data: %s", asy
   ]);
   const rewrite = await manager.prepareTranscriptRewriteAsync();
   const entry = rewrite.sessionManager.getEntry("data");
-  if (entry?.type !== "custom" || !isRecord(entry.data)) {
-    throw new Error("Missing custom entry");
-  }
+  assert(entry?.type === "custom" && isRecord(entry.data), "Missing custom entry");
   const record = rewrite.sessionManager
     .getPersistedEntries()
     .find((value) => isRecord(value) && value.type === "opaque");
-  if (!isRecord(record)) {
-    throw new Error("Missing opaque record");
-  }
+  assert(isRecord(record), "Missing opaque record");
   expect(record.shared).toBe(entry.data);
   if (opaque) {
-    if (!(record.bytes instanceof Uint8Array)) {
-      throw new Error("Missing opaque bytes");
-    }
+    assert(record.bytes instanceof Uint8Array, "Missing opaque bytes");
     expect(record.bytes.buffer).toBe(record.buffer);
     expect(record.buffer).not.toBe(buffer);
   }
@@ -138,18 +162,20 @@ it("preserves opaque SDK aliases into an admitted payload during a rewrite", asy
   const opaque = manager
     .getPersistedEntries()
     .find((entry) => isRecord(entry) && entry.type === "opaque");
-  if (owned?.type !== "custom" || !isRecord(owned.data) || !isRecord(opaque)) {
-    throw new Error("Missing alias fixture");
-  }
+  assert(
+    owned?.type === "custom" && isRecord(owned.data) && isRecord(opaque),
+    "Missing alias fixture",
+  );
   opaque.alias = owned.data.child;
   const rewrite = await manager.prepareTranscriptRewriteAsync();
   const prepared = rewrite.sessionManager.getEntry(id);
   const preparedOpaque = rewrite.sessionManager
     .getPersistedEntries()
     .find((entry) => isRecord(entry) && entry.type === "opaque");
-  if (prepared?.type !== "custom" || !isRecord(prepared.data) || !isRecord(preparedOpaque)) {
-    throw new Error("Missing prepared aliases");
-  }
+  assert(
+    prepared?.type === "custom" && isRecord(prepared.data) && isRecord(preparedOpaque),
+    "Missing prepared aliases",
+  );
   expect(preparedOpaque.alias).toBe(prepared.data.child);
   expect(prepared.data).toBe(owned.data);
 });
@@ -191,30 +217,6 @@ it.each(["read", "receipt"] as const)(
     });
     const before = await loadTranscriptEvents(scope);
     const prepareHydration = transcriptHydration.prepareSessionTranscriptHydration;
-    const withWorker = metadataRuntime.withSessionMetadataWorker;
-    const delayedReceipt: typeof withWorker = (
-      options,
-      database,
-      assertCurrent,
-      operation,
-      controls,
-    ) =>
-      withWorker(
-        options,
-        database,
-        assertCurrent,
-        (worker) =>
-          operation({
-            execute: async (command, commandOptions) => {
-              const result = await worker.execute(command, commandOptions);
-              if (command.type === "session.transcript.replaceSuffix") {
-                manager.resetLeaf();
-              }
-              return result;
-            },
-          }),
-        controls,
-      );
     const interception =
       boundary === "read"
         ? vi
@@ -230,7 +232,11 @@ it.each(["read", "receipt"] as const)(
                 },
               };
             })
-        : vi.spyOn(metadataRuntime, "withSessionMetadataWorker").mockImplementation(delayedReceipt);
+        : vi
+            .spyOn(metadataRuntime, "withSessionMetadataWorker")
+            .mockImplementation(
+              afterWorkerCommand("session.transcript.replaceSuffix", () => manager.resetLeaf()),
+            );
     let failure: unknown;
     try {
       await manager.removeTrailingEntriesAsync((entry) => entry.id === removed);
@@ -269,37 +275,41 @@ it.each(["same", "independent"] as const)(
       content: [{ type: "text", text: "original" }],
       timestamp: 1,
     });
-    if (!sourceId) {
-      throw new Error("Missing source message ID");
-    }
+    assert(sourceId, "Missing source message ID");
     await manager.reloadPersistedTranscriptAsync();
     const source = manager.getEntry(sourceId);
-    if (source?.type !== "message" || source.message.role !== "user") {
-      throw new Error("Missing hydrated source message");
-    }
+    assert(
+      source?.type === "message" && source.message.role === "user",
+      "Missing hydrated source message",
+    );
     expect(Object.isFrozen(source.message.content)).toBe(false);
     vi.spyOn(manager, "prepareTranscriptRewrite").mockImplementation(() => {
       throw new Error("sync compatibility adapter used");
     });
     const rewrite = await manager.prepareTranscriptRewriteAsync();
     const snapshot = rewrite.sessionManager.getEntry(sourceId);
-    if (snapshot?.type !== "message" || snapshot.message.role !== "user") {
-      throw new Error("Missing rewrite source message");
-    }
+    assert(
+      snapshot?.type === "message" && snapshot.message.role === "user",
+      "Missing rewrite source message",
+    );
     expect(snapshot).not.toBe(source);
     expect(snapshot.message).not.toBe(source.message);
     expect(snapshot.message.content).not.toBe(source.message.content);
     source.message.content = "local replacement";
     expect(snapshot.message.content).toEqual([{ type: "text", text: "original" }]);
     await rewrite.sessionManager.resetLeafAsync();
-    const replacementId = await appendUser(rewrite.sessionManager, "replacement");
+    const replacementText = "pass: opaque-pass-secret-1234567890";
+    const replacementId = await appendUser(rewrite.sessionManager, replacementText);
     await rewrite.commit(new Map([[sourceId, replacementId]]));
     expect(manager.getLeafId()).toBe(replacementId);
-    expect((await SessionManager.openAsync(scope)).getBranch()).toEqual(manager.getBranch());
+    expect(manager.getEntry(replacementId)).toMatchObject({
+      message: { content: replacementText },
+    });
+    const committed = await SessionManager.openAsync(scope);
+    expect(committed.getBranch()).toEqual(manager.getBranch());
+    expect(committed.getEntry(replacementId)).toEqual(manager.getEntry(replacementId));
 
-    const stale = await manager.prepareTranscriptRewriteAsync();
-    await stale.sessionManager.resetLeafAsync();
-    const staleId = await appendUser(stale.sessionManager, "stale");
+    const { replacementId: staleId, ...stale } = await prepareUserRewrite(manager, "stale");
     const writer = writerKind === "same" ? manager : await SessionManager.openAsync(scope);
     const laterId = await writer.appendCustomEntryAsync("later", {});
     await expect(stale.commit(new Map([[replacementId, staleId]]))).rejects.toThrow(
@@ -315,12 +325,8 @@ it.each(["same", "independent"] as const)(
 it("preserves a steer acknowledgment committed after rewrite preparation", async () => {
   const { scope, manager } = await openSession();
   const source = await manager.appendMessageWithTranscriptAnchorAsync(makeUserMessage("steer", 1));
-  if (!source.anchor) {
-    throw new Error("Persisted user message must have a transcript anchor");
-  }
-  const rewrite = await manager.prepareTranscriptRewriteAsync();
-  await rewrite.sessionManager.resetLeafAsync();
-  const replacementId = await appendUser(rewrite.sessionManager, "replacement");
+  assert(source.anchor, "Persisted user message must have a transcript anchor");
+  const { replacementId, ...rewrite } = await prepareUserRewrite(manager);
   const acknowledged = await rewritePreparedTranscriptMessageAtAnchor(source.anchor, () => ({
     ...source.message,
     __openclaw: { steerTargetRunId: "steered-run" },
@@ -340,37 +346,13 @@ it("adopts only the submitted rewrite snapshot when the prepared manager changes
   const { scope, manager } = await openSession();
   const sourceId = await appendUser(manager, "original");
   await manager.appendLabelChangeAsync(sourceId, "retained label");
-  const rewrite = await manager.prepareTranscriptRewriteAsync();
-  await rewrite.sessionManager.resetLeafAsync();
-  const replacementId = await appendUser(rewrite.sessionManager, "replacement");
-  const withWorker = metadataRuntime.withSessionMetadataWorker;
+  const { replacementId, ...rewrite } = await prepareUserRewrite(manager);
   let laterPreparedId: string | undefined;
-  const mutateAfterCommit: typeof withWorker = (
-    options,
-    database,
-    assertCurrent,
-    operation,
-    controls,
-  ) =>
-    withWorker(
-      options,
-      database,
-      assertCurrent,
-      (worker) =>
-        operation({
-          execute: async (command, commandOptions) => {
-            const result = await worker.execute(command, commandOptions);
-            if (command.type === "session.transcript.rewrite") {
-              laterPreparedId = await appendUser(rewrite.sessionManager, "uncommitted later edit");
-            }
-            return result;
-          },
-        }),
-      controls,
-    );
-  const observer = vi
-    .spyOn(metadataRuntime, "withSessionMetadataWorker")
-    .mockImplementation(mutateAfterCommit);
+  const observer = vi.spyOn(metadataRuntime, "withSessionMetadataWorker").mockImplementation(
+    afterWorkerCommand("session.transcript.rewrite", async () => {
+      laterPreparedId = await appendUser(rewrite.sessionManager, "uncommitted later edit");
+    }),
+  );
   try {
     await rewrite.commit(new Map([[sourceId, replacementId]]));
   } finally {
@@ -505,21 +487,4 @@ it("preserves a committed branch and a later target rebinding", async () => {
   expect(manager.buildSessionContext().messages).toEqual([]);
   const reopened = await SessionManager.openAsync({ ...scope, sessionId: committed!.sessionId });
   expect(reopened.getLeafId()).toBe(selected);
-});
-
-it("preserves source rewrite bytes through the worker commit", async () => {
-  const { scope, manager } = await openSession();
-  const sourceId = await appendUser(manager, "original");
-  const rewrite = await manager.prepareTranscriptRewriteAsync();
-  await rewrite.sessionManager.resetLeafAsync();
-  const replacementId = await appendUser(
-    rewrite.sessionManager,
-    "pass: opaque-pass-secret-1234567890",
-  );
-  await rewrite.commit(new Map([[sourceId, replacementId]]));
-  expect(manager.getEntry(replacementId)).toMatchObject({
-    message: { content: "pass: opaque-pass-secret-1234567890" },
-  });
-  const reopened = await SessionManager.openAsync(scope);
-  expect(reopened.getEntry(replacementId)).toEqual(manager.getEntry(replacementId));
 });

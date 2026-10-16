@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeUserMessage } from "../../../test/helpers/user-message.js";
 import { memorySessionActorOwners } from "../../config/sessions/session-actor-memory-owner.js";
@@ -52,9 +53,7 @@ async function fixture(name: string, create = true) {
     { database: owner.identity, sessionKey: target.sessionKey },
     lifetime,
   );
-  if (!actor.storage) {
-    throw new Error("Memory actor has no storage capability");
-  }
+  assert(actor.storage, "Memory actor has no storage capability");
   if (create) {
     const created = await actor.storage.mutate(
       {
@@ -84,9 +83,7 @@ describe("SessionManager selected memory actor", () => {
     const [firstId, secondId] = await Promise.all(
       messages.map((message) => manager.appendMessageAsync(message)),
     );
-    if (!firstId || !secondId) {
-      throw new Error("Missing fixture message entries");
-    }
+    assert(firstId && secondId, "Missing fixture message entries");
     expect(
       manager
         .getBranch()
@@ -125,9 +122,7 @@ describe("SessionManager selected memory actor", () => {
     const { target, run, storage } = await fixture("branch");
     const manager = await run(() => SessionManager.openAsync(target));
     const first = await manager.appendMessageAsync(makeUserMessage("retained", 1));
-    if (!first) {
-      throw new Error("Missing fixture branch entry");
-    }
+    assert(first, "Missing fixture branch entry");
     await manager.appendMessageAsync(makeUserMessage("omitted", 2));
     await manager.createBranchedSession(first);
     const nextTarget = manager.getSessionTarget()!;
@@ -196,9 +191,7 @@ describe("SessionManager selected memory actor", () => {
     const terminal = await manager.appendMessageWithTranscriptAnchorAsync(
       makeAgentAssistantMessage({ content: [{ type: "text", text: "completed answer" }] }),
     );
-    if (!terminal.anchor) {
-      throw new Error("Missing completed-turn anchor");
-    }
+    assert(terminal.anchor, "Missing completed-turn anchor");
     const expected = manager.buildSessionContext();
     await manager.appendMessageAsync(makeUserMessage("later question", 2));
     const context = await run(() =>
@@ -229,9 +222,7 @@ describe("SessionManager selected memory actor", () => {
     finish.resolve();
     const entryId = await writing;
     await released;
-    if (!entryId) {
-      throw new Error("Missing accepted message entry");
-    }
+    assert(entryId, "Missing accepted message entry");
     expect(manager.getEntry(entryId)).toMatchObject({ message: { content: "accepted" } });
   });
 
@@ -313,9 +304,7 @@ describe("SessionManager selected memory actor", () => {
       expect(() => handle.assertReadable()).toThrow(/released/);
     }
     const id = await manager.appendMessageAsync(makeUserMessage("after caller release", 1));
-    if (!id) {
-      throw new Error("Missing message entry after caller release");
-    }
+    assert(id, "Missing message entry after caller release");
     expect(manager.getEntry(id)).toMatchObject({ message: { content: "after caller release" } });
     owner.close();
     await expect(
@@ -373,9 +362,7 @@ describe("SessionManager selected memory actor", () => {
     };
     const receipt = await run(() =>
       withSessionManagerWrite(manager, async (admission) => {
-        if (!admission) {
-          throw new Error("Missing write admission");
-        }
+        assert(admission, "Missing write admission");
         return receiveSessionManagerCommit("session.metadata.initialize", () =>
           withSessionMetadataWorker(
             admission.options,

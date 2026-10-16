@@ -1,7 +1,9 @@
+import assert from "node:assert/strict";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, expect, it } from "vitest";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { makeUserMessage } from "../../../test/helpers/user-message.js";
 import {
   appendTranscriptMessage,
   loadTranscriptEventsSync,
@@ -17,10 +19,25 @@ import {
 import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
 import { rewriteTranscriptEntriesInSessionManager } from "../embedded-agent-runner/transcript-rewrite.js";
-import { createZeroUsageFixture } from "../test-helpers/usage-fixtures.js";
+import { makeAgentAssistantMessage } from "../test-helpers/agent-message-fixtures.js";
+import { sessionScope } from "./session-manager-fixtures.test-support.js";
 import { SessionManager } from "./session-manager.js";
 
 const tempDirs = createTempDirTracker();
+
+async function openSession(label: string) {
+  const dir = tempDirs.make(`openclaw-${label}-`);
+  const scope = sessionScope(path.join(dir, "sessions.json"), label);
+  await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+  return { dir, scope, manager: SessionManager.open(scope, dir) };
+}
+
+function expectCanonicalView(manager: SessionManager, reopened: SessionManager) {
+  expect(reopened.getBoundaryCount()).toBe(1);
+  expect(manager.getBoundaryCount()).toBe(reopened.getBoundaryCount());
+  expect(manager.getBranch()).toEqual(reopened.getBranch());
+  expect(manager.buildSessionContext()).toEqual(reopened.buildSessionContext());
+}
 
 afterEach(async () => {
   // Reconcile workers can otherwise retain the shared state lock into later tests.
@@ -43,15 +60,7 @@ afterEach(async () => {
 });
 
 it("keeps deprecated sync rewrite publication ahead of synchronous commit observers", async () => {
-  const dir = tempDirs.make("openclaw-rewrite-observer-");
-  const scope = {
-    agentId: "main",
-    sessionId: "rewrite-observer",
-    sessionKey: "agent:main:rewrite-observer",
-    storePath: path.join(dir, "sessions.json"),
-  };
-  await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-  const manager = SessionManager.open(scope, dir);
+  const { scope, manager } = await openSession("rewrite-observer");
   const first = manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
   const tail = manager.appendMessage({ role: "user", content: "tail", timestamp: 2 });
   const database = openOpenClawAgentDatabase({
@@ -71,41 +80,24 @@ it("keeps deprecated sync rewrite publication ahead of synchronous commit observ
   );
   const rewrite = manager.prepareTranscriptRewrite();
   rewrite.sessionManager.resetLeaf();
-  const replacement = rewrite.sessionManager.appendMessage({
-    role: "user",
-    content: "replacement",
-    timestamp: 1,
-  });
-  const copiedTail = rewrite.sessionManager.appendMessage({
-    role: "user",
-    content: "tail",
-    timestamp: 2,
-  });
+  const replacement = rewrite.sessionManager.appendMessage(makeUserMessage("replacement", 1));
+  const copiedTail = rewrite.sessionManager.appendMessage(makeUserMessage("tail", 2));
   rewrite.commit(
     new Map([
       [first, replacement],
       [tail, copiedTail],
     ]),
   );
-  const expected = [
+  expect(manager.getBranch()).toMatchObject([
     { message: { content: "replacement" } },
     { message: { content: "tail" } },
     { message: { content: "observer" } },
-  ];
-  expect(manager.getBranch()).toMatchObject(expected);
+  ]);
   expect(SessionManager.open(scope).getBranch()).toEqual(manager.getBranch());
 });
 
 it("does not certify stale navigation with a post-commit replacement version", async () => {
-  const dir = tempDirs.make("openclaw-postcommit-rewrite-race-");
-  const scope = {
-    agentId: "main",
-    sessionId: "postcommit-race",
-    sessionKey: "agent:main:postcommit-race",
-    storePath: path.join(dir, "sessions.json"),
-  };
-  await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-  const manager = SessionManager.open(scope, dir);
+  const { scope, manager } = await openSession("postcommit-race");
   const first = manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
   const second = manager.appendMessage({ role: "user", content: "second", timestamp: 2 });
   const control = manager.appendLeafControl({
@@ -164,15 +156,7 @@ it("does not certify stale navigation with a post-commit replacement version", a
 it.each(["compaction", "reset"] as const)(
   "adopts canonical boundary counts and navigation after replaying %s",
   async (kind) => {
-    const dir = tempDirs.make("openclaw-bounded-rewrite-boundary-");
-    const scope = {
-      agentId: "main",
-      sessionId: "rewrite-boundary",
-      sessionKey: "agent:main:rewrite-boundary",
-      storePath: path.join(dir, "sessions.json"),
-    };
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    const full = SessionManager.open(scope, dir);
+    const { dir, scope, manager: full } = await openSession("rewrite-boundary");
     const first = full.appendMessage({ role: "user", content: "first", timestamp: 1 });
     full.appendMessage({ role: "user", content: "second", timestamp: 2 });
     if (kind === "reset") {
@@ -189,26 +173,14 @@ it.each(["compaction", "reset"] as const)(
         { entryId: first, message: { role: "user", content: "rewritten", timestamp: 1 } },
       ],
     });
-    const reopened = SessionManager.open(scope, dir);
-    expect(reopened.getBoundaryCount()).toBe(1);
-    expect(manager.getBoundaryCount()).toBe(reopened.getBoundaryCount());
-    expect(manager.getBranch()).toEqual(reopened.getBranch());
-    expect(manager.buildSessionContext()).toEqual(reopened.buildSessionContext());
+    expectCanonicalView(manager, SessionManager.open(scope, dir));
   },
 );
 
 it.each(["compaction", "reset"] as const)(
   "counts a stale bounded %s append exactly once after reload",
   async (kind) => {
-    const dir = tempDirs.make("openclaw-stale-boundary-count-");
-    const scope = {
-      agentId: "main",
-      sessionId: "stale-boundary-count",
-      sessionKey: "agent:main:stale-boundary-count",
-      storePath: path.join(dir, "sessions.json"),
-    };
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    const writer = SessionManager.open(scope, dir);
+    const { dir, scope, manager: writer } = await openSession("stale-boundary-count");
     const first = writer.appendMessage({ role: "user", content: "first", timestamp: 1 });
     const stale = SessionManager.openBounded(scope, { cwd: dir, maxEvents: 20, maxBytes: 4096 });
     expect(stale.getBoundaryCount()).toBe(0);
@@ -218,22 +190,16 @@ it.each(["compaction", "reset"] as const)(
     } else {
       stale.appendResetBoundary("reset", first);
     }
-    const reopened = SessionManager.openBounded(scope, { cwd: dir, maxEvents: 20, maxBytes: 4096 });
-    expect(reopened.getBoundaryCount()).toBe(1);
-    expect(stale.getBoundaryCount()).toBe(reopened.getBoundaryCount());
-    expect(stale.getBranch()).toEqual(reopened.getBranch());
-    expect(stale.buildSessionContext()).toEqual(reopened.buildSessionContext());
+    expectCanonicalView(
+      stale,
+      SessionManager.openBounded(scope, { cwd: dir, maxEvents: 20, maxBytes: 4096 }),
+    );
   },
 );
 
 it("appends an assistant without parsing transcript rows outside the bounded context", async () => {
   const dir = tempDirs.make("openclaw-session-manager-bounded-assistant-");
-  const scope = {
-    agentId: "main",
-    sessionId: "bounded-assistant-append",
-    sessionKey: "agent:main:bounded-assistant-append",
-    storePath: path.join(dir, "sessions.json"),
-  };
+  const scope = sessionScope(path.join(dir, "sessions.json"), "bounded-assistant-append");
   await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
   await appendTranscriptMessage(scope, {
     cwd: dir,
@@ -259,25 +225,22 @@ it("appends an assistant without parsing transcript rows outside the bounded con
     .prepare("SELECT seq FROM transcript_event_identities WHERE session_id = ? AND event_id = ?")
     .get(scope.sessionId, "excluded");
   const excludedSeq = excluded?.seq;
-  if (typeof excludedSeq !== "number") {
-    throw new Error("Missing excluded transcript message");
-  }
+  assert(typeof excludedSeq === "number", "Missing excluded transcript message");
   expect(manager.getEntry("excluded")).toBeUndefined();
   const poisoned = database.db
     .prepare("UPDATE transcript_events SET event_json = ? WHERE session_id = ? AND seq = ?")
     .run("{", scope.sessionId, excludedSeq);
   expect(poisoned.changes).toBe(1);
 
-  const assistantId = manager.appendMessage({
-    role: "assistant",
-    content: [{ type: "text", text: "bounded reply" }],
-    api: "messages",
-    provider: "anthropic",
-    model: "sonnet-4.6",
-    usage: createZeroUsageFixture(),
-    stopReason: "stop",
-    timestamp: Date.now(),
-  });
+  const assistantId = manager.appendMessage(
+    makeAgentAssistantMessage({
+      content: [{ type: "text", text: "bounded reply" }],
+      api: "messages",
+      provider: "anthropic",
+      model: "sonnet-4.6",
+      timestamp: Date.now(),
+    }),
+  );
 
   expect(manager.getEntry(assistantId)).toMatchObject({ parentId: "retained" });
   const stored = database.db
