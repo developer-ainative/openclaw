@@ -13,6 +13,7 @@ import {
   runInitialFallbackAttempt,
   createMockReplyOperation,
   expectMockCallArgFields,
+  expectRecordFields,
   createMinimalRunAgentTurnParams,
 } from "./agent-runner-execution.test-support.js";
 import type { FallbackRunnerParams } from "./agent-runner-execution.test-support.js";
@@ -277,7 +278,6 @@ describe("executeAgentTurn: primary probe routing", () => {
       },
     });
 
-    const executeAgentTurn = await getExecuteAgentTurnForTest();
     await executeAgentTurn({
       ...createMinimalRunAgentTurnParams({ followupRun }),
       sessionKey,
