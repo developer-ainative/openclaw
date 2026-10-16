@@ -512,25 +512,40 @@ export function resolveSqliteWriteAdmissionScope(
   };
 }
 
-/** Writers resolve physical ownership in the existing read worker inside exact-path admission. */
+/** Resolve custom physical ownership in the existing read worker. */
 export async function prepareSqliteScope(
   scope: SqliteScopeInput & { sessionKey: string },
-  writeOperation?: SqliteSessionWriteOperation,
 ): Promise<ResolvedSqliteScope> {
-  if (writeOperation && !isMainThread) {
-    return resolveSqliteScope(scope);
-  }
   const captured = {
     ...scope,
     env: captureSessionTranscriptStorageEnvironment(scope.env ?? process.env),
   };
-  const prepare = async () =>
-    resolveSqliteScope(captured, undefined, await prepareSqliteScopeTarget(captured));
-  // Reserve exact-path FIFO before worker-owned discovery; commit custody remains with the caller.
-  const admission = writeOperation ? resolveSqliteWriteAdmissionScope(captured) : undefined;
-  return admission && writeOperation
-    ? runExclusiveSqliteSessionWrite(admission, prepare, writeOperation)
-    : prepare();
+  return resolveSqliteScope(captured, undefined, await prepareSqliteScopeTarget(captured));
+}
+
+/** Canonical writers must enter their existing FIFO before the first asynchronous yield. */
+export function withPreparedSqliteScope<T>(
+  scope: SqliteScopeInput & { sessionKey: string },
+  run: (resolved: ResolvedSqliteScope) => T | Promise<T>,
+): T | Promise<T> {
+  const captured = {
+    ...scope,
+    env: captureSessionTranscriptStorageEnvironment(scope.env ?? process.env),
+  };
+  if (!isMainThread) {
+    return run(resolveSqliteScope(captured));
+  }
+  const { effectiveStorePath, explicitIncognito } = resolveSqliteDatabaseScopeIdentity(captured);
+  const target = effectiveStorePath
+    ? (explicitIncognito ?? resolveUnsuffixedSqliteTargetFromSessionStorePath(effectiveStorePath))
+    : undefined;
+  if (!effectiveStorePath || target?.agentId) {
+    return run(resolveSqliteScope(captured, undefined, target));
+  }
+  // Shared and custom locators need worker-owned discovery; the resolved writer owns admission.
+  return prepareSqliteScopeTarget(captured).then((prepared) =>
+    run(resolveSqliteScope(captured, undefined, prepared)),
+  );
 }
 
 async function prepareSqliteScopeTarget(scope: SqliteScopeInput, signal?: AbortSignal) {

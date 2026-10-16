@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { getEnvironmentData } from "node:worker_threads";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import type { AgentToolGatewayRequestCaller } from "../../agents/tools/in-process-gateway.js";
+import { createSessionsSearchTool } from "../../agents/tools/sessions-search-tool.js";
 import {
   setRuntimeConfigSnapshot,
   clearRuntimeConfigSnapshot,
@@ -20,6 +23,8 @@ import {
 } from "../../config/sessions/session-transcript-reconcile.js";
 import { searchSessionTranscripts } from "../../config/sessions/session-transcript-search.js";
 import type { SessionTranscriptSearchParams } from "../../config/sessions/session-transcript-search.types.js";
+import { requestContext } from "../../gateway/server-methods/sessions-read-cache.test-support.js";
+import { sessionReadHandlers } from "../../gateway/server-methods/sessions-read.js";
 import { appendSessionTranscriptMessagesByIdentity } from "../../plugin-sdk/session-transcript-runtime.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
@@ -136,6 +141,56 @@ describe.skipIf(!connection)("PostgreSQL session search product flow", () => {
     expect(capped.hits).toHaveLength(25);
     expect(capped.truncated).toBe(true);
     expect(capped.hits.every((hit) => hit.sessionKey.startsWith("agent:main:"))).toBe(true);
+
+    vi.stubEnv("OPENCLAW_STATE_DIR", root);
+    const config = {
+      agents: { entries: { main: {} } },
+      session: { store: scope("selected").storePath },
+    };
+    setRuntimeConfigSnapshot(config);
+    const context = requestContext(config);
+    const tool = createSessionsSearchTool({
+      config,
+      agentId: "main",
+      agentSessionKey: scope("selected").sessionKey,
+      callGateway: async <T>(request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
+        if (request.method !== "sessions.search" || !isRecord(request.params)) {
+          throw new Error("Invalid session search transport request");
+        }
+        let payload: unknown;
+        await sessionReadHandlers["sessions.search"]!({
+          req: { type: "req", id: "pg-session-search", method: request.method },
+          params: request.params,
+          context,
+          client: null,
+          isWebchatConnect: () => false,
+          respond: (ok, result, error) => {
+            if (!ok) {
+              throw new Error(error?.message ?? "Session search failed");
+            }
+            payload = result;
+          },
+        });
+        return payload as T;
+      },
+    });
+    expect(
+      (
+        await tool.execute("pg-session-search", {
+          query: "harbor beacon",
+          sessionKey: "current",
+          limit: 1,
+        })
+      ).details,
+    ).toMatchObject({
+      results: [
+        {
+          messageId: "selected-hit",
+          sessionKey: scope("selected").sessionKey,
+          snippet: expect.stringMatching(/^.{1,301}$/su),
+        },
+      ],
+    });
   });
 
   it("folds diacritics, completes prefixes, ranks proximity and treats operators literally", async () => {

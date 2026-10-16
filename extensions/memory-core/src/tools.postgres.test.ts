@@ -283,7 +283,7 @@ describe.skipIf(!connection)("PostgreSQL memory_search product flows", () => {
     ).toEqual(["memory/agent-decoy.md"]);
   });
 
-  it("scopes exact cosine retrieval before LIMIT through real transcript and memory indexing", async () => {
+  it("publishes vector updates, rebuilds and deletions through scoped public retrieval", async () => {
     await write("semantic", "target.md", "launch plan");
     await write("semantic", "orthogonal.md", "unrelated material");
     await transcript("semantic", "nearest-decoy", "nearest-decoy");
@@ -299,6 +299,29 @@ describe.skipIf(!connection)("PostgreSQL memory_search product flows", () => {
       // Session ranking applies age decay; exact cosine arithmetic has its own worker proof.
       { path: "sessions/semantic/nearest-decoy.jsonl", score: expect.closeTo(0.7, 3) },
     ]);
+    await write("semantic", "target.md", "nearest-decoy replacement");
+    await sync("semantic");
+    const updated = [
+      {
+        path: "memory/target.md",
+        snippet: "nearest-decoy replacement",
+        score: expect.closeTo(0.7, 5),
+      },
+    ];
+    expect(
+      (await search("semantic-only", { agentId: "semantic", maxResults: 1 })).results,
+    ).toMatchObject(updated);
+    await sync("semantic", true);
+    expect(
+      (await search("semantic-only", { agentId: "semantic", maxResults: 1 })).results,
+    ).toMatchObject(updated);
+    const target = path.join(workspaces.get("semantic")!, "memory", "target.md");
+    await fs.unlink(target);
+    invalidate(target);
+    await sync("semantic");
+    expect(
+      (await search("semantic-only", { agentId: "semantic", maxResults: 1 })).results,
+    ).toMatchObject([{ path: "memory/orthogonal.md", score: 0 }]);
   });
 
   it("uses configured trigram body and path substring search at the public tool", async () => {

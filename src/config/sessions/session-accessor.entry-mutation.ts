@@ -23,6 +23,7 @@ import {
   captureLifecycleDatabaseScope,
   resolveSqliteScope,
   prepareSqliteScope,
+  withPreparedSqliteScope,
   toDatabaseOptions,
 } from "./session-accessor.sqlite-scope.js";
 import type {
@@ -381,10 +382,13 @@ export async function createSessionEntryWithTranscript<TError = string>(
   const storePath = resolveSessionStorePathForScope(captured);
   const agentId = captured.agentId ?? resolveAgentIdFromSessionKey(captured.sessionKey);
   const target = { ...captured, agentId, storePath };
-  const resolved = captureLifecycleDatabaseScope(
-    await prepareSqliteScope(target, "session.entry.create-with-transcript"),
+  return withPreparedSqliteScope(target, (prepared) =>
+    createSessionEntryWithTranscriptInScope(
+      captureLifecycleDatabaseScope(prepared),
+      createEntry,
+      options,
+    ),
   );
-  return createSessionEntryWithTranscriptInScope(resolved, createEntry, options);
 }
 
 export function cloneSessionEntries(

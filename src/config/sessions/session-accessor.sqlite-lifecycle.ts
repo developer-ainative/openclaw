@@ -65,7 +65,7 @@ import {
 import { prepareSessionEntryReplacementDatabase } from "./session-accessor.sqlite-replacement-worker.js";
 import {
   captureLifecycleDatabaseScope,
-  prepareSqliteScope,
+  withPreparedSqliteScope,
   resolveSqliteAgentId,
   resolveSqliteStoreScope,
   resolveSqliteTranscriptArchiveDirectory,
@@ -117,21 +117,21 @@ export async function resetSessionEntryLifecycle(
     return memory;
   }
   const agentId = params.agentId ?? parseAgentSessionKey(params.target.canonicalKey)?.agentId;
-  const resolved = captureLifecycleDatabaseScope(
-    await prepareSqliteScope(
-      { agentId, sessionKey: "", storePath: params.storePath },
-      "session.lifecycle.reset",
-    ),
+  return withPreparedSqliteScope(
+    { agentId, sessionKey: "", storePath: params.storePath },
+    (prepared) => {
+      const resolved = captureLifecycleDatabaseScope(prepared);
+      const databaseOptions = { ...toDatabaseOptions(resolved), path: resolved.path };
+      if (isMainThread && supportsOpenClawAgentDatabaseExecution(databaseOptions)) {
+        return withCommittedHistoryMaintenance(
+          { agentId: resolved.agentId, env: resolved.env, storePath: params.storePath },
+          (_recordCommit, markCommitted) =>
+            resetSessionEntryInWorker(params, databaseOptions, resolved.agentId, markCommitted),
+        );
+      }
+      return resetSessionEntryLifecycleForMaintenance(params, resolved);
+    },
   );
-  const databaseOptions = { ...toDatabaseOptions(resolved), path: resolved.path };
-  if (isMainThread && supportsOpenClawAgentDatabaseExecution(databaseOptions)) {
-    return withCommittedHistoryMaintenance(
-      { agentId: resolved.agentId, env: resolved.env, storePath: params.storePath },
-      (_recordCommit, markCommitted) =>
-        resetSessionEntryInWorker(params, databaseOptions, resolved.agentId, markCommitted),
-    );
-  }
-  return resetSessionEntryLifecycleForMaintenance(params, resolved);
 }
 
 async function resetSessionEntryLifecycleForMaintenance(
@@ -246,21 +246,21 @@ async function deleteSqliteSessionEntryLifecycleInternal(
 ): Promise<DeleteSessionEntryLifecycleResult> {
   const agentId = params.agentId ?? parseAgentSessionKey(params.target.canonicalKey)?.agentId;
   const target = { agentId, env: params.env, sessionKey: "", storePath: params.storePath };
-  const resolved = captureLifecycleDatabaseScope(
-    await prepareSqliteScope(target, "session.lifecycle.delete-prepare"),
-  );
-  return await withCommittedHistoryMaintenance(
-    { ...params, env: resolved.env },
-    async (recordCommit, markCommitted) =>
-      deleteSqliteSessionEntryLifecycleLocked(
-        resolved,
-        params,
-        allowLockedEntryRemoval,
-        expectedPluginOwnerId,
-        recordCommit,
-        markCommitted,
-      ),
-  );
+  return withPreparedSqliteScope(target, (prepared) => {
+    const resolved = captureLifecycleDatabaseScope(prepared);
+    return withCommittedHistoryMaintenance(
+      { ...params, env: resolved.env },
+      async (recordCommit, markCommitted) =>
+        deleteSqliteSessionEntryLifecycleLocked(
+          resolved,
+          params,
+          allowLockedEntryRemoval,
+          expectedPluginOwnerId,
+          recordCommit,
+          markCommitted,
+        ),
+    );
+  });
 }
 
 const DELETE_EXPECTED_ENTRY_MISMATCH = Symbol("delete-expected-entry-mismatch");
