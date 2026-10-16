@@ -29,6 +29,38 @@ import type { TelegramDraftStream } from "./draft-stream.js";
 import { renderTelegramProgressDraftPreview } from "./progress-draft-preview.js";
 import type * as TelegramEditModule from "./send-edit.js";
 
+function expectText(text: string | undefined, included: string[], excluded: string[] = []) {
+  for (const value of included) {
+    expect(text).toContain(value);
+  }
+  for (const value of excluded) {
+    expect(text).not.toContain(value);
+  }
+}
+
+async function useRealDelivery(structured: boolean) {
+  const draft = await vi.importActual<typeof TelegramDraftModule>("./draft-stream.js");
+  const delivery = await vi.importActual<typeof TelegramDeliveryModule>(
+    "./bot/delivery.replies.js",
+  );
+  const edit = await vi.importActual<typeof TelegramEditModule>("./send-edit.js");
+  deliverReplies.mockImplementation(
+    structured ? delivery.deliverStructuredReplies : delivery.deliverReplies,
+  );
+  editMessageTelegram.mockImplementation(edit.editMessageTelegram);
+  return draft;
+}
+
+function trackEdits(bot: ReturnType<typeof createBot>, visible: Map<number, string>) {
+  return vi.spyOn(bot.api, "editMessageText").mockImplementation(async (_chatId, id, text) => {
+    if (typeof text !== "string") {
+      throw new Error("Expected a plain-text Telegram edit");
+    }
+    visible.set(id, text);
+    return true;
+  });
+}
+
 describeTelegramDispatch("dispatchTelegramMessage progress cards", () => {
   it("keeps a full plan and recent activity after failed named tool items", () => {
     const richMessages = true;
@@ -67,14 +99,11 @@ describeTelegramDispatch("dispatchTelegramMessage progress cards", () => {
       },
       { richMessages, toolProgress: true, maxLines: 5, maxLineChars: 300 },
     );
-    expect(preview.text).toContain("Inspect");
-    expect(preview.text).toContain("Repair");
-    expect(preview.text).toContain("Verify");
-    expect(preview.text).toContain("command 7");
-    expect(preview.text).not.toContain("command 0");
-    expect(preview.text).not.toContain("Automations");
-    expect(preview.text).not.toContain("Browser");
-    expect(preview.text).not.toContain("Custom Command Runner");
+    expectText(
+      preview.text,
+      ["Inspect", "Repair", "Verify", "command 7"],
+      ["command 0", "Automations", "Browser", "Custom Command Runner"],
+    );
   });
 
   it("shows a fresh named failure before newer activity replaces it", () => {
@@ -92,8 +121,7 @@ describeTelegramDispatch("dispatchTelegramMessage progress cards", () => {
     ];
     const options = { richMessages, toolProgress: true, maxLines: 3, maxLineChars: 300 };
     const initial = renderTelegramProgressDraftPreview({ lines: [failed], plan }, options);
-    expect(initial.text).toContain("Read");
-    expect(initial.text).toContain("Repair");
+    expectText(initial.text, ["Read", "Repair"]);
 
     const after = renderTelegramProgressDraftPreview(
       {
@@ -102,9 +130,7 @@ describeTelegramDispatch("dispatchTelegramMessage progress cards", () => {
       },
       options,
     );
-    expect(after.text).not.toContain("Read");
-    expect(after.text).toContain("Browser");
-    expect(after.text).toContain("Repair");
+    expectText(after.text, ["Browser", "Repair"], ["Read"]);
   });
 
   // The real compositor, renderer and transport expose short sends, stopped
@@ -118,13 +144,7 @@ describeTelegramDispatch("dispatchTelegramMessage progress cards", () => {
       vi.useFakeTimers();
       try {
         let queuedReplyOptions: DispatchReplyWithBufferedBlockDispatcherArgs["replyOptions"];
-        const actualDraft = await vi.importActual<typeof TelegramDraftModule>("./draft-stream.js");
-        const actualDelivery = await vi.importActual<typeof TelegramDeliveryModule>(
-          "./bot/delivery.replies.js",
-        );
-        const actualEdit = await vi.importActual<typeof TelegramEditModule>("./send-edit.js");
-        deliverReplies.mockImplementation(actualDelivery.deliverStructuredReplies);
-        editMessageTelegram.mockImplementation(actualEdit.editMessageTelegram);
+        const actualDraft = await useRealDelivery(true);
         let draft: TelegramDraftStream | undefined;
         createTelegramDraftStream.mockImplementation((params) => {
           const stream = actualDraft.createTelegramDraftStream(params);
@@ -144,15 +164,7 @@ describeTelegramDispatch("dispatchTelegramMessage progress cards", () => {
             text,
           };
         });
-        const edit = vi
-          .spyOn(bot.api, "editMessageText")
-          .mockImplementation(async (_chatId, messageId, text) => {
-            if (typeof text !== "string") {
-              throw new Error("Expected a plain-text Telegram edit");
-            }
-            visible.set(messageId, text);
-            return true;
-          });
+        const edit = trackEdits(bot, visible);
         vi.spyOn(bot.api, "deleteMessage").mockImplementation(async (_chatId, messageId) => {
           visible.delete(messageId);
           return true;
@@ -160,50 +172,43 @@ describeTelegramDispatch("dispatchTelegramMessage progress cards", () => {
         dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
           async ({ dispatcherOptions, replyOptions }) => {
             queuedReplyOptions = replyOptions;
-            await replyOptions?.onAssistantMessageStart?.();
-            await replyOptions?.onPlanUpdate?.({ phase: "update", steps: [] });
+            const plan = async (
+              steps: Parameters<
+                NonNullable<NonNullable<typeof replyOptions>["onPlanUpdate"]>
+              >[0]["steps"] = [],
+              explanation?: string,
+            ) => {
+              await replyOptions?.onAssistantMessageStart?.();
+              await replyOptions?.onPlanUpdate?.({ phase: "update", steps, explanation });
+            };
+            await plan();
             await draft?.flush();
             expect(send).not.toHaveBeenCalled();
 
-            await replyOptions?.onAssistantMessageStart?.();
-            await replyOptions?.onPlanUpdate?.({
-              phase: "update",
-              explanation: "Working",
-              steps: [],
-            });
+            await plan([], "Working");
             await draft?.flush();
             expect(send).toHaveBeenCalledOnce();
             expect([...visible.values()]).toEqual(["<b>Working</b>"]);
 
-            await replyOptions?.onAssistantMessageStart?.();
-            await replyOptions?.onPlanUpdate?.({
-              phase: "update",
-              explanation: "1/2 complete",
-              steps: [
+            await plan(
+              [
                 { step: "Inspect", status: "completed" },
                 { step: "Repair", status: "in_progress" },
               ],
-            });
+              "1/2 complete",
+            );
             await draft?.flush();
             expect(send).toHaveBeenCalledOnce();
-            expect([...visible.values()][0]).toContain("[x] Inspect");
-            expect([...visible.values()][0]).not.toContain("Working");
+            expectText([...visible.values()][0], ["[x] Inspect"], ["Working"]);
 
-            await replyOptions?.onAssistantMessageStart?.();
-            await replyOptions?.onPlanUpdate?.({ phase: "update", steps: [] });
+            await plan();
             await vi.advanceTimersByTimeAsync(4_000);
             expect(visible.size).toBe(0);
 
-            await replyOptions?.onAssistantMessageStart?.();
-            await replyOptions?.onPlanUpdate?.({
-              phase: "update",
-              explanation: "Resumed",
-              steps: [{ step: "Resume work", status: "in_progress" }],
-            });
+            await plan([{ step: "Resume work", status: "in_progress" }], "Resumed");
             await draft?.flush();
             expect(send).toHaveBeenCalledTimes(2);
-            expect([...visible.values()][0]).toContain("<b>Resumed</b>");
-            expect([...visible.values()][0]).toContain("Resume work (in progress)");
+            expectText([...visible.values()][0], ["<b>Resumed</b>", "Resume work (in progress)"]);
 
             await replyOptions?.onAssistantMessageStart?.();
             await replyOptions?.onItemEvent?.({
@@ -213,9 +218,11 @@ describeTelegramDispatch("dispatchTelegramMessage progress cards", () => {
               status: "blocked",
             });
             await draft?.flush();
-            expect([...visible.values()][0]).toContain("Resume work (in progress)");
-            expect([...visible.values()][0]).toContain("Progress Card");
-            expect([...visible.values()][0]).toContain("blocked");
+            expectText([...visible.values()][0], [
+              "Resume work (in progress)",
+              "Progress Card",
+              "blocked",
+            ]);
 
             await replyOptions?.onBlockReplyQueued?.({ text: "Checking the result" });
             await dispatcherOptions.deliver({ text: "Checking the result" }, { kind: "block" });
@@ -239,15 +246,12 @@ describeTelegramDispatch("dispatchTelegramMessage progress cards", () => {
             await replyOptions?.onReasoningEnd?.();
             await draft?.flush();
             const resumedCard = [...visible.values()].find((text) => text.includes("Exec"));
-            expect(resumedCard).toContain("Resume work (in progress)");
-            expect(resumedCard).toContain("blocked");
+            expectText(resumedCard, ["Resume work (in progress)", "blocked"]);
 
-            await replyOptions?.onAssistantMessageStart?.();
-            await replyOptions?.onPlanUpdate?.({ phase: "update", steps: [] });
+            await plan();
             await draft?.flush();
             const toolCard = [...visible.values()].find((text) => text.includes("Exec"));
-            expect(toolCard).not.toContain("Resumed");
-            expect(toolCard).not.toContain("Resume work");
+            expectText(toolCard, [], ["Resumed", "Resume work"]);
 
             await replyOptions?.onAssistantMessageStart?.();
             if (finalDelivery === "message-tool") {
@@ -263,12 +267,7 @@ describeTelegramDispatch("dispatchTelegramMessage progress cards", () => {
             const finalMessages = [...visible.entries()];
             const sendsAfterFinal = send.mock.calls.length;
             const editsAfterFinal = edit.mock.calls.length;
-            await replyOptions?.onAssistantMessageStart?.();
-            await replyOptions?.onPlanUpdate?.({
-              phase: "update",
-              explanation: "Late card",
-              steps: [],
-            });
+            await plan([], "Late card");
             await replyOptions?.onToolStart?.({
               name: "exec",
               phase: "start",
@@ -369,11 +368,7 @@ describeTelegramDispatch("dispatchTelegramMessage reasoning-room-events", () => 
     const replacementRequested = createDeferred<void>();
     const acceptReplacement = createDeferred<void>();
     try {
-      const actualDraft = await vi.importActual<typeof TelegramDraftModule>("./draft-stream.js");
-      const actualDelivery = await vi.importActual<typeof TelegramDeliveryModule>(
-        "./bot/delivery.replies.js",
-      );
-      const actualEdit = await vi.importActual<typeof TelegramEditModule>("./send-edit.js");
+      const actualDraft = await useRealDelivery(false);
       createTelegramDraftStream.mockImplementation((params) => {
         const stream = actualDraft.createTelegramDraftStream(params);
         streams.push(stream);
@@ -409,13 +404,7 @@ describeTelegramDispatch("dispatchTelegramMessage reasoning-room-events", () => 
           text,
         };
       });
-      vi.spyOn(bot.api, "editMessageText").mockImplementation(async (_chatId, messageId, text) => {
-        if (typeof text !== "string") {
-          throw new Error("Expected a Telegram text edit");
-        }
-        visible.set(messageId, text);
-        return true;
-      });
+      trackEdits(bot, visible);
       vi.spyOn(bot.api, "deleteMessage").mockImplementation(async (_chatId, messageId) => {
         if (messageId === firstReasoningId) {
           replacementAcceptedBeforeRetirement =

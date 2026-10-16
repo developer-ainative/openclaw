@@ -20,6 +20,15 @@ import { deliverReplies, deliverStructuredReplies } from "./bot/delivery.replies
 import { resolveTelegramTestUpload } from "./send.telegram-http.test-support.js";
 
 const DELIVERY_WARNING = "I couldn't deliver my reply. Please ask again.";
+type ProgressDraft = Parameters<NonNullable<ReplyDispatchRuntimeInfo["adoptProgressDraft"]>>[0];
+function continuation(text: string, adopt: (draft: ProgressDraft) => boolean) {
+  return setReplyPayloadMetadata(
+    { text },
+    {
+      progressContinuation: { adopt, close: () => undefined },
+    },
+  );
+}
 
 describe("Telegram progress custody and delivery outcomes through HTTP", () => {
   const http = createTelegramDispatchHttpFixture();
@@ -33,6 +42,33 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
     waitForBotApiCall,
   } = http;
   afterEach(() => vi.restoreAllMocks());
+
+  const callsFor = (method: string) => calls.filter((call) => call.method === method);
+  const deletedIds = () => callsFor("deleteMessage").map((call) => Number(call.fields.message_id));
+  async function startTool(options: ReplyResolverOptions, toolCallId: string, name = "exec") {
+    await emitToolStart(options, { name, phase: "start", toolCallId });
+    await waitForBotApiCall((call) => call.method === "sendMessage");
+  }
+  async function retainProgress() {
+    let draft: ProgressDraft | undefined;
+    let parentCallbacks: ReplyResolverOptions;
+    await dispatchProgressTurn(
+      async (options) => {
+        parentCallbacks = options;
+        await startTool(options, "delegate");
+      },
+      {
+        mode: "progress",
+        toolProgress: true,
+        finalReply: continuation("Waiting for delegated work.", (candidate) => {
+          draft = candidate;
+          return true;
+        }),
+      },
+    );
+    assert(draft);
+    return { draft, parentCallbacks: parentCallbacks! };
+  }
 
   it("reports an owner rejection silently without claiming a network failure", async () => {
     await dispatchProgressTurn(async () => {}, {
@@ -220,8 +256,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
     };
     const turn = dispatchProgressTurn(
       async (options) => {
-        await emitToolStart(options, { name: "exec", phase: "start", toolCallId: "flood" });
-        await waitForBotApiCall((call) => call.method === "sendMessage");
+        await startTool(options, "flood");
       },
       { mode: "progress", toolProgress: true, allowErrors: true },
     );
@@ -245,8 +280,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         : undefined;
     await dispatchProgressTurn(
       async (options) => {
-        await emitToolStart(options, { name: "exec", phase: "start", toolCallId: "cleanup" });
-        await waitForBotApiCall((call) => call.method === "sendMessage");
+        await startTool(options, "cleanup");
       },
       {
         mode: "progress",
@@ -276,23 +310,13 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         { step: "Inspect the request", status: "completed" as const },
         { step: "Finish delegated work", status: "in_progress" as const },
       ];
-      let draft:
-        | Parameters<NonNullable<ReplyDispatchRuntimeInfo["adoptProgressDraft"]>>[0]
-        | undefined;
+      let draft: ProgressDraft | undefined;
       let progressMessageId: number | undefined;
       let parentCallbacks: ReplyResolverOptions | undefined;
-      const waitingPayload = setReplyPayloadMetadata(
-        { text: waitingText },
-        {
-          progressContinuation: {
-            adopt: (candidate) => {
-              draft = candidate;
-              return accept;
-            },
-            close: () => undefined,
-          },
-        },
-      );
+      const waitingPayload = continuation(waitingText, (candidate) => {
+        draft = candidate;
+        return accept;
+      });
       await dispatchProgressTurn(
         async (options) => {
           parentCallbacks = options;
@@ -307,8 +331,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
             phase: "end",
             progressText: commentary,
           });
-          await emitToolStart(options, { name: "exec", phase: "start", toolCallId: "delegate" });
-          await waitForBotApiCall((call) => call.method === "sendMessage");
+          await startTool(options, "delegate");
           progressMessageId = [...visibleMessages.keys()][0];
         },
         { mode: "progress", toolProgress, finalReply: waitingPayload },
@@ -331,18 +354,14 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         await expect
           .poll(() => [...visibleMessages.values()], { timeout: 5_000 })
           .toEqual([waitingText]);
-        expect(
-          calls
-            .filter((call) => call.method === "deleteMessage")
-            .map((call) => Number(call.fields.message_id)),
-        ).toEqual([progressMessageId]);
+        expect(deletedIds()).toEqual([progressMessageId]);
         return;
       }
       expect([...visibleMessages.entries()]).toEqual([
         [progressMessageId, expect.stringContaining(commentary)],
       ]);
       expect([...visibleMessages.values()][0]).toContain("Finish delegated work");
-      expect(calls.filter((call) => call.method === "deleteMessage")).toEqual([]);
+      expect(callsFor("deleteMessage")).toEqual([]);
       expect(calls.some((call) => call.fields.text === waitingText)).toBe(false);
 
       draft?.push({
@@ -357,43 +376,13 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         .toContain("Delegated verification");
       draft?.retire();
       await expect.poll(() => [...visibleMessages.keys()], { timeout: 5_000 }).toEqual([]);
-      expect(
-        calls
-          .filter((call) => call.method === "deleteMessage")
-          .map((call) => Number(call.fields.message_id)),
-      ).toEqual([progressMessageId]);
-      expect(calls.filter((call) => call.method === "sendMessage")).toHaveLength(1);
+      expect(deletedIds()).toEqual([progressMessageId]);
+      expect(callsFor("sendMessage")).toHaveLength(1);
     },
   );
 
   it("gives a queued turn its own progress card while the adopted card stays retained", async () => {
-    let draft:
-      | Parameters<NonNullable<ReplyDispatchRuntimeInfo["adoptProgressDraft"]>>[0]
-      | undefined;
-    let parentCallbacks: ReplyResolverOptions | undefined;
-    await dispatchProgressTurn(
-      async (options) => {
-        parentCallbacks = options;
-        await emitToolStart(options, { name: "exec", phase: "start", toolCallId: "delegate" });
-        await waitForBotApiCall((call) => call.method === "sendMessage");
-      },
-      {
-        mode: "progress",
-        toolProgress: true,
-        finalReply: setReplyPayloadMetadata(
-          { text: "Waiting for delegated work." },
-          {
-            progressContinuation: {
-              adopt: (candidate) => {
-                draft = candidate;
-                return true;
-              },
-              close: () => undefined,
-            },
-          },
-        ),
-      },
-    );
+    const { draft, parentCallbacks } = await retainProgress();
     const [retained] = [...visibleMessages.entries()];
     assert(retained && draft);
     const [retainedId, retainedText] = retained;
@@ -413,11 +402,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
 
     draft.retire();
     await expect.poll(() => visibleMessages.has(retainedId), { timeout: 5_000 }).toBe(false);
-    expect(
-      calls
-        .filter((call) => call.method === "deleteMessage")
-        .map((call) => Number(call.fields.message_id)),
-    ).toEqual([retainedId]);
+    expect(deletedIds()).toEqual([retainedId]);
   });
 
   it.each([false, true])(
@@ -429,33 +414,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
           apiThrottler({ global: {}, group: { maxConcurrent: 1 }, out: { maxConcurrent: 1 } }),
         ).transformer,
       );
-      let draft:
-        | Parameters<NonNullable<ReplyDispatchRuntimeInfo["adoptProgressDraft"]>>[0]
-        | undefined;
-      let parentCallbacks: ReplyResolverOptions | undefined;
-      await dispatchProgressTurn(
-        async (options) => {
-          parentCallbacks = options;
-          await emitToolStart(options, { name: "exec", phase: "start", toolCallId: "delegate" });
-          await waitForBotApiCall((call) => call.method === "sendMessage");
-        },
-        {
-          mode: "progress",
-          toolProgress: true,
-          finalReply: setReplyPayloadMetadata(
-            { text: "Waiting for delegated work." },
-            {
-              progressContinuation: {
-                adopt: (candidate) => {
-                  draft = candidate;
-                  return true;
-                },
-                close: () => undefined,
-              },
-            },
-          ),
-        },
-      );
+      const { draft, parentCallbacks } = await retainProgress();
       const [retainedId] = [...visibleMessages.keys()];
       assert(retainedId !== undefined && draft);
       const isEditWith =

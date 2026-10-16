@@ -56,6 +56,11 @@ function message(messageId: number, text: string, extra: Partial<Message.TextMes
   } satisfies Message.TextMessage;
 }
 
+const replyTarget = (id: number, text: string) => ({
+  ...message(id, text),
+  reply_to_message: undefined,
+});
+
 function chatWindow(
   messages: ReadonlyArray<{
     message_id: string;
@@ -127,42 +132,32 @@ const ambientRows = [
 
 describe("Telegram prompt composition", () => {
   it.each([
-    { name: "existing plain DM", existing: true, reply: false, include: false },
-    { name: "existing DM reply", existing: true, reply: true, include: true },
-  ])(
-    "selects cached context for $name from recorded session state",
-    async ({ existing, reply, include }) => {
-      const cfg = config();
-      if (existing) {
-        await upsertSessionEntry({
-          storePath: cfg.session!.store!,
-          sessionKey: "agent:main:main",
-          entry: {
-            sessionId: "existing-dm",
-            updatedAt: 1_700_000_000_000,
-          },
-        });
-      }
-      const ctx = await buildTelegramMessageContextForTest({
-        cfg,
-        sessionRuntime: null,
-        message: {
-          ...message(12, "continue"),
-          ...(reply
-            ? { reply_to_message: { ...message(10, "older target"), reply_to_message: undefined } }
-            : {}),
-        },
-        promptContext: chatWindow([{ message_id: "10", body: "Earlier DM turn" }]),
-      });
-      if (include) {
-        expect(ctx?.ctxPayload.ChannelStructuredContext).toMatchObject([
-          { payload: { messages: [{ message_id: "10", body: "Earlier DM turn" }] } },
-        ]);
-      } else {
-        expect(ctx?.ctxPayload.ChannelStructuredContext).toBeUndefined();
-      }
-    },
-  );
+    { name: "existing plain DM", reply: false },
+    { name: "existing DM reply", reply: true },
+  ])("selects cached context for $name from recorded session state", async ({ reply }) => {
+    const cfg = config();
+    await upsertSessionEntry({
+      storePath: cfg.session!.store!,
+      sessionKey: "agent:main:main",
+      entry: { sessionId: "existing-dm", updatedAt: 1_700_000_000_000 },
+    });
+    const ctx = await buildTelegramMessageContextForTest({
+      cfg,
+      sessionRuntime: null,
+      message: {
+        ...message(12, "continue"),
+        ...(reply ? { reply_to_message: replyTarget(10, "older target") } : {}),
+      },
+      promptContext: chatWindow([{ message_id: "10", body: "Earlier DM turn" }]),
+    });
+    if (reply) {
+      expect(ctx?.ctxPayload.ChannelStructuredContext).toMatchObject([
+        { payload: { messages: [{ message_id: "10", body: "Earlier DM turn" }] } },
+      ]);
+    } else {
+      expect(ctx?.ctxPayload.ChannelStructuredContext).toBeUndefined();
+    }
+  });
 
   it("excludes old DM history but preserves explicit replies with a zero sender limit", async () => {
     const telegramCfg: TelegramAccountConfig = {
@@ -174,7 +169,7 @@ describe("Telegram prompt composition", () => {
     await runtime.recordMessageForReplyChain(message(10, "older unrelated DM"));
     const current: unknown = {
       ...message(12, "answer this reply target"),
-      reply_to_message: { ...message(11, "current reply target"), reply_to_message: undefined },
+      reply_to_message: replyTarget(11, "current reply target"),
     } satisfies Message.TextMessage;
     if (!isTelegramMessageCacheSourceMessage(current)) {
       throw new Error("Expected a valid Telegram message fixture");
@@ -327,9 +322,8 @@ describe("Telegram prompt composition", () => {
 
   it("keeps authenticated cached ancestry behind an unknown quote-only follow-up", async () => {
     const target = {
-      ...message(90, "the quoted source line"),
+      ...replyTarget(90, "the quoted source line"),
       from: { id: 7, first_name: "Bob", is_bot: false },
-      reply_to_message: undefined,
     };
     const first = {
       ...message(1, "first ask"),
@@ -370,9 +364,7 @@ describe("Telegram prompt composition", () => {
   it("bounds oversized reply batches by newest unique targets ahead of saturated ancestry", async () => {
     const burst = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10].map((id, index) =>
       Object.assign(message(index + 1, `ask ${id}`), {
-        reply_to_message: Object.assign(message(500 + id, `source ${id}`), {
-          reply_to_message: undefined,
-        }),
+        reply_to_message: replyTarget(500 + id, `source ${id}`),
         quote: { text: `source ${id}`, position: 0 },
       }),
     );
@@ -398,37 +390,14 @@ describe("Telegram prompt composition", () => {
 
 describe("Telegram registered topic recovery", () => {
   it.each([
-    {
-      name: "recovered window",
-      historyLimit: 10,
-      topic: 3731,
-      targetChat: -10042001,
-      ambient: false,
-    },
-    {
-      name: "disabled automatic history",
-      historyLimit: 0,
-      topic: 3731,
-      targetChat: -10042001,
-      ambient: false,
-    },
-    {
-      name: "different chat binding",
-      historyLimit: 10,
-      topic: 3731,
-      targetChat: -10099999,
-      ambient: false,
-    },
-    {
-      name: "ambient reset boundary",
-      historyLimit: 10,
-      topic: 3731,
-      targetChat: -10042001,
-      ambient: true,
-    },
-  ])(
-    "preserves admitted history and route custody for $name",
-    async ({ historyLimit, topic, targetChat, ambient }) => {
+    ["recovered window", 10, -10042001, false],
+    ["disabled automatic history", 0, -10042001, false],
+    ["different chat binding", 10, -10099999, false],
+    ["ambient reset boundary", 10, -10042001, true],
+  ] as const)(
+    "preserves admitted history and route custody for %s",
+    async (_name, historyLimit, targetChat, ambient) => {
+      const topic = 3731;
       const storePath = createStorePath();
       const accountId = "work";
       const sessionKey = `agent:main:telegram:group:${targetChat}:topic:${topic}`;
@@ -482,39 +451,25 @@ describe("Telegram registered topic recovery", () => {
         scope: resolveTelegramMessageCacheScope(storePath),
       });
       try {
-        for (const row of [
-          { id: 100, topic: 1, text: "General context", sender: from, seconds: 5, accountId },
-          { id: 200, topic: 3731, text: "Before self", sender: from, seconds: 4, accountId },
-          {
-            id: 201,
-            topic: 3731,
-            text: "Self marker",
-            sender: telegramBotInfoForTest,
-            seconds: 3,
-            accountId,
-          },
-          { id: 202, topic: 3731, text: "After watermark", sender: from, seconds: 2, accountId },
-          {
-            id: 203,
-            topic: 3731,
-            text: "Other account secret",
-            sender: from,
-            seconds: 1,
-            accountId: "other",
-          },
-        ]) {
+        for (const [id, thread, text, rowSender, seconds, account] of [
+          [100, 1, "General context", from, 5, accountId],
+          [200, 3731, "Before self", from, 4, accountId],
+          [201, 3731, "Self marker", telegramBotInfoForTest, 3, accountId],
+          [202, 3731, "After watermark", from, 2, accountId],
+          [203, 3731, "Other account secret", from, 1, "other"],
+        ] as const) {
           await cache.record({
-            accountId: row.accountId,
+            accountId: account,
             chatId: forumChat.id,
             botUserId: telegramBotInfoForTest.id,
             historyEligible: true,
             msg: {
               chat: forumChat,
-              from: row.sender,
-              message_id: row.id,
-              message_thread_id: row.topic,
-              date: now - row.seconds,
-              text: row.text,
+              from: rowSender,
+              message_id: id,
+              message_thread_id: thread,
+              date: now - seconds,
+              text,
             },
           });
         }
@@ -578,13 +533,8 @@ describe("Telegram registered topic recovery", () => {
           expect(observed.InboundHistory).toBeUndefined();
           expect(observed.ChannelStructuredContext).toBeUndefined();
         } else {
-          expect(observed.media).toEqual(
-            expect.arrayContaining([
-              expect.objectContaining({
-                kind: "image",
-                path: "/tmp/replied-photo.jpg",
-              }),
-            ]),
+          expect(observed.media).toContainEqual(
+            expect.objectContaining({ kind: "image", path: "/tmp/replied-photo.jpg" }),
           );
           if (historyLimit === 0) {
             expect(observed.ChannelStructuredContext).toMatchObject([
@@ -600,10 +550,8 @@ describe("Telegram registered topic recovery", () => {
             );
           }
           if (recovered && topic === 3731 && historyLimit > 0) {
-            expect(observed.InboundHistory).toEqual(
-              expect.arrayContaining([
-                expect.objectContaining({ body: "After watermark", timestamp: (now - 2) * 1000 }),
-              ]),
+            expect(observed.InboundHistory).toContainEqual(
+              expect.objectContaining({ body: "After watermark", timestamp: (now - 2) * 1000 }),
             );
             expect(history).not.toContain("Before self");
             expect(history).not.toContain("Self marker");

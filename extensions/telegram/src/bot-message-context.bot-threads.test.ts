@@ -10,11 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import {
   apiCalls,
   apiResponses,
-  commandMessage,
   createBot,
   deliverTelegramUpdate,
   from,
   groupChat,
+  groupCommand,
   harness,
   photo,
   publishTelegramTestConfig,
@@ -55,13 +55,7 @@ function config(group: TelegramGroupConfig): OpenClawConfig {
 }
 
 function topicMessage(text: string, threadId = 99) {
-  return {
-    ...commandMessage(text),
-    chat: groupChat,
-    message_thread_id: threadId,
-    is_topic_message: true,
-    entities: [],
-  };
+  return { ...groupCommand(text, threadId), entities: [] };
 }
 
 async function receive(bot: Bot, message: NonNullable<Update["message"]>) {
