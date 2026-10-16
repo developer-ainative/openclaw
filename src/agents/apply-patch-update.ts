@@ -152,8 +152,7 @@ function buildChunkLines(params: {
   contextOldIndexes: Array<number | undefined>;
 }): SourceLine[] {
   const { source, matchIndex, pattern, newSlice, contextOldIndexes } = params;
-  // Large hunks exceed the engine's argument limit if spread into push/splice.
-  let lines: SourceLine[] = [];
+  const lines: SourceLine[] = [];
   let oldStart = 0;
   let newStart = 0;
 
@@ -163,7 +162,8 @@ function buildChunkLines(params: {
     if (oldContext === undefined || oldContext >= pattern.length || newContext >= newSlice.length) {
       continue;
     }
-    lines = lines.concat(
+    appendLines(
+      lines,
       buildChangedLines({
         sourceLines: source.lines,
         startIndex: matchIndex + oldStart,
@@ -171,13 +171,14 @@ function buildChunkLines(params: {
         newLines: newSlice.slice(newStart, newContext),
         preferredEnding: source.preferredEnding,
       }),
-      [source.lines[matchIndex + oldContext]!],
     );
+    lines.push(source.lines[matchIndex + oldContext]!);
     oldStart = oldContext + 1;
     newStart = newContext + 1;
   }
 
-  return lines.concat(
+  appendLines(
+    lines,
     buildChangedLines({
       sourceLines: source.lines,
       startIndex: matchIndex + oldStart,
@@ -186,6 +187,14 @@ function buildChunkLines(params: {
       preferredEnding: source.preferredEnding,
     }),
   );
+  return lines;
+}
+
+// Spreading a large hunk into push() exceeds the engine's call argument limit.
+function appendLines(target: SourceLine[], items: SourceLine[]) {
+  for (const item of items) {
+    target.push(item);
+  }
 }
 
 function buildChangedLines(params: {
