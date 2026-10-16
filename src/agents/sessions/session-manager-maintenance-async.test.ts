@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { makeUserMessage } from "../../../test/helpers/user-message.js";
+import { makeUserMessage as userMessage } from "../../../test/helpers/user-message.js";
 import {
   loadSessionEntry,
   loadTranscriptEvents,
@@ -21,6 +20,7 @@ import {
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { isRecordedModelFallbackStop } from "../model-fallback-stop.js";
+import { customData, opaqueEntry, sessionScope } from "./session-manager-fixtures.test-support.js";
 import * as metadataRuntime from "./session-manager-metadata-runtime.js";
 import { SessionManager } from "./session-manager.js";
 
@@ -35,10 +35,10 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
 
 async function openSession(lifecycleRevision?: string) {
   const scope = {
-    agentId: "main",
-    sessionId: "maintenance",
-    sessionKey: "agent:main:maintenance",
-    storePath: path.join(tempDirs.make("session-maintenance-"), "sessions.json"),
+    ...sessionScope(
+      path.join(tempDirs.make("session-maintenance-"), "sessions.json"),
+      "maintenance",
+    ),
     ...(lifecycleRevision ? { expectedLifecycleRevision: lifecycleRevision } : {}),
   };
   await upsertSessionEntryCore(scope, {
@@ -50,7 +50,7 @@ async function openSession(lifecycleRevision?: string) {
 }
 
 async function appendUser(manager: SessionManager, text: string): Promise<string> {
-  return (await manager.appendMessageWithTranscriptAnchorAsync(makeUserMessage(text, 1))).entryId;
+  return (await manager.appendMessageWithTranscriptAnchorAsync(userMessage(text, 1))).entryId;
 }
 
 async function prepareUserRewrite(manager: SessionManager, text = "replacement") {
@@ -90,24 +90,17 @@ it("shares admitted immutable payloads when preparing and publishing a rewrite",
   const id = await manager.appendCustomEntryAsync("large-tool-output", {
     chunks: Array.from({ length: 1024 }, () => ({ text: "x".repeat(1024) })),
   });
+  const data = customData(manager, id);
   const original = manager.getEntry(id);
-  assert(
-    original?.type === "custom" && isRecord(original.data),
-    "Missing large transcript payload",
-  );
   const rewrite = await manager.prepareTranscriptRewriteAsync();
   expect(rewrite.sessionManager.getEntry(id)).not.toBe(original);
-  const prepared = rewrite.sessionManager.getEntry(id);
-  assert(prepared?.type === "custom", "Missing prepared transcript payload");
-  expect(prepared.data).toBe(original.data);
-  expect(Object.isFrozen(original.data)).toBe(true);
-  expect(Reflect.set(original.data, "chunks", [])).toBe(false);
+  expect(customData(rewrite.sessionManager, id)).toBe(data);
+  expect(Object.isFrozen(data)).toBe(true);
+  expect(Reflect.set(data, "chunks", [])).toBe(false);
   const replacementId = await appendUser(rewrite.sessionManager, "replacement");
   expect(manager.getEntry(replacementId)).toBeUndefined();
   await rewrite.commit(new Map());
-  const published = manager.getEntry(id);
-  assert(published?.type === "custom", "Missing published transcript payload");
-  expect(published.data).toBe(original.data);
+  expect(customData(manager, id)).toBe(data);
   expect(manager.getEntry(replacementId)).toMatchObject({
     appendMode: "side",
     message: { content: "replacement" },
@@ -131,24 +124,21 @@ it.each([false, true])("isolates rewrite payloads with opaque SDK data: %s", asy
   ]);
   const rewrite = await manager.prepareTranscriptRewriteAsync();
   const entry = rewrite.sessionManager.getEntry("data");
-  assert(entry?.type === "custom" && isRecord(entry.data), "Missing custom entry");
-  const record = rewrite.sessionManager
-    .getPersistedEntries()
-    .find((value) => isRecord(value) && value.type === "opaque");
-  assert(isRecord(record), "Missing opaque record");
-  expect(record.shared).toBe(entry.data);
+  const data = customData(rewrite.sessionManager, "data");
+  const record = opaqueEntry(rewrite.sessionManager);
+  expect(record.shared).toBe(data);
   if (opaque) {
     assert(record.bytes instanceof Uint8Array, "Missing opaque bytes");
     expect(record.bytes.buffer).toBe(record.buffer);
     expect(record.buffer).not.toBe(buffer);
   }
-  entry.data.text = "prepared";
+  data.text = "prepared";
   expect(manager.getEntry("data")).toMatchObject({ data: { text: "original" } });
   await rewrite.commit(new Map());
   const committed = manager.getEntry("data");
   expect(committed).toMatchObject({ data: { text: "prepared" } });
   expect(committed).not.toBe(entry);
-  entry.data.text = "later";
+  data.text = "later";
   expect(committed).toMatchObject({ data: { text: "prepared" } });
 });
 
@@ -158,26 +148,12 @@ it("preserves opaque SDK aliases into an admitted payload during a rewrite", asy
     { type: "opaque", id: "opaque", parentId: null },
   ]);
   const id = await manager.appendCustomEntryAsync("owned", { child: { text: "original" } });
-  const owned = manager.getEntry(id);
-  const opaque = manager
-    .getPersistedEntries()
-    .find((entry) => isRecord(entry) && entry.type === "opaque");
-  assert(
-    owned?.type === "custom" && isRecord(owned.data) && isRecord(opaque),
-    "Missing alias fixture",
-  );
-  opaque.alias = owned.data.child;
+  const owned = customData(manager, id);
+  opaqueEntry(manager).alias = owned.child;
   const rewrite = await manager.prepareTranscriptRewriteAsync();
-  const prepared = rewrite.sessionManager.getEntry(id);
-  const preparedOpaque = rewrite.sessionManager
-    .getPersistedEntries()
-    .find((entry) => isRecord(entry) && entry.type === "opaque");
-  assert(
-    prepared?.type === "custom" && isRecord(prepared.data) && isRecord(preparedOpaque),
-    "Missing prepared aliases",
-  );
-  expect(preparedOpaque.alias).toBe(prepared.data.child);
-  expect(prepared.data).toBe(owned.data);
+  const prepared = customData(rewrite.sessionManager, id);
+  expect(opaqueEntry(rewrite.sessionManager).alias).toBe(prepared.child);
+  expect(prepared).toBe(owned);
 });
 
 it("settles queued suffix removals in order and rebuilds the pending branch projection", async () => {
@@ -278,10 +254,7 @@ it.each(["same", "independent"] as const)(
     assert(sourceId, "Missing source message ID");
     await manager.reloadPersistedTranscriptAsync();
     const source = manager.getEntry(sourceId);
-    assert(
-      source?.type === "message" && source.message.role === "user",
-      "Missing hydrated source message",
-    );
+    assert(source?.type === "message" && source.message.role === "user", "Missing user source");
     expect(Object.isFrozen(source.message.content)).toBe(false);
     vi.spyOn(manager, "prepareTranscriptRewrite").mockImplementation(() => {
       throw new Error("sync compatibility adapter used");
@@ -290,7 +263,7 @@ it.each(["same", "independent"] as const)(
     const snapshot = rewrite.sessionManager.getEntry(sourceId);
     assert(
       snapshot?.type === "message" && snapshot.message.role === "user",
-      "Missing rewrite source message",
+      "Missing rewrite user",
     );
     expect(snapshot).not.toBe(source);
     expect(snapshot.message).not.toBe(source.message);
@@ -324,7 +297,7 @@ it.each(["same", "independent"] as const)(
 
 it("preserves a steer acknowledgment committed after rewrite preparation", async () => {
   const { scope, manager } = await openSession();
-  const source = await manager.appendMessageWithTranscriptAnchorAsync(makeUserMessage("steer", 1));
+  const source = await manager.appendMessageWithTranscriptAnchorAsync(userMessage("steer", 1));
   assert(source.anchor, "Persisted user message must have a transcript anchor");
   const { replacementId, ...rewrite } = await prepareUserRewrite(manager);
   const acknowledged = await rewritePreparedTranscriptMessageAtAnchor(source.anchor, () => ({
@@ -440,14 +413,8 @@ it("preserves a committed branch and a later target rebinding", async () => {
   });
   const runExternalRetarget = AsyncLocalStorage.snapshot();
   const original = metadataRuntime.withSessionMetadataWorker;
-  const rebindAfterCommit: typeof original = async (
-    options,
-    database,
-    assertCurrent,
-    operation,
-    controls,
-  ) => {
-    const result = await original(options, database, assertCurrent, operation, controls);
+  const rebindAfterCommit: typeof original = async (...args) => {
+    const result = await original(...args);
     await runExternalRetarget(() => manager.setSessionTargetAsync(replacementScope));
     return result;
   };

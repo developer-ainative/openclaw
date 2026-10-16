@@ -1,9 +1,59 @@
+import assert from "node:assert/strict";
 import path from "node:path";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { vi } from "vitest";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
+import * as contextWorker from "../../config/sessions/session-transcript-read-worker-runtime.js";
 import {
   withOpenClawTestState,
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
+import { makeAgentAssistantMessage } from "../test-helpers/agent-message-fixtures.js";
+import type { SessionManager } from "./session-manager.js";
+
+export function assistantText(text: string) {
+  return makeAgentAssistantMessage({ content: [{ type: "text", text }] });
+}
+
+export function customData(manager: SessionManager, id: string) {
+  const entry = manager.getEntry(id);
+  assert(entry?.type === "custom" && isRecord(entry.data), "Missing custom payload");
+  return entry.data;
+}
+
+export function opaqueEntry(manager: SessionManager) {
+  const entry = manager
+    .getPersistedEntries()
+    .find((value) => isRecord(value) && value.type === "opaque");
+  assert(isRecord(entry), "Missing opaque record");
+  return entry;
+}
+
+export function observeJsonParse(observe: (text: string) => void) {
+  const parse = JSON.parse;
+  return vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+    observe(text);
+    return parse(text, reviver);
+  });
+}
+
+export function afterModelRead(after: () => void | Promise<void>, restoreBeforeRead = false) {
+  const read = contextWorker.readSessionTranscriptModelContextInWorker;
+  const spy = vi
+    .spyOn(contextWorker, "readSessionTranscriptModelContextInWorker")
+    .mockImplementationOnce(async (...args) => {
+      if (restoreBeforeRead) {
+        spy.mockRestore();
+      }
+      const context = await read(...args);
+      const pending = after();
+      if (pending) {
+        await pending;
+      }
+      return context;
+    });
+  return spy;
+}
 
 export function sessionScope(storePath: string, sessionId: string) {
   return { agentId: "main", sessionId, sessionKey: `agent:main:${sessionId}`, storePath };

@@ -3,7 +3,7 @@ import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, expect, it } from "vitest";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { makeUserMessage } from "../../../test/helpers/user-message.js";
+import { makeUserMessage as userMessage } from "../../../test/helpers/user-message.js";
 import {
   appendTranscriptMessage,
   loadTranscriptEventsSync,
@@ -19,8 +19,7 @@ import {
 import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
 import { rewriteTranscriptEntriesInSessionManager } from "../embedded-agent-runner/transcript-rewrite.js";
-import { makeAgentAssistantMessage } from "../test-helpers/agent-message-fixtures.js";
-import { sessionScope } from "./session-manager-fixtures.test-support.js";
+import { assistantText, sessionScope } from "./session-manager-fixtures.test-support.js";
 import { SessionManager } from "./session-manager.js";
 
 const tempDirs = createTempDirTracker();
@@ -39,30 +38,31 @@ function expectCanonicalView(manager: SessionManager, reopened: SessionManager) 
   expect(manager.buildSessionContext()).toEqual(reopened.buildSessionContext());
 }
 
+function appendBoundary(manager: SessionManager, kind: "compaction" | "reset", first: string) {
+  return kind === "reset"
+    ? manager.appendResetBoundary("reset", first)
+    : manager.appendCompaction("summary", first, 100);
+}
+
+function rewriteUser(manager: SessionManager, entryId: string, text: string, timestamp = 1) {
+  return rewriteTranscriptEntriesInSessionManager({
+    sessionManager: manager,
+    replacements: [{ entryId, message: userMessage(text, timestamp) }],
+  });
+}
+
 afterEach(async () => {
   // Reconcile workers can otherwise retain the shared state lock into later tests.
-  const stateDirs = [...tempDirs.dirs];
-  const errors: unknown[] = [];
-  for (const stateDir of stateDirs) {
-    try {
-      await cleanupSessionStateForTest({ stateDir });
-    } catch (error) {
-      errors.push(error);
-    }
-  }
-  if (errors.length === 1) {
-    throw errors[0];
-  }
-  if (errors.length > 1) {
-    throw new AggregateError(errors, "Session fixture cleanup failed");
+  for (const stateDir of tempDirs.dirs) {
+    await cleanupSessionStateForTest({ stateDir });
   }
   tempDirs.cleanup();
 });
 
 it("keeps deprecated sync rewrite publication ahead of synchronous commit observers", async () => {
   const { scope, manager } = await openSession("rewrite-observer");
-  const first = manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
-  const tail = manager.appendMessage({ role: "user", content: "tail", timestamp: 2 });
+  const first = manager.appendMessage(userMessage("first", 1));
+  const tail = manager.appendMessage(userMessage("tail", 2));
   const database = openOpenClawAgentDatabase({
     agentId: scope.agentId,
     path: resolveSessionTranscriptDatabasePath(scope),
@@ -70,7 +70,7 @@ it("keeps deprecated sync rewrite publication ahead of synchronous commit observ
   requireNativeSqliteDatabase(database.db).function("queue_observer_append", () => {
     expect(
       deferOpenClawAgentPostCommitPublication(database, () => {
-        manager.appendMessage({ role: "user", content: "observer", timestamp: 3 });
+        manager.appendMessage(userMessage("observer", 3));
       }),
     ).toBe(true);
     return 0;
@@ -80,8 +80,8 @@ it("keeps deprecated sync rewrite publication ahead of synchronous commit observ
   );
   const rewrite = manager.prepareTranscriptRewrite();
   rewrite.sessionManager.resetLeaf();
-  const replacement = rewrite.sessionManager.appendMessage(makeUserMessage("replacement", 1));
-  const copiedTail = rewrite.sessionManager.appendMessage(makeUserMessage("tail", 2));
+  const replacement = rewrite.sessionManager.appendMessage(userMessage("replacement", 1));
+  const copiedTail = rewrite.sessionManager.appendMessage(userMessage("tail", 2));
   rewrite.commit(
     new Map([
       [first, replacement],
@@ -98,15 +98,15 @@ it("keeps deprecated sync rewrite publication ahead of synchronous commit observ
 
 it("does not certify stale navigation with a post-commit replacement version", async () => {
   const { scope, manager } = await openSession("postcommit-race");
-  const first = manager.appendMessage({ role: "user", content: "first", timestamp: 1 });
-  const second = manager.appendMessage({ role: "user", content: "second", timestamp: 2 });
+  const first = manager.appendMessage(userMessage("first", 1));
+  const second = manager.appendMessage(userMessage("second", 2));
   const control = manager.appendLeafControl({
     targetId: first,
     appendParentId: second,
     appendMode: "side",
   });
-  const kept = manager.appendMessage({ role: "user", content: "kept-after-trim", timestamp: 3 });
-  manager.appendMessage({ role: "user", content: "remove-tail", timestamp: 4 });
+  const kept = manager.appendMessage(userMessage("kept-after-trim", 3));
+  manager.appendMessage(userMessage("remove-tail", 4));
   let published = false;
   runOpenClawAgentWriteTransaction(
     (database) => {
@@ -135,13 +135,7 @@ it("does not certify stale navigation with a post-commit replacement version", a
   );
   expect(published).toBe(true);
   const committed = loadTranscriptEventsSync(scope);
-  const rewrite = () =>
-    rewriteTranscriptEntriesInSessionManager({
-      sessionManager: manager,
-      replacements: [
-        { entryId: kept, message: { role: "user", content: "replacement", timestamp: 3 } },
-      ],
-    });
+  const rewrite = () => rewriteUser(manager, kept, "replacement", 3);
   await expect(rewrite()).rejects.toThrow("Session transcript changed");
   expect(loadTranscriptEventsSync(scope)).toEqual(committed);
   manager.reloadPersistedTranscript();
@@ -157,22 +151,13 @@ it.each(["compaction", "reset"] as const)(
   "adopts canonical boundary counts and navigation after replaying %s",
   async (kind) => {
     const { dir, scope, manager: full } = await openSession("rewrite-boundary");
-    const first = full.appendMessage({ role: "user", content: "first", timestamp: 1 });
-    full.appendMessage({ role: "user", content: "second", timestamp: 2 });
-    if (kind === "reset") {
-      full.appendResetBoundary("reset", first);
-    } else {
-      full.appendCompaction("summary", first, 100);
-    }
-    full.appendMessage({ role: "user", content: "last", timestamp: 3 });
+    const first = full.appendMessage(userMessage("first", 1));
+    full.appendMessage(userMessage("second", 2));
+    appendBoundary(full, kind, first);
+    full.appendMessage(userMessage("last", 3));
     const manager = SessionManager.openBounded(scope, { maxEvents: 10, maxBytes: 16384 });
     expect(manager.getBoundaryCount()).toBe(1);
-    await rewriteTranscriptEntriesInSessionManager({
-      sessionManager: manager,
-      replacements: [
-        { entryId: first, message: { role: "user", content: "rewritten", timestamp: 1 } },
-      ],
-    });
+    await rewriteUser(manager, first, "rewritten");
     expectCanonicalView(manager, SessionManager.open(scope, dir));
   },
 );
@@ -181,15 +166,11 @@ it.each(["compaction", "reset"] as const)(
   "counts a stale bounded %s append exactly once after reload",
   async (kind) => {
     const { dir, scope, manager: writer } = await openSession("stale-boundary-count");
-    const first = writer.appendMessage({ role: "user", content: "first", timestamp: 1 });
+    const first = writer.appendMessage(userMessage("first", 1));
     const stale = SessionManager.openBounded(scope, { cwd: dir, maxEvents: 20, maxBytes: 4096 });
     expect(stale.getBoundaryCount()).toBe(0);
     writer.appendCustomEntry("concurrent-metadata", { keep: true });
-    if (kind === "compaction") {
-      stale.appendCompaction("summary", first, 100);
-    } else {
-      stale.appendResetBoundary("reset", first);
-    }
+    appendBoundary(stale, kind, first);
     expectCanonicalView(
       stale,
       SessionManager.openBounded(scope, { cwd: dir, maxEvents: 20, maxBytes: 4096 }),
@@ -201,17 +182,13 @@ it("appends an assistant without parsing transcript rows outside the bounded con
   const dir = tempDirs.make("openclaw-session-manager-bounded-assistant-");
   const scope = sessionScope(path.join(dir, "sessions.json"), "bounded-assistant-append");
   await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-  await appendTranscriptMessage(scope, {
-    cwd: dir,
-    eventId: "excluded",
-    message: { role: "user", content: "excluded" },
-  });
-  await appendTranscriptMessage(scope, {
-    cwd: dir,
-    eventId: "retained",
-    parentId: "excluded",
-    message: { role: "user", content: "retained" },
-  });
+  for (const event of [{ eventId: "excluded" }, { eventId: "retained", parentId: "excluded" }]) {
+    await appendTranscriptMessage(scope, {
+      cwd: dir,
+      ...event,
+      message: { role: "user", content: event.eventId },
+    });
+  }
   const manager = SessionManager.openBounded(scope, {
     cwd: dir,
     maxBytes: 4096,
@@ -232,15 +209,7 @@ it("appends an assistant without parsing transcript rows outside the bounded con
     .run("{", scope.sessionId, excludedSeq);
   expect(poisoned.changes).toBe(1);
 
-  const assistantId = manager.appendMessage(
-    makeAgentAssistantMessage({
-      content: [{ type: "text", text: "bounded reply" }],
-      api: "messages",
-      provider: "anthropic",
-      model: "sonnet-4.6",
-      timestamp: Date.now(),
-    }),
-  );
+  const assistantId = manager.appendMessage(assistantText("bounded reply"));
 
   expect(manager.getEntry(assistantId)).toMatchObject({ parentId: "retained" });
   const stored = database.db
