@@ -711,20 +711,23 @@ function startServiceFixture(
   });
 }
 
+type MetricArgs = [
+  name: string,
+  value: number,
+  attributes: unknown,
+  position?: "first" | "last",
+  omittedText?: string[],
+];
+type MetricExpectation = [kind: "counter" | "histogram", ...MetricArgs];
+const counter = (...args: MetricArgs): MetricExpectation => ["counter", ...args];
+const histogram = (...args: MetricArgs): MetricExpectation => ["histogram", ...args];
+
 type RecorderCase = {
   name: string;
   signals: OtelSignal[];
   trusted?: boolean;
   events: TrustedEvent[];
-  metrics: Array<
-    [
-      kind: "counter" | "histogram",
-      name: string,
-      calls: unknown[][],
-      position?: "first" | "last",
-      omittedText?: string[],
-    ]
-  >;
+  metrics: MetricExpectation[];
   span?: {
     name: string;
     attributes: Record<string, unknown>;
@@ -734,6 +737,14 @@ type RecorderCase = {
   stateOmits?: string[];
 };
 
+function expectCounter(name: string, ...args: unknown[]) {
+  expect(telemetryState.counters.get(name)?.add).toHaveBeenCalledWith(...args);
+}
+
+function expectHistogram(name: string, ...args: unknown[]) {
+  expect(telemetryState.histograms.get(name)?.record).toHaveBeenCalledWith(...args);
+}
+
 function captureExporterEvents() {
   const events: TelemetryExporterEvent[] = [];
   const unsubscribe = onInternalDiagnosticEvent((event) => {
@@ -742,6 +753,10 @@ function captureExporterEvents() {
     }
   });
   return { events, unsubscribe };
+}
+
+function project<T, K extends keyof T>(records: readonly T[], keys: readonly K[]) {
+  return records.map((record) => keys.map((key) => record[key]));
 }
 
 function emitTrustedModelCallCompletedWithContent(
@@ -827,18 +842,22 @@ describe("diagnostics-otel service", () => {
     for (const mock of [logEmit, traceExporterExport, metricExporterExport, logExporterExport]) {
       mock.mockReset();
     }
-    traceExporterShutdown.mockReset();
-    traceExporterShutdown.mockResolvedValue(undefined);
-    metricExporterShutdown.mockReset();
-    metricExporterShutdown.mockResolvedValue(undefined);
-    logExporterShutdown.mockReset();
-    logExporterShutdown.mockResolvedValue(undefined);
-    exporterForceFlush.mockReset();
-    exporterForceFlush.mockResolvedValue(undefined);
-    logProcessorCtor.mockClear();
-    spanProcessorCtor.mockClear();
-    metricReaderCtor.mockClear();
-    ownedSdkRuntimeCleanup.mockClear();
+    for (const mock of [
+      traceExporterShutdown,
+      metricExporterShutdown,
+      logExporterShutdown,
+      exporterForceFlush,
+    ]) {
+      mock.mockReset().mockResolvedValue(undefined);
+    }
+    for (const mock of [
+      logProcessorCtor,
+      spanProcessorCtor,
+      metricReaderCtor,
+      ownedSdkRuntimeCleanup,
+    ]) {
+      mock.mockClear();
+    }
     registerOwnedSdkRuntimeMock.mockClear();
     registerOwnedSdkRuntimeMock.mockReturnValue(ownedSdkRuntimeCleanup);
     createNodeProxyAgentMock.mockReset();
@@ -929,55 +948,48 @@ describe("diagnostics-otel service", () => {
       attempt: 2,
     });
 
-    expect(telemetryState.counters.get("openclaw.webhook.received")?.add).toHaveBeenCalledWith(1, {
+    expectCounter("openclaw.webhook.received", 1, {
       "openclaw.channel": "telegram",
       "openclaw.webhook": "telegram-post",
     });
-    expect(
-      telemetryState.histograms.get("openclaw.webhook.duration_ms")?.record,
-    ).toHaveBeenCalledWith(120, {
+    expectHistogram("openclaw.webhook.duration_ms", 120, {
       "openclaw.channel": "telegram",
       "openclaw.webhook": "telegram-post",
     });
-    expect(telemetryState.counters.get("openclaw.message.queued")?.add).toHaveBeenCalledWith(1, {
+    expectCounter("openclaw.message.queued", 1, {
       "openclaw.channel": "telegram",
       "openclaw.source": "telegram",
     });
     expect(telemetryState.histograms.get("openclaw.queue.depth")?.record).toHaveBeenCalledTimes(2);
-    expect(telemetryState.histograms.get("openclaw.queue.depth")?.record).toHaveBeenCalledWith(2, {
+    expectHistogram("openclaw.queue.depth", 2, {
       "openclaw.channel": "telegram",
       "openclaw.source": "telegram",
     });
-    expect(telemetryState.histograms.get("openclaw.queue.depth")?.record).toHaveBeenCalledWith(3, {
+    expectHistogram("openclaw.queue.depth", 3, {
       "openclaw.lane": "main",
     });
-    expect(telemetryState.counters.get("openclaw.message.processed")?.add).toHaveBeenCalledWith(1, {
+    expectCounter("openclaw.message.processed", 1, {
       "openclaw.channel": "telegram",
       "openclaw.outcome": "completed",
     });
-    expect(telemetryState.counters.get("openclaw.message.received")?.add).toHaveBeenCalledWith(1, {
+    expectCounter("openclaw.message.received", 1, {
       "openclaw.channel": "telegram",
       "openclaw.source": "webhook",
     });
-    expect(telemetryState.counters.get("openclaw.message.received")?.add).toHaveBeenCalledWith(1, {
+    expectCounter("openclaw.message.received", 1, {
       "openclaw.channel": "unknown",
       "openclaw.source": "unknown",
     });
-    expect(
-      telemetryState.counters.get("openclaw.message.dispatch.started")?.add,
-    ).toHaveBeenCalledWith(1, {
+    expectCounter("openclaw.message.dispatch.started", 1, {
       "openclaw.channel": "telegram",
       "openclaw.source": "webhook",
     });
-    expect(
-      telemetryState.counters.get("openclaw.message.dispatch.started")?.add,
-    ).toHaveBeenCalledWith(1, {
+    expectCounter("openclaw.message.dispatch.started", 1, {
       "openclaw.channel": "unknown",
       "openclaw.source": "unknown",
     });
-    expect(
-      telemetryState.counters.get("openclaw.message.dispatch.completed")?.add,
-    ).toHaveBeenCalledWith(
+    expectCounter(
+      "openclaw.message.dispatch.completed",
       1,
       expect.objectContaining({
         "openclaw.channel": "telegram",
@@ -985,9 +997,8 @@ describe("diagnostics-otel service", () => {
         "openclaw.source": "webhook",
       }),
     );
-    expect(
-      telemetryState.counters.get("openclaw.message.dispatch.completed")?.add,
-    ).toHaveBeenCalledWith(
+    expectCounter(
+      "openclaw.message.dispatch.completed",
       1,
       expect.objectContaining({
         "openclaw.channel": "unknown",
@@ -995,9 +1006,8 @@ describe("diagnostics-otel service", () => {
         "openclaw.source": "unknown",
       }),
     );
-    expect(
-      telemetryState.histograms.get("openclaw.message.dispatch.duration_ms")?.record,
-    ).toHaveBeenCalledWith(
+    expectHistogram(
+      "openclaw.message.dispatch.duration_ms",
       25,
       expect.objectContaining({
         "openclaw.channel": "telegram",
@@ -1005,9 +1015,8 @@ describe("diagnostics-otel service", () => {
         "openclaw.source": "webhook",
       }),
     );
-    expect(
-      telemetryState.histograms.get("openclaw.message.dispatch.duration_ms")?.record,
-    ).toHaveBeenCalledWith(
+    expectHistogram(
+      "openclaw.message.dispatch.duration_ms",
       30,
       expect.objectContaining({
         "openclaw.channel": "unknown",
@@ -1015,28 +1024,21 @@ describe("diagnostics-otel service", () => {
         "openclaw.source": "unknown",
       }),
     );
-    expect(
-      telemetryState.histograms.get("openclaw.message.duration_ms")?.record,
-    ).toHaveBeenCalledWith(55, {
+    expectHistogram("openclaw.message.duration_ms", 55, {
       "openclaw.channel": "telegram",
       "openclaw.outcome": "completed",
     });
-    expect(telemetryState.histograms.get("openclaw.queue.wait_ms")?.record).toHaveBeenCalledWith(
-      10,
-      {
-        "openclaw.lane": "main",
-      },
-    );
+    expectHistogram("openclaw.queue.wait_ms", 10, {
+      "openclaw.lane": "main",
+    });
     expect(telemetryState.counters.get("openclaw.session.stuck")?.add).toHaveBeenCalledTimes(1);
-    expect(telemetryState.counters.get("openclaw.session.stuck")?.add).toHaveBeenCalledWith(1, {
+    expectCounter("openclaw.session.stuck", 1, {
       "openclaw.state": "processing",
     });
-    expect(
-      telemetryState.histograms.get("openclaw.session.stuck_age_ms")?.record,
-    ).toHaveBeenCalledWith(125_000, {
+    expectHistogram("openclaw.session.stuck_age_ms", 125_000, {
       "openclaw.state": "processing",
     });
-    expect(telemetryState.counters.get("openclaw.run.attempt")?.add).toHaveBeenCalledWith(1, {
+    expectCounter("openclaw.run.attempt", 1, {
       "openclaw.attempt": 2,
     });
 
@@ -1046,14 +1048,11 @@ describe("diagnostics-otel service", () => {
       channel: "telegram",
       trigger: "user",
     });
-    expect(telemetryState.counters.get("openclaw.session.turn.created")?.add).toHaveBeenCalledWith(
-      1,
-      {
-        "openclaw.agent": "agent.default",
-        "openclaw.channel": "telegram",
-        "openclaw.trigger": "user",
-      },
-    );
+    expectCounter("openclaw.session.turn.created", 1, {
+      "openclaw.agent": "agent.default",
+      "openclaw.channel": "telegram",
+      "openclaw.trigger": "user",
+    });
 
     const spanNames = telemetryState.tracer.startSpan.mock.calls.map((call) => call[0]);
     expect(spanNames).toContain("openclaw.webhook.processed");
@@ -1178,27 +1177,13 @@ describe("diagnostics-otel service", () => {
 
     await expect(service.stop?.(ctx)).rejects.toThrow("private shutdown details");
     await waitForDiagnosticEventsDrained();
-    expect(events.map(({ status, reason }) => ({ status, reason }))).toEqual([
-      { status: "started", reason: "configured" },
-      { status: "failure", reason: "shutdown_failed" },
+    expect(project(events, ["status", "reason"])).toEqual([
+      ["started", "configured"],
+      ["failure", "shutdown_failed"],
     ]);
-    expect(
-      getReportedExporterHealth(ctx).map(({ transport, status, reason }) => ({
-        transport,
-        status,
-        reason,
-      })),
-    ).toEqual([
-      {
-        transport: "otlp-http-protobuf",
-        status: "started",
-        reason: "configured",
-      },
-      {
-        transport: "otlp-http-protobuf",
-        status: "failure",
-        reason: "shutdown_failed",
-      },
+    expect(project(getReportedExporterHealth(ctx), ["transport", "status", "reason"])).toEqual([
+      ["otlp-http-protobuf", "started", "configured"],
+      ["otlp-http-protobuf", "failure", "shutdown_failed"],
     ]);
 
     await expect(service.stop?.(ctx)).resolves.toBeUndefined();
@@ -1245,39 +1230,27 @@ describe("diagnostics-otel service", () => {
     );
     expect(meterProviderShutdown).toHaveBeenCalledOnce();
     await waitForDiagnosticEventsDrained();
-    expect(events.map(({ status, reason }) => ({ status, reason }))).toEqual([
-      { status: "failure", reason: "start_failed" },
-      { status: "failure", reason: "start_failed" },
+    expect(project(events, ["status", "reason"])).toEqual([
+      ["failure", "start_failed"],
+      ["failure", "start_failed"],
     ]);
     expect(
-      getReportedExporterHealth(ctx).map(({ signal, transport, endpointMode, status, reason }) => ({
-        signal,
-        transport,
-        endpointMode,
-        status,
-        reason,
-      })),
+      project(getReportedExporterHealth(ctx), [
+        "signal",
+        "transport",
+        "endpointMode",
+        "status",
+        "reason",
+      ]),
     ).toEqual([
-      {
-        signal: "traces",
-        transport: "otlp-http-protobuf",
-        endpointMode: "configured",
-        status: "failure",
-        reason: "start_failed",
-      },
-      {
-        signal: "metrics",
-        transport: "otlp-http-protobuf",
-        endpointMode: "configured",
-        status: "failure",
-        reason: "start_failed",
-      },
+      ["traces", "otlp-http-protobuf", "configured", "failure", "start_failed"],
+      ["metrics", "otlp-http-protobuf", "configured", "failure", "start_failed"],
     ]);
     await expect(service.stop?.(ctx)).resolves.toBeUndefined();
     await waitForDiagnosticEventsDrained();
-    expect(events.map(({ status, reason }) => ({ status, reason }))).toEqual([
-      { status: "failure", reason: "start_failed" },
-      { status: "failure", reason: "start_failed" },
+    expect(project(events, ["status", "reason"])).toEqual([
+      ["failure", "start_failed"],
+      ["failure", "start_failed"],
     ]);
     expect(getReportedExporterHealth(ctx).at(-1)).toMatchObject({
       transport: "otlp-http-protobuf",
@@ -1423,27 +1396,13 @@ describe("diagnostics-otel service", () => {
     });
     await waitForDiagnosticEventsDrained();
 
-    expect(events.map(({ signal, status }) => ({ signal, status }))).toEqual([
-      { signal: "traces", status: "started" },
-      { signal: "metrics", status: "started" },
+    expect(project(events, ["signal", "status"])).toEqual([
+      ["traces", "started"],
+      ["metrics", "started"],
     ]);
-    expect(
-      getReportedExporterHealth(ctx).map(({ signal, transport, status }) => ({
-        signal,
-        transport,
-        status,
-      })),
-    ).toEqual([
-      {
-        signal: "traces",
-        transport: "external-sdk",
-        status: "started",
-      },
-      {
-        signal: "metrics",
-        transport: "external-sdk",
-        status: "started",
-      },
+    expect(project(getReportedExporterHealth(ctx), ["signal", "transport", "status"])).toEqual([
+      ["traces", "external-sdk", "started"],
+      ["metrics", "external-sdk", "started"],
     ]);
     expect(traceExporterCtor).not.toHaveBeenCalled();
     expect(metricExporterCtor).not.toHaveBeenCalled();
@@ -1474,25 +1433,11 @@ describe("diagnostics-otel service", () => {
       await service.stop?.(ctx);
       await waitForDiagnosticEventsDrained();
 
-      expect(
-        getReportedExporterHealth(ctx).map(({ transport, status, reason }) => ({
-          transport,
-          status,
-          reason,
-        })),
-      ).toEqual([
-        {
-          transport: "otlp-http-protobuf",
-          status: "failure",
-          reason: "unsupported_protocol",
-        },
-        { transport: "otlp-http-protobuf", status: "dropped", reason: undefined },
-        {
-          transport: "otlp-http-protobuf",
-          status: "failure",
-          reason: "unsupported_protocol",
-        },
-        { transport: "otlp-http-protobuf", status: "dropped", reason: undefined },
+      expect(project(getReportedExporterHealth(ctx), ["transport", "status", "reason"])).toEqual([
+        ["otlp-http-protobuf", "failure", "unsupported_protocol"],
+        ["otlp-http-protobuf", "dropped", undefined],
+        ["otlp-http-protobuf", "failure", "unsupported_protocol"],
+        ["otlp-http-protobuf", "dropped", undefined],
       ]);
     } finally {
       await service.stop?.(ctx);
@@ -1514,20 +1459,15 @@ describe("diagnostics-otel service", () => {
       await service.start(ctx);
       await waitForDiagnosticEventsDrained();
 
-      expect(
-        getReportedExporterHealth(ctx).map(({ transport, status }) => ({
-          transport,
-          status,
-        })),
-      ).toEqual([
-        { transport: "otlp-http-protobuf", status: "started" },
-        { transport: "stdout", status: "started" },
-        { transport: "otlp-http-protobuf", status: "dropped" },
-        { transport: "stdout", status: "dropped" },
-        { transport: "stdout", status: "started" },
-        { transport: "stdout", status: "dropped" },
-        { transport: "otlp-http-protobuf", status: "started" },
-        { transport: "stdout", status: "started" },
+      expect(project(getReportedExporterHealth(ctx), ["transport", "status"])).toEqual([
+        ["otlp-http-protobuf", "started"],
+        ["stdout", "started"],
+        ["otlp-http-protobuf", "dropped"],
+        ["stdout", "dropped"],
+        ["stdout", "started"],
+        ["stdout", "dropped"],
+        ["otlp-http-protobuf", "started"],
+        ["stdout", "started"],
       ]);
     } finally {
       await service.stop?.(ctx);
@@ -1667,21 +1607,15 @@ describe("diagnostics-otel service", () => {
         },
       ],
       metrics: [
-        [
-          "counter",
-          "openclaw.liveness.warning",
-          [[1, { "openclaw.liveness.reason": "event_loop_delay:cpu" }]],
-        ],
-        [
-          "histogram",
-          "openclaw.liveness.event_loop_delay_p99_ms",
-          [[250, { "openclaw.liveness.reason": "event_loop_delay:cpu" }]],
-        ],
-        [
-          "histogram",
-          "openclaw.liveness.cpu_core_ratio",
-          [[1.4, { "openclaw.liveness.reason": "event_loop_delay:cpu" }]],
-        ],
+        counter("openclaw.liveness.warning", 1, {
+          "openclaw.liveness.reason": "event_loop_delay:cpu",
+        }),
+        histogram("openclaw.liveness.event_loop_delay_p99_ms", 250, {
+          "openclaw.liveness.reason": "event_loop_delay:cpu",
+        }),
+        histogram("openclaw.liveness.cpu_core_ratio", 1.4, {
+          "openclaw.liveness.reason": "event_loop_delay:cpu",
+        }),
       ],
       span: {
         name: "openclaw.liveness.warning",
@@ -1710,8 +1644,8 @@ describe("diagnostics-otel service", () => {
         },
       ],
       metrics: [
-        ["counter", "openclaw.payload.large", [[1, payloadAttributes]]],
-        ["histogram", "openclaw.payload.large_bytes", [[2048, payloadAttributes]]],
+        counter("openclaw.payload.large", 1, payloadAttributes),
+        histogram("openclaw.payload.large_bytes", 2048, payloadAttributes),
       ],
     },
     {
@@ -1727,20 +1661,15 @@ describe("diagnostics-otel service", () => {
         },
       ],
       metrics: [
-        [
-          "histogram",
+        histogram(
           "openclaw.run.duration_ms",
-          [
-            [
-              100,
-              expect.objectContaining({
-                "openclaw.outcome": "blocked",
-                "openclaw.blocked_by": "policy-plugin",
-              }),
-            ],
-          ],
+          100,
+          expect.objectContaining({
+            "openclaw.outcome": "blocked",
+            "openclaw.blocked_by": "policy-plugin",
+          }),
           "last",
-        ],
+        ),
       ],
       stateOmits: ["matched secret prompt"],
     },
@@ -1761,7 +1690,7 @@ describe("diagnostics-otel service", () => {
           trace: createTestTrace(TOOL_SPAN_ID, CHILD_SPAN_ID),
         },
       ],
-      metrics: [["counter", "openclaw.skill.used", [[1, skillAttributes]]]],
+      metrics: [counter("openclaw.skill.used", 1, skillAttributes)],
       span: {
         name: "openclaw.skill.used",
         attributes: skillAttributes,
@@ -1785,7 +1714,7 @@ describe("diagnostics-otel service", () => {
           pairedToolName: "read",
         },
       ],
-      metrics: [["counter", "openclaw.tool.loop", [[1, loopAttributes]]]],
+      metrics: [counter("openclaw.tool.loop", 1, loopAttributes)],
       span: {
         name: "openclaw.tool.loop",
         attributes: loopAttributes,
@@ -1825,19 +1754,15 @@ describe("diagnostics-otel service", () => {
         },
       ],
       metrics: [
-        [
-          "histogram",
-          "openclaw.memory.rss_bytes",
-          [
-            [100, {}],
-            [200, { "openclaw.memory.level": "critical", "openclaw.memory.reason": "rss_growth" }],
-          ],
-        ],
-        [
-          "counter",
-          "openclaw.memory.pressure",
-          [[1, { "openclaw.memory.level": "critical", "openclaw.memory.reason": "rss_growth" }]],
-        ],
+        histogram("openclaw.memory.rss_bytes", 100, {}),
+        histogram("openclaw.memory.rss_bytes", 200, {
+          "openclaw.memory.level": "critical",
+          "openclaw.memory.reason": "rss_growth",
+        }),
+        counter("openclaw.memory.pressure", 1, {
+          "openclaw.memory.level": "critical",
+          "openclaw.memory.reason": "rss_growth",
+        }),
       ],
       span: {
         name: "openclaw.memory.pressure",
@@ -1873,16 +1798,18 @@ describe("diagnostics-otel service", () => {
         },
       ],
       metrics: [
-        [
-          "counter",
-          "openclaw.diagnostic.async_queue.dropped",
-          [
-            [4, { "openclaw.diagnostic.async_queue.drop_class": "total" }],
-            [1, { "openclaw.diagnostic.async_queue.drop_class": "trusted" }],
-            [2, { "openclaw.diagnostic.async_queue.drop_class": "untrusted" }],
-            [1, { "openclaw.diagnostic.async_queue.drop_class": "priority" }],
-          ],
-        ],
+        counter("openclaw.diagnostic.async_queue.dropped", 4, {
+          "openclaw.diagnostic.async_queue.drop_class": "total",
+        }),
+        counter("openclaw.diagnostic.async_queue.dropped", 1, {
+          "openclaw.diagnostic.async_queue.drop_class": "trusted",
+        }),
+        counter("openclaw.diagnostic.async_queue.dropped", 2, {
+          "openclaw.diagnostic.async_queue.drop_class": "untrusted",
+        }),
+        counter("openclaw.diagnostic.async_queue.dropped", 1, {
+          "openclaw.diagnostic.async_queue.drop_class": "priority",
+        }),
       ],
     },
     {
@@ -1934,66 +1861,44 @@ describe("diagnostics-otel service", () => {
         },
       ],
       metrics: [
-        [
-          "counter",
+        counter(
           "openclaw.session.recovery.requested",
-          [
-            [
-              1,
-              expect.objectContaining({
-                "openclaw.state": "processing",
-                "openclaw.action": "abort",
-                "openclaw.active_work_kind": "tool_call",
-              }),
-            ],
-          ],
+          1,
+          expect.objectContaining({
+            "openclaw.state": "processing",
+            "openclaw.action": "abort",
+            "openclaw.active_work_kind": "tool_call",
+          }),
           "first",
-        ],
-        [
-          "counter",
+        ),
+        counter(
           "openclaw.session.recovery.completed",
-          [
-            [
-              1,
-              expect.objectContaining({
-                "openclaw.state": "processing",
-                "openclaw.status": "released",
-                "openclaw.action": "abort-active-run",
-              }),
-            ],
-          ],
+          1,
+          expect.objectContaining({
+            "openclaw.state": "processing",
+            "openclaw.status": "released",
+            "openclaw.action": "abort-active-run",
+          }),
           "first",
-        ],
-        [
-          "histogram",
+        ),
+        histogram(
           "openclaw.session.recovery.age_ms",
-          [[13_000, expect.objectContaining({ "openclaw.status": "released" })]],
+          13_000,
+          expect.objectContaining({ "openclaw.status": "released" }),
           "last",
-        ],
-        [
-          "counter",
-          "openclaw.talk.event",
-          [[1, audioAttributes]],
-          undefined,
-          ["talk-session-should-not-export", "turn-should-not-export"],
-        ],
-        ["histogram", "openclaw.talk.audio.bytes", [[320, audioAttributes]]],
-        [
-          "histogram",
-          "openclaw.talk.event.duration_ms",
-          [
-            [
-              45,
-              {
-                "openclaw.talk.brain": "agent-consult",
-                "openclaw.talk.event_type": "latency.metrics",
-                "openclaw.talk.mode": "realtime",
-                "openclaw.talk.provider": "openai",
-                "openclaw.talk.transport": "gateway-relay",
-              },
-            ],
-          ],
-        ],
+        ),
+        counter("openclaw.talk.event", 1, audioAttributes, undefined, [
+          "talk-session-should-not-export",
+          "turn-should-not-export",
+        ]),
+        histogram("openclaw.talk.audio.bytes", 320, audioAttributes),
+        histogram("openclaw.talk.event.duration_ms", 45, {
+          "openclaw.talk.brain": "agent-consult",
+          "openclaw.talk.event_type": "latency.metrics",
+          "openclaw.talk.mode": "realtime",
+          "openclaw.talk.provider": "openai",
+          "openclaw.talk.transport": "gateway-relay",
+        }),
       ],
     },
     {
@@ -2007,14 +1912,14 @@ describe("diagnostics-otel service", () => {
         },
       ], // pragma: allowlist secret
       metrics: [
-        [
-          "counter",
+        counter(
           "openclaw.session.state",
-          [[1, expect.objectContaining({ "openclaw.reason": expect.stringContaining("…") })]],
+          1,
+          expect.objectContaining({ "openclaw.reason": expect.stringContaining("…") }),
           "first",
-          ["ghp_abcdefghijklmnopqrstuvwxyz123456"],
-        ],
-      ], // pragma: allowlist secret
+          ["ghp_abcdefghijklmnopqrstuvwxyz123456"], // pragma: allowlist secret
+        ),
+      ],
     },
     {
       name: "session-shaped queue lane",
@@ -2023,13 +1928,9 @@ describe("diagnostics-otel service", () => {
         { type: "queue.lane.enqueue", lane: "session:Agent:qa:otel-trace-smoke", queueSize: 2 },
       ],
       metrics: [
-        [
-          "counter",
-          "openclaw.queue.lane.enqueue",
-          [[1, { "openclaw.lane": "session" }]],
-          undefined,
-          ["Agent:qa:otel-trace-smoke"],
-        ],
+        counter("openclaw.queue.lane.enqueue", 1, { "openclaw.lane": "session" }, undefined, [
+          "Agent:qa:otel-trace-smoke",
+        ]),
       ],
     },
   ])(
@@ -2040,17 +1941,15 @@ describe("diagnostics-otel service", () => {
         (trusted ? emitTrustedDiagnosticEvent : emitDiagnosticEvent)(event);
       }
       await flushDiagnosticEvents();
-      for (const [kind, name, calls, position, omittedText] of metrics) {
+      for (const [kind, name, value, attributes, position, omittedText] of metrics) {
         const record =
           kind === "counter"
             ? telemetryState.counters.get(name)?.add
             : telemetryState.histograms.get(name)?.record;
-        for (const args of calls) {
-          if (position) {
-            expect(record?.mock.calls.at(position === "first" ? 0 : -1)).toEqual(args);
-          } else {
-            expect(record).toHaveBeenCalledWith(...args);
-          }
+        if (position) {
+          expect(record?.mock.calls.at(position === "first" ? 0 : -1)).toEqual([value, attributes]);
+        } else {
+          expect(record).toHaveBeenCalledWith(value, attributes);
         }
         for (const text of omittedText ?? []) {
           expect(JSON.stringify(record?.mock.calls)).not.toContain(text);
@@ -2102,9 +2001,9 @@ describe("diagnostics-otel service", () => {
           (event) => event.transport === transport && event.reason === "emit_failed",
         );
         if (stdout) {
-          expect(health.map(({ status, errorCategory }) => ({ status, errorCategory }))).toEqual([
-            { status: "failure", errorCategory: "TypeError" },
-            { status: "recovered", errorCategory: undefined },
+          expect(project(health, ["status", "errorCategory"])).toEqual([
+            ["failure", "TypeError"],
+            ["recovered", undefined],
           ]);
           expect(events.map((event) => event.status)).not.toContain("recovered");
           expect(stdout.writes).toHaveLength(1);
@@ -2120,9 +2019,7 @@ describe("diagnostics-otel service", () => {
             reason: "emit_failed",
             errorCategory: "TypeError",
           });
-          expect(
-            telemetryState.counters.get("openclaw.telemetry.exporter.events")?.add,
-          ).toHaveBeenCalledWith(1, {
+          expectCounter("openclaw.telemetry.exporter.events", 1, {
             "openclaw.exporter": "diagnostics-otel",
             "openclaw.signal": "logs",
             "openclaw.status": "failure",
@@ -2182,25 +2079,27 @@ describe("diagnostics-otel service", () => {
     await waitForDiagnosticEventsDrained();
 
     expect(
-      getReportedExporterHealth(ctx)
-        .filter((event) => event.transport === "otlp-http-protobuf")
-        .map(({ status, reason }) => ({ status, reason })),
+      project(
+        getReportedExporterHealth(ctx).filter((event) => event.transport === "otlp-http-protobuf"),
+        ["status", "reason"],
+      ),
     ).toEqual([
-      { status: "started", reason: "configured" },
-      { status: "failure", reason: "export_failed" },
+      ["started", "configured"],
+      ["failure", "export_failed"],
     ]);
 
     exporter.export([], vi.fn());
     completeExport?.({ code: ExportResultCode.SUCCESS });
     await waitForDiagnosticEventsDrained();
     expect(
-      getReportedExporterHealth(ctx)
-        .filter((event) => event.transport === "otlp-http-protobuf")
-        .map(({ status, reason }) => ({ status, reason })),
+      project(
+        getReportedExporterHealth(ctx).filter((event) => event.transport === "otlp-http-protobuf"),
+        ["status", "reason"],
+      ),
     ).toEqual([
-      { status: "started", reason: "configured" },
-      { status: "failure", reason: "export_failed" },
-      { status: "recovered", reason: "export_failed" },
+      ["started", "configured"],
+      ["failure", "export_failed"],
+      ["recovered", "export_failed"],
     ]);
     expect(events.map((event) => event.status)).not.toContain("recovered");
     expect(JSON.stringify({ events, health: getReportedExporterHealth(ctx) })).not.toContain(
@@ -2258,26 +2157,9 @@ describe("diagnostics-otel service", () => {
     recordLog(2, attributes);
     recordLog(3, {});
 
-    expect(
-      events.map(({ transport, status, reason, errorCategory }) => ({
-        transport,
-        status,
-        reason,
-        errorCategory,
-      })),
-    ).toEqual([
-      {
-        transport: "otlp-http-protobuf",
-        status: "failure",
-        reason: "emit_failed",
-        errorCategory: "TypeError",
-      },
-      {
-        transport: "otlp-http-protobuf",
-        status: "recovered",
-        reason: "emit_failed",
-        errorCategory: undefined,
-      },
+    expect(project(events, ["transport", "status", "reason", "errorCategory"])).toEqual([
+      ["otlp-http-protobuf", "failure", "emit_failed", "TypeError"],
+      ["otlp-http-protobuf", "recovered", "emit_failed", undefined],
     ]);
     expect(JSON.stringify(events)).not.toContain("private preparation details");
     expect(logger.error).toHaveBeenCalledWith(
@@ -2819,22 +2701,19 @@ describe("diagnostics-otel service", () => {
     expectAbsent(toolOptions, "kind");
     expect(toolCall?.[2]).toBeUndefined();
 
-    const modelCallDuration = lastHistogramRecord("openclaw.model_call.duration_ms");
-    expect(modelCallDuration?.[0]).toBe(80);
-    expect(modelCallDuration?.[1]?.["openclaw.provider"]).toBe("openai");
-    expect(modelCallDuration?.[1]?.["openclaw.model"]).toBe("gpt-5.4");
-    const requestBytes = lastHistogramRecord("openclaw.model_call.request_bytes");
-    expect(requestBytes?.[0]).toBe(1234);
-    expect(requestBytes?.[1]?.["openclaw.provider"]).toBe("openai");
-    expect(requestBytes?.[1]?.["openclaw.model"]).toBe("gpt-5.4");
-    const responseBytes = lastHistogramRecord("openclaw.model_call.response_bytes");
-    expect(responseBytes?.[0]).toBe(567);
-    expect(responseBytes?.[1]?.["openclaw.provider"]).toBe("openai");
-    expect(responseBytes?.[1]?.["openclaw.model"]).toBe("gpt-5.4");
-    const timeToFirstByte = lastHistogramRecord("openclaw.model_call.time_to_first_byte_ms");
-    expect(timeToFirstByte?.[0]).toBe(45);
-    expect(timeToFirstByte?.[1]?.["openclaw.provider"]).toBe("openai");
-    expect(timeToFirstByte?.[1]?.["openclaw.model"]).toBe("gpt-5.4");
+    for (const [metric, value] of [
+      ["duration_ms", 80],
+      ["request_bytes", 1234],
+      ["response_bytes", 567],
+      ["time_to_first_byte_ms", 45],
+    ] as const) {
+      const record = lastHistogramRecord(`openclaw.model_call.${metric}`);
+      expect(record?.[0]).toBe(value);
+      expect(record?.[1]).toMatchObject({
+        "openclaw.provider": "openai",
+        "openclaw.model": "gpt-5.4",
+      });
+    }
     const modelSpanAttributes = firstSpanAttributes("openclaw.model.call");
     expect(modelSpanAttributes).toMatchObject({
       "openclaw.model_call.request_bytes": 1234,
@@ -3502,9 +3381,7 @@ describe("diagnostics-otel service", () => {
       sessionKey: "session-secret",
     });
 
-    expect(
-      telemetryState.counters.get("openclaw.message.delivery.started")?.add,
-    ).toHaveBeenCalledWith(1, {
+    expectCounter("openclaw.message.delivery.started", 1, {
       "openclaw.channel": "matrix",
       "openclaw.delivery.kind": "text",
     });
