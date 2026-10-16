@@ -208,7 +208,11 @@ describe("delivery-queue recovery", () => {
   async function expectPendingEntry(expected: Record<string, unknown>) {
     const entries = await loadPendingDeliveries(tmpDir());
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toMatchObject(expected);
+    const entry = entries[0];
+    assert(entry, "Expected one pending entry");
+    for (const [key, value] of Object.entries(expected)) {
+      expect(Reflect.get(entry, key)).toEqual(value);
+    }
     return entries[0];
   }
   async function enqueueClaimedRecoveryDelivery(
