@@ -1,39 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it, vi, type Mock } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { registerAgentWorkspaceAccess } from "../../agents/workspace-access.js";
 import { FsSafeError, type ReadResult } from "../../infra/fs-safe.js";
 import {
   expectRecordFields,
   expectRespondErrorContaining,
   expectRespondOk,
+  agentConfig,
   expectUncalled,
-  expectStringContaining,
-  expectStringNotContaining,
   mockCallArg,
 } from "./agents-mutate.test-support.js";
+import type { AgentMutationHarness } from "./agents-mutate.test.js";
 
-type IdentityUpdateHarness = {
-  mocks: {
-    loadConfigReturn: Record<string, unknown>;
-    applyAgentConfig: Mock<(cfg: unknown, opts: unknown) => unknown>;
-    ensureAgentWorkspace: Mock<
-      (params?: { dir?: string }) => Promise<{ dir: string; identityPathCreated: boolean }>
-    >;
-    rootRead: Mock<(params: { rootDir: string; relativePath: string }) => Promise<ReadResult>>;
-    rootWrite: Mock<(params?: unknown) => Promise<void>>;
-    writeConfigFile: Mock<(nextConfig?: unknown, writeOptions?: unknown) => Promise<void>>;
-    fsMkdir: unknown;
-  };
-  makeCall: (
-    method: "agents.update",
-    params: Record<string, unknown>,
-  ) => { respond: Mock; promise: Promise<void> | void };
-  makeFileStat: () => import("node:fs").Stats;
-  createEnoentError: () => Error;
-};
-
-/** Share the mutation harness while exercising identity changes through agents.update. */
-export function registerAgentIdentityUpdateTests(harness: IdentityUpdateHarness): void {
+export function registerAgentIdentityUpdateTests(harness: AgentMutationHarness): void {
   const { mocks, makeCall, makeFileStat, createEnoentError } = harness;
   function identityRead(rootDir: string, relativePath: string, content: string): ReadResult {
     return {
@@ -58,9 +37,9 @@ export function registerAgentIdentityUpdateTests(harness: IdentityUpdateHarness)
       "updates the identity form through remote workspace access when %s",
       async (state) => {
         const workspace = `/remote-identity-${randomUUID()}`;
-        mocks.loadConfigReturn = {
-          agents: { entries: { "test-agent": { workspace, identity: { name: "Current Agent" } } } },
-        };
+        mocks.loadConfigReturn = agentConfig({
+          "test-agent": { workspace, identity: { name: "Current Agent" } },
+        });
         let release = () => {};
         const readFile = vi.fn(async () => {
           if (state === "revoked") {
@@ -157,108 +136,100 @@ export function registerAgentIdentityUpdateTests(harness: IdentityUpdateHarness)
 
       expectRespondOk(respond, { ok: true, agentId: "test-agent" });
       expectRecordFields(mockCallArg(mocks.rootRead), { relativePath: "IDENTITY.md" });
-      const configOptions = expectRecordFields(mockCallArg(mocks.applyAgentConfig, 0, 1), {
+      expectRecordFields(mockCallArg(mocks.applyAgentConfig, 0, 1), {
         name: "New Name",
+        identity: expect.objectContaining({
+          name: "New Name",
+          emoji: "🤖",
+          avatar: "https://example.com/new.png",
+        }),
       });
-      expectRecordFields(configOptions.identity, {
-        name: "New Name",
-        emoji: "🤖",
-        avatar: "https://example.com/new.png",
-      });
-      const write = expectRecordFields(mockCallArg(mocks.rootWrite), {
+      expectRecordFields(mockCallArg(mocks.rootWrite), {
         rootDir: "/workspace/test-agent",
         relativePath: "IDENTITY.md",
+        data: "# IDENTITY.md - Agent Identity\n\n- Name: New Name\n- Theme: steady\n- Emoji: 🤖\n- Avatar: https://example.com/new.png\n",
       });
-      expect(write.data).toBe(
-        "# IDENTITY.md - Agent Identity\n\n- Name: New Name\n- Theme: steady\n- Emoji: 🤖\n- Avatar: https://example.com/new.png\n",
-      );
     });
 
-    it("syncs existing identity into a new workspace even without identity params", async () => {
-      mocks.ensureAgentWorkspace.mockResolvedValueOnce({
-        dir: "/resolved/new/workspace",
-        identityPathCreated: true,
-      });
-      readIdentities({
-        "/workspace/test-agent/IDENTITY.md":
-          "# IDENTITY.md - Agent Identity\n\n- **Name:** Current Agent\n- **Creature:** Steady Turtle\n- **Vibe:** Calm and methodical\n- **Emoji:** 🐢\n\n## Role\n\nProtect the queue.\n",
-        "/resolved/new/workspace/IDENTITY.md":
-          "# IDENTITY.md - Agent Identity\n\n- **Name:** C-3PO (Clawd's Third Protocol Observer)\n- **Creature:** Flustered Protocol Droid\n\n## Role\n\nDebug agent for `--dev` mode.\n",
-      });
+    it.each([
+      {
+        created: true,
+        source:
+          "- Name: Current Agent\n- **Creature:** Steady Turtle\n\n## Role\nProtect the queue.\n",
+        destination: "- Name: Dev Agent\n- **Creature:** Flustered Protocol Droid\n",
+        kept: ["- **Creature:** Steady Turtle", "## Role"],
+        removed: "Flustered Protocol Droid",
+      },
+      {
+        created: false,
+        source:
+          "- Name: Current Agent\n- **Creature:** Old Turtle\n\n## Role\nOld workspace role.\n",
+        destination:
+          "- Name: Destination Agent\n- **Creature:** Destination Fox\n\n## Role\nDestination workspace role.\n",
+        kept: ["- **Creature:** Destination Fox", "Destination workspace role."],
+        removed: "Old workspace role.",
+      },
+    ])(
+      "preserves the correct identity when moving workspace (new=$created)",
+      async ({ created, source, destination, kept, removed }) => {
+        mocks.ensureAgentWorkspace.mockResolvedValueOnce({
+          dir: "/resolved/new/workspace",
+          identityPathCreated: created,
+        });
+        readIdentities({
+          "/workspace/test-agent/IDENTITY.md": source,
+          "/resolved/new/workspace/IDENTITY.md": destination,
+        });
+        const { respond, promise } = makeCall("agents.update", {
+          agentId: "test-agent",
+          workspace: "/new/workspace",
+        });
+        await promise;
+        expectRespondOk(respond, { ok: true, agentId: "test-agent" });
+        const write = expectRecordFields(mockCallArg(mocks.rootWrite), {
+          rootDir: "/resolved/new/workspace",
+          relativePath: "IDENTITY.md",
+        });
+        for (const content of kept) {
+          expect(write.data).toEqual(expect.stringContaining(content));
+        }
+        expect(typeof write.data).toBe("string");
+        expect(write.data).not.toContain(removed);
+      },
+    );
 
-      const { respond, promise } = makeCall("agents.update", {
-        agentId: "test-agent",
-        workspace: "/new/workspace",
-      });
-      await promise;
-
-      expectRespondOk(respond, { ok: true, agentId: "test-agent" });
-      const write = expectRecordFields(mockCallArg(mocks.rootWrite), {
-        rootDir: "/resolved/new/workspace",
-        relativePath: "IDENTITY.md",
-      });
-      expectStringContaining(write.data, "- **Creature:** Steady Turtle");
-      expectStringContaining(write.data, "## Role");
-      expectStringNotContaining(write.data, "Flustered Protocol Droid");
-    });
-
-    it("preserves an existing destination identity file when workspace changes", async () => {
-      mocks.ensureAgentWorkspace.mockResolvedValueOnce({
-        dir: "/resolved/new/workspace",
-        identityPathCreated: false,
-      });
-      readIdentities({
-        "/workspace/test-agent/IDENTITY.md":
-          "# IDENTITY.md - Agent Identity\n\n- **Name:** Current Agent\n- **Creature:** Old Turtle\n\n## Role\n\nOld workspace role.\n",
-        "/resolved/new/workspace/IDENTITY.md":
-          "# IDENTITY.md - Agent Identity\n\n- **Name:** Destination Agent\n- **Creature:** Destination Fox\n\n## Role\n\nDestination workspace role.\n",
-      });
-
-      const { respond, promise } = makeCall("agents.update", {
-        agentId: "test-agent",
-        workspace: "/new/workspace",
-      });
-      await promise;
-
-      expectRespondOk(respond, { ok: true, agentId: "test-agent" });
-      const write = expectRecordFields(mockCallArg(mocks.rootWrite), {
-        rootDir: "/resolved/new/workspace",
-        relativePath: "IDENTITY.md",
-      });
-      expectStringContaining(write.data, "- **Creature:** Destination Fox");
-      expectStringContaining(write.data, "Destination workspace role.");
-      expectStringNotContaining(write.data, "Old workspace role.");
-    });
-
-    it("does not persist config when IDENTITY.md write fails on update", async () => {
-      mocks.rootWrite.mockRejectedValueOnce(
-        new FsSafeError("path-mismatch", "path escapes workspace root"),
-      );
-
-      const { respond, promise } = makeCall("agents.update", {
-        agentId: "test-agent",
-        name: "Bad Update",
-        avatar: "https://example.com/avatar.png",
-      });
-      await promise;
-
-      expectRespondErrorContaining(respond, "unsafe workspace file");
-      expect(mocks.writeConfigFile).not.toHaveBeenCalled();
-    });
-
-    it("treats unsafe IDENTITY.md reads as invalid update requests", async () => {
-      mocks.rootRead.mockRejectedValue(
-        new FsSafeError("invalid-path", "path is not a regular file under root"),
-      );
-
-      const { respond, promise } = makeCall("agents.update", {
-        agentId: "test-agent",
-        avatar: "https://example.com/unsafe.png",
-      });
-      await promise;
-
-      expectRespondErrorContaining(respond, 'unsafe workspace file "IDENTITY.md"');
-      expectUncalled(mocks.writeConfigFile, mocks.rootWrite);
-    });
+    it.each([
+      {
+        operation: "write",
+        error: new FsSafeError("path-mismatch", "path escapes workspace root"),
+        params: { name: "Bad Update", avatar: "https://example.com/avatar.png" },
+        message: "unsafe workspace file",
+      },
+      {
+        operation: "read",
+        error: new FsSafeError("invalid-path", "path is not a regular file under root"),
+        params: { avatar: "https://example.com/unsafe.png" },
+        message: 'unsafe workspace file "IDENTITY.md"',
+      },
+    ])(
+      "rejects unsafe identity $operation without persisting config",
+      async ({ operation, error, params, message }) => {
+        if (operation === "read") {
+          mocks.rootRead.mockRejectedValue(error);
+        } else {
+          mocks.rootWrite.mockRejectedValueOnce(error);
+        }
+        const { respond, promise } = makeCall("agents.update", {
+          agentId: "test-agent",
+          ...params,
+        });
+        await promise;
+        expectRespondErrorContaining(respond, message);
+        expect(mocks.writeConfigFile).not.toHaveBeenCalled();
+        if (operation === "read") {
+          expect(mocks.rootWrite).not.toHaveBeenCalled();
+        }
+      },
+    );
   });
 }

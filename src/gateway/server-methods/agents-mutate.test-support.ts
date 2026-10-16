@@ -5,6 +5,7 @@ import type {
   AgentDeletionJournalEntry,
 } from "../../state/agent-deletion-journal.js";
 import { expectObjectFields as expectRecordFields } from "../../test-utils/mock-call-assertions.js";
+import type { AgentMutationHarness } from "./agents-mutate.test.js";
 
 export { expectRecordFields };
 
@@ -29,6 +30,13 @@ export type MockConfig = {
     entries?: Record<string, Omit<MockAgentEntry, "id">>;
   };
 };
+
+export function agentConfig(
+  entries: Record<string, Omit<MockAgentEntry, "id">>,
+  defaults?: Record<string, unknown>,
+) {
+  return { agents: { entries, ...(defaults ? { defaults } : {}) } };
+}
 
 export function getAgentList(cfg: unknown): MockAgentEntry[] {
   return Object.entries((cfg as MockConfig | undefined)?.agents?.entries ?? {}).map(([id, entry]) =>
@@ -61,19 +69,8 @@ export function mergeAgentConfig(cfg: unknown, opts: unknown): MockConfig {
   }
   return {
     ...config,
-    agents: {
-      ...config.agents,
-      entries: { ...config.agents?.entries, [agentId]: nextEntry },
-    },
+    agents: { ...config.agents, entries: { ...config.agents?.entries, [agentId]: nextEntry } },
   };
-}
-
-export function resolveMockWorkspaceDir(cfg: unknown, agentId?: string): string {
-  const resolvedAgentId = agentId ?? "";
-  return (
-    getAgentList(cfg).find((entry) => entry.id === resolvedAgentId)?.workspace ??
-    `/workspace/${resolvedAgentId}`
-  );
 }
 
 export function cleanupPath(
@@ -121,104 +118,75 @@ export function deletionJournal(
   };
 }
 
-export function registerAgentCreationCommitTests(fixture: {
-  create: (params: Record<string, unknown>) => {
-    respond: ReturnType<typeof vi.fn>;
-    promise: void | Promise<void>;
-  };
-  configuredConfig: () => unknown;
-  ensureAgentWorkspace: Mock;
-  resolveAgentWorkspaceDir: Mock;
-  applyAgentConfig: Mock;
-  rootWrite: Mock;
-  writeConfigFile: Mock;
-  captureDeletedAgentDatabaseFences: Mock<() => [string, string][]>;
-  reviveAgentDatabases: Mock<(agentIds: readonly string[]) => Promise<void>>;
-  logGatewayWarn: Mock;
-}) {
-  it("creates a new agent successfully", async () => {
-    const { respond, promise } = fixture.create({
-      name: "Test Agent",
-      workspace: "/home/user/agents/test",
+export function registerAgentCreationCommitTests({ mocks, makeCall }: AgentMutationHarness) {
+  const create = (params: Record<string, unknown>) => makeCall("agents.create", params);
+  it.each([
+    { name: "Test Agent", workspace: "/home/user/agents/test", fancy: false },
+    { name: "Test Agent", workspace: undefined, fancy: false },
+    { name: "Fancy Agent", workspace: "/tmp/ws", fancy: true },
+  ])("creates $name (workspace=$workspace)", async ({ name, workspace, fancy }) => {
+    const { respond, promise } = create({
+      name,
+      ...(workspace ? { workspace } : {}),
+      ...(fancy
+        ? { model: "sonnet-4.6", emoji: "🤖", avatar: "https://example.com/avatar.png" }
+        : {}),
     });
     await promise;
-
-    expectRespondOk(respond, { ok: true, agentId: "test-agent", name: "Test Agent" });
-    expect(fixture.ensureAgentWorkspace).toHaveBeenCalled();
-    expect(fixture.writeConfigFile).toHaveBeenCalled();
-    expect(fixture.reviveAgentDatabases).not.toHaveBeenCalled();
-  });
-
-  it("defaults an omitted workspace", async () => {
-    const { respond, promise } = fixture.create({ name: "Test Agent" });
-    await promise;
-
-    expect(fixture.resolveAgentWorkspaceDir).toHaveBeenCalledWith(expect.any(Object), "test-agent");
     expectRespondOk(respond, {
       ok: true,
-      agentId: "test-agent",
-      workspace: "/resolved/workspace/test-agent",
+      agentId: fancy ? "fancy-agent" : "test-agent",
+      name,
+      ...(fancy ? { model: "sonnet-4.6" } : {}),
     });
+    expect(mocks.ensureAgentWorkspace).toHaveBeenCalled();
+    expect(mocks.writeConfigFile).toHaveBeenCalled();
+    expect(mocks.reviveAgentDatabases).not.toHaveBeenCalled();
+    if (!workspace) {
+      expect(mocks.resolveAgentWorkspaceDir).toHaveBeenCalledWith(expect.any(Object), "test-agent");
+      expectRespondOk(respond, { workspace: "/resolved/workspace/test-agent" });
+    }
+    if (fancy) {
+      expectRecordFields(mockCallArg(mocks.applyAgentConfig, 0, 1), {
+        model: "sonnet-4.6",
+        identity: expect.objectContaining({
+          name: "Fancy Agent",
+          emoji: "🤖",
+          avatar: "https://example.com/avatar.png",
+        }),
+      });
+      expectRecordFields(mockCallArg(mocks.rootWrite), {
+        rootDir: "/resolved/tmp/ws",
+        relativePath: "IDENTITY.md",
+        data: "# IDENTITY.md - Agent Identity\n\n- Name: Fancy Agent\n- Emoji: 🤖\n- Avatar: https://example.com/avatar.png\n",
+      });
+    }
   });
-
   it("reports committed creation when deleted database reader revival fails", async () => {
-    fixture.captureDeletedAgentDatabaseFences.mockReturnValue([
+    mocks.captureDeletedAgentDatabaseFences.mockReturnValue([
       ["/agents/test-agent/openclaw-agent.sqlite", "test-agent"],
     ]);
-    fixture.reviveAgentDatabases.mockRejectedValueOnce(new Error("worker acknowledgement failed"));
-    const { respond, promise } = fixture.create({ name: "Test Agent" });
+    mocks.reviveAgentDatabases.mockRejectedValueOnce(new Error("worker acknowledgement failed"));
+    const { respond, promise } = create({ name: "Test Agent" });
 
     await promise;
 
     expectRespondOk(respond, { ok: true, agentId: "test-agent" });
-    expect(fixture.configuredConfig()).toMatchObject({
+    expect(mocks.loadConfigReturn).toMatchObject({
       agents: { entries: { "test-agent": { name: "Test Agent" } } },
     });
-    expect(fixture.writeConfigFile).toHaveBeenCalledExactlyOnceWith(fixture.configuredConfig());
-    expect(fixture.reviveAgentDatabases).toHaveBeenCalledExactlyOnceWith(["test-agent"]);
-    expect(fixture.logGatewayWarn).toHaveBeenCalledExactlyOnceWith(
+    expect(mocks.writeConfigFile).toHaveBeenCalledExactlyOnceWith(mocks.loadConfigReturn);
+    expect(mocks.reviveAgentDatabases).toHaveBeenCalledExactlyOnceWith(["test-agent"]);
+    expect(mocks.logGatewayWarn).toHaveBeenCalledExactlyOnceWith(
       "agent config committed; worker reader revival will reconcile at next task: worker acknowledgement failed",
     );
   });
 
   it("rejects invalid params (missing name)", async () => {
-    const { respond, promise } = fixture.create({ workspace: "/tmp/ws" });
+    const { respond, promise } = create({ workspace: "/tmp/ws" });
     await promise;
 
     expectRespondErrorContaining(respond, "invalid");
-  });
-
-  it("writes emoji and avatar to both config and IDENTITY.md", async () => {
-    const { respond, promise } = fixture.create({
-      name: "Fancy Agent",
-      model: "sonnet-4.6",
-      workspace: "/tmp/ws",
-      emoji: "🤖",
-      avatar: "https://example.com/avatar.png",
-    });
-    await promise;
-
-    expectRespondOk(respond, {
-      ok: true,
-      agentId: "fancy-agent",
-      name: "Fancy Agent",
-      model: "sonnet-4.6",
-    });
-    const configOptions = expectRecordFields(mockCallArg(fixture.applyAgentConfig, 0, 1), {
-      model: "sonnet-4.6",
-    });
-    expectRecordFields(configOptions.identity, {
-      name: "Fancy Agent",
-      emoji: "🤖",
-      avatar: "https://example.com/avatar.png",
-    });
-    const write = expectRecordFields(mockCallArg(fixture.rootWrite), {
-      rootDir: "/resolved/tmp/ws",
-      relativePath: "IDENTITY.md",
-    });
-    expect(write.data).toBe(
-      "# IDENTITY.md - Agent Identity\n\n- Name: Fancy Agent\n- Emoji: 🤖\n- Avatar: https://example.com/avatar.png\n",
-    );
   });
 }
 
@@ -228,21 +196,23 @@ export function expectUncalled(...callbacks: unknown[]) {
   }
 }
 
-export function makeFileStat(params?: {
-  size?: number;
-  mtimeMs?: number;
-  dev?: number;
-  ino?: number;
-  nlink?: number;
-}): import("node:fs").Stats {
+export function makeFileStat({
+  size = 10,
+  mtimeMs = 1234,
+  dev = 1,
+  ino = 1,
+  nlink = 1,
+}: Partial<
+  Pick<import("node:fs").Stats, "size" | "mtimeMs" | "dev" | "ino" | "nlink">
+> = {}): import("node:fs").Stats {
   return {
     isFile: () => true,
     isSymbolicLink: () => false,
-    size: params?.size ?? 10,
-    mtimeMs: params?.mtimeMs ?? 1234,
-    dev: params?.dev ?? 1,
-    ino: params?.ino ?? 1,
-    nlink: params?.nlink ?? 1,
+    size,
+    mtimeMs,
+    dev,
+    ino,
+    nlink,
   } as unknown as import("node:fs").Stats;
 }
 
@@ -283,22 +253,8 @@ export function expectRespondErrorContaining(respond: ReturnType<typeof vi.fn>, 
   expect(mockCallArg(respond)).toBe(false);
   expect(mockCallArg(respond, 0, 1)).toBeUndefined();
   const error = expectRecordFields(mockCallArg(respond, 0, 2), {});
-  expectStringContaining(error.message, text);
+  expect(error.message).toEqual(expect.stringContaining(text));
   return error;
-}
-
-export function firstRespondResult(respond: ReturnType<typeof vi.fn>): unknown {
-  return mockCallArg(respond, 0, 1);
-}
-
-export function expectStringContaining(value: unknown, text: string) {
-  expect(typeof value).toBe("string");
-  expect(value as string).toContain(text);
-}
-
-export function expectStringNotContaining(value: unknown, text: string) {
-  expect(typeof value).toBe("string");
-  expect(value as string).not.toContain(text);
 }
 
 export function createTrashAssertions(
@@ -313,8 +269,11 @@ export function createTrashAssertions(
         }),
       );
     },
-    expectNotTrashed: (pathname: string): void => {
-      expect(movePathToTrash.mock.calls.map(([target]) => target)).not.toContain(pathname);
+    expectNotTrashed: (...paths: string[]): void => {
+      const targets = movePathToTrash.mock.calls.map(([target]) => target);
+      for (const pathname of paths) {
+        expect(targets).not.toContain(pathname);
+      }
     },
   };
 }

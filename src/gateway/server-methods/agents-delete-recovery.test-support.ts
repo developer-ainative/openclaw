@@ -1,4 +1,4 @@
-import { expect, it, vi, type Mock } from "vitest";
+import { expect, it, vi } from "vitest";
 import {
   awaitGateBeforeSettlement,
   createDeferred,
@@ -18,57 +18,12 @@ import {
   deletionJournal,
   expectRespondErrorContaining,
   expectRespondOk,
+  agentConfig,
   expectUncalled,
 } from "./agents-mutate.test-support.js";
+import type { AgentMutationHarness } from "./agents-mutate.test.js";
 
-type AgentDeleteRecoveryHarness = {
-  mocks: {
-    loadConfigReturn: Record<string, unknown>;
-    sharedAuthStoreOwnership: { location: "legacy-main" | "state-db" };
-    findAgentEntryIndex: Mock<(list?: unknown, agentId?: string) => number>;
-    readAgentDeletionJournal: Mock<() => Record<string, unknown> | undefined>;
-    listPendingAgentDeletionJournals: Mock<() => Record<string, unknown>[]>;
-    beginAgentDeletionRetire: Mock<() => void>;
-    beginAgentDeletionFinish: unknown;
-    beginAgentDeletionRollback: unknown;
-    closeOpenClawAgentDatabaseByPath: unknown;
-    resolveOpenClawAgentSqlitePath: Mock<(params?: { path?: string }) => string>;
-    resolveRegisteredAgentIdForDir: Mock<(pathname?: string) => string | undefined>;
-    isPathOwnedByAnotherRegisteredAgent: Mock<
-      (params: { agentId: string; pathname: string }) => boolean
-    >;
-    unregisterResolvedAgentDir: Mock<(params: { agentId: string; agentDir: string }) => boolean>;
-    listOpenClawRegisteredAgentDatabases: Mock<() => Array<Record<string, unknown>>>;
-    assertNoOpenClawAgentDatabaseLeases: unknown;
-    closeDeletedAgentDatabases: unknown;
-    assertAgentDeletionCurrentFinal: unknown;
-    assertAgentDeletionCurrentAsync: unknown;
-    deleteWorkspaceState: unknown;
-    movePathToTrash: unknown;
-    readSessionEntrySummariesInWorker: unknown;
-    logGatewayWarn: unknown;
-    writeConfigFile: Mock<(nextConfig?: unknown, writeOptions?: unknown) => Promise<void>>;
-    cronRemoveAgentJobsTransactional: Mock<
-      (agentId: string, commit: () => Promise<unknown>) => Promise<unknown>
-    >;
-    withAgentExecApprovalsRemoved: Mock<
-      (agentId: string, commit: () => Promise<unknown>) => Promise<unknown>
-    >;
-  };
-  makeCall: (
-    method: "agents.delete" | "agents.create",
-    params: Record<string, unknown>,
-  ) => { respond: Mock; promise: Promise<void> | void };
-  call: (
-    method: "agents.delete" | "agents.create",
-    params: Record<string, unknown>,
-  ) => Promise<Mock>;
-  resume: () => Promise<void>;
-  expectTrashedWithinParent: (pathname: string, declaredPath?: string) => void;
-  expectNotTrashed: (pathname: string) => void;
-};
-
-export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecoveryHarness): void {
+export function registerAgentDeleteDrainRecoveryTests(harness: AgentMutationHarness): void {
   const { mocks, makeCall, call, resume, expectTrashedWithinParent, expectNotTrashed } = harness;
   it.each([
     new Error("Placement read failed; restore the placement database and retry"),
@@ -97,61 +52,31 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
     }
   });
 
-  it("reports slow placement preparation without canceling the run after timeout", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const sessionId = "slow-placement-session";
-    const sessionKey = "agent:test-agent:slow-placement";
-    const handle = createEmbeddedRunHandle({ abort: vi.fn() });
-    setActiveEmbeddedRun(sessionId, handle, sessionKey, undefined, "test-agent");
-    const preparation =
-      createDeferred<
-        Awaited<ReturnType<typeof sessionPlacement.prepareSessionWorkerPlacementStop>>
-      >();
-    const stop = vi.fn(async () => {});
-    const prepareStop = vi
-      .spyOn(sessionPlacement, "prepareSessionWorkerPlacementStop")
-      .mockReturnValueOnce(preparation.promise);
-    const deletion = makeCall("agents.delete", { agentId: "test-agent" });
-    const failed = vi.fn();
-    const completed = Promise.resolve(deletion.promise).catch(failed);
-    try {
-      await vi.advanceTimersByTimeAsync(SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS);
-      expect(prepareStop).toHaveBeenCalledOnce();
-      expect(failed).toHaveBeenCalledWith(
-        expect.objectContaining({
-          message: expect.stringContaining(
-            "deletion preparation timed out for sessions: agent:test-agent:slow-placement. Check session placement availability",
-          ),
-        }),
-      );
-      preparation.resolve({ stop, startBeforeDrain: false });
-      await vi.runAllTimersAsync();
-      expectUncalled(handle.abort, stop);
-      expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeDefined();
-      expect(EMBEDDED_RUN_WAITERS.has(sessionId)).toBe(false);
-      expectUncalled(mocks.beginAgentDeletionRetire, mocks.writeConfigFile, mocks.movePathToTrash);
-    } finally {
-      preparation.resolve({ stop, startBeforeDrain: false });
-      await vi.runAllTimersAsync();
-      await completed;
-      prepareStop.mockRestore();
-      clearActiveEmbeddedRun(sessionId, handle, sessionKey);
-      vi.useRealTimers();
-    }
-  });
-
   it.each([
-    { sessionKey: undefined, isAbortable: false },
-    { sessionKey: undefined, isAbortable: true },
-    { sessionKey: "agent:test-agent:stuck", isAbortable: false },
-    { sessionKey: "agent:test-agent:stuck", isAbortable: true },
+    { sessionKey: undefined, isAbortable: false, slowPlacement: false },
+    { sessionKey: undefined, isAbortable: true, slowPlacement: false },
+    { sessionKey: "agent:test-agent:stuck", isAbortable: false, slowPlacement: false },
+    { sessionKey: "agent:test-agent:stuck", isAbortable: true, slowPlacement: false },
+    { sessionKey: "agent:test-agent:slow-placement", isAbortable: true, slowPlacement: true },
   ])(
-    "agents.delete bounds a never-ending run (key: $sessionKey, abortable: $isAbortable)",
-    async ({ sessionKey, isAbortable }) => {
+    "bounds deletion (key: $sessionKey, abortable: $isAbortable, slow placement: $slowPlacement)",
+    async ({ sessionKey, isAbortable, slowPlacement }) => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-      const sessionId = "stuck-deletion-session";
-      const handle = createEmbeddedRunHandle({ runId: "stuck-run", isAbortable });
+      const sessionId = slowPlacement ? "slow-placement-session" : "stuck-deletion-session";
+      const handle = createEmbeddedRunHandle(
+        slowPlacement ? { abort: vi.fn() } : { runId: "stuck-run", isAbortable },
+      );
       setActiveEmbeddedRun(sessionId, handle, sessionKey, undefined, "test-agent");
+      const preparation =
+        createDeferred<
+          Awaited<ReturnType<typeof sessionPlacement.prepareSessionWorkerPlacementStop>>
+        >();
+      const stop = vi.fn(async () => {});
+      const prepareStop = slowPlacement
+        ? vi
+            .spyOn(sessionPlacement, "prepareSessionWorkerPlacementStop")
+            .mockReturnValueOnce(preparation.promise)
+        : undefined;
       const deletion = makeCall("agents.delete", { agentId: "test-agent" });
       const failed = vi.fn();
       const completed = Promise.resolve(deletion.promise).catch(failed);
@@ -160,17 +85,35 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
         expect(failed).toHaveBeenCalledOnce();
         expect(failed).toHaveBeenCalledWith(
           expect.objectContaining({
-            message: expect.stringMatching(/stuck-deletion-session.*retry agents.delete/),
+            message: slowPlacement
+              ? expect.stringContaining(
+                  "deletion preparation timed out for sessions: agent:test-agent:slow-placement. Check session placement availability",
+                )
+              : expect.stringMatching(/stuck-deletion-session.*retry agents.delete/),
           }),
         );
+        if (slowPlacement) {
+          expect(prepareStop).toHaveBeenCalledOnce();
+          preparation.resolve({ stop, startBeforeDrain: false });
+          await vi.runAllTimersAsync();
+          expectUncalled(handle.abort, stop);
+        } else {
+          expectUncalled(mocks.closeOpenClawAgentDatabaseByPath, mocks.beginAgentDeletionRollback);
+        }
         expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeDefined();
         expect(EMBEDDED_RUN_WAITERS.has(sessionId)).toBe(false);
-        expect(mocks.beginAgentDeletionRetire).not.toHaveBeenCalled();
-        expect(mocks.writeConfigFile).not.toHaveBeenCalled();
-        expect(mocks.closeOpenClawAgentDatabaseByPath).not.toHaveBeenCalled();
-        expect(mocks.movePathToTrash).not.toHaveBeenCalled();
-        expect(mocks.beginAgentDeletionRollback).not.toHaveBeenCalled();
+        expectUncalled(
+          mocks.beginAgentDeletionRetire,
+          mocks.writeConfigFile,
+          mocks.movePathToTrash,
+        );
       } finally {
+        if (slowPlacement) {
+          preparation.resolve({ stop, startBeforeDrain: false });
+          await vi.runAllTimersAsync();
+          await completed;
+        }
+        prepareStop?.mockRestore();
         clearActiveEmbeddedRun(sessionId, handle, sessionKey);
         await completed;
         vi.useRealTimers();
@@ -203,11 +146,13 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
           signal,
         );
         expect(abort).toHaveBeenCalledOnce();
-        expect(mocks.beginAgentDeletionRetire).not.toHaveBeenCalled();
-        expect(mocks.closeOpenClawAgentDatabaseByPath).not.toHaveBeenCalled();
-        expect(mocks.movePathToTrash).not.toHaveBeenCalled();
-        expect(deletion.respond).not.toHaveBeenCalled();
-        expect(foreign.abort).not.toHaveBeenCalled();
+        expectUncalled(
+          mocks.beginAgentDeletionRetire,
+          mocks.closeOpenClawAgentDatabaseByPath,
+          mocks.movePathToTrash,
+          deletion.respond,
+          foreign.abort,
+        );
 
         settled.resolve();
         await owner;
@@ -224,7 +169,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
         expect(EMBEDDED_RUN_WAITERS.has(sessionId)).toBe(false);
         expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeUndefined();
         expect(resolveEmbeddedAgentRunProgressState("other-session")).toBeDefined();
-        mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
+        mocks.loadConfigReturn = agentConfig({ main: {} });
         mocks.findAgentEntryIndex.mockReturnValue(-1);
         mocks.readAgentDeletionJournal.mockReturnValue(deletionJournal({ cleanupCompleted: true }));
         const recreated = await call("agents.create", { name: "Test Agent" });
@@ -261,18 +206,20 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
 
   it("does not replay a deletion journal after another operation replaces it", async () => {
     mocks.listPendingAgentDeletionJournals.mockReturnValue([
-      { ...deletionJournal({ phase: "draining", operationId: "previous-deletion" }) },
+      deletionJournal({ phase: "draining", operationId: "previous-deletion" }),
     ]);
-    mocks.readAgentDeletionJournal.mockReturnValue({
-      ...deletionJournal({ phase: "draining", operationId: "replacement-deletion" }),
-    });
+    mocks.readAgentDeletionJournal.mockReturnValue(
+      deletionJournal({ phase: "draining", operationId: "replacement-deletion" }),
+    );
     await resume();
     expect(mocks.logGatewayWarn).toHaveBeenCalledOnce();
-    expect(mocks.beginAgentDeletionRetire).not.toHaveBeenCalled();
-    expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalled();
-    expect(mocks.closeOpenClawAgentDatabaseByPath).not.toHaveBeenCalled();
-    expect(mocks.movePathToTrash).not.toHaveBeenCalled();
-    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
+    expectUncalled(
+      mocks.beginAgentDeletionRetire,
+      mocks.beginAgentDeletionFinish,
+      mocks.closeOpenClawAgentDatabaseByPath,
+      mocks.movePathToTrash,
+      mocks.writeConfigFile,
+    );
   });
 
   it("settles recovery without touching a journaled directory claimed by another agent", async () => {
@@ -284,7 +231,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
       { agentId: "test-agent", path: "/journal/agent/openclaw-agent.sqlite" },
       { agentId: "other-agent", path: "/journal/agent/openclaw-agent.sqlite" },
     ];
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
+    mocks.loadConfigReturn = agentConfig({ main: {} });
     mocks.readAgentDeletionJournal.mockReturnValue(
       deletionJournal({ workspaceDir: "/journal", sessionsDir: "/deleted/sessions" }),
     );
@@ -297,12 +244,8 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
         directoryOwners.get("/journal/agent") !== agentId,
     );
     mocks.unregisterResolvedAgentDir.mockImplementation(
-      ({ agentId, agentDir }: { agentId: string; agentDir: string }) => {
-        if (directoryOwners.get(agentDir) !== agentId) {
-          return false;
-        }
-        return directoryOwners.delete(agentDir);
-      },
+      ({ agentId, agentDir }: { agentId: string; agentDir: string }) =>
+        directoryOwners.get(agentDir) === agentId && directoryOwners.delete(agentDir),
     );
     mocks.listOpenClawRegisteredAgentDatabases.mockImplementation(() => databaseRows);
 
@@ -323,8 +266,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
         assertCurrentAsync: mocks.assertAgentDeletionCurrentAsync,
       }),
     );
-    expectNotTrashed("/journal/agent");
-    expectNotTrashed("/journal");
+    expectNotTrashed("/journal/agent", "/journal");
     expectTrashedWithinParent("/deleted/sessions");
     expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledWith({ unregisterDatabases: true });
     expect(mocks.unregisterResolvedAgentDir).toHaveBeenCalledWith({
@@ -339,9 +281,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
     mocks.resolveOpenClawAgentSqlitePath.mockImplementation(
       (params) => params?.path ?? "/journal/agent/openclaw-agent.sqlite",
     );
-    mocks.loadConfigReturn = {
-      agents: { entries: { "other-agent": { workspace: "/journal" } } },
-    };
+    mocks.loadConfigReturn = agentConfig({ "other-agent": { workspace: "/journal" } });
     mocks.readAgentDeletionJournal.mockReturnValue(deletionJournal());
 
     const respond = await call("agents.delete", { agentId: "test-agent" });
@@ -356,14 +296,14 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
   });
 }
 
-export function registerAgentDeleteRollbackTests(harness: AgentDeleteRecoveryHarness): void {
+export function registerAgentDeleteRollbackTests(harness: AgentMutationHarness): void {
   const { mocks, makeCall, call } = harness;
   it("rolls back a fresh deletion when draining leaves it as the only configured agent", async () => {
     mocks.sharedAuthStoreOwnership = { location: "state-db" };
     mocks.beginAgentDeletionRetire.mockImplementationOnce(() => {
-      mocks.loadConfigReturn = {
-        agents: { entries: { "test-agent": { workspace: "/workspace/test-agent" } } },
-      };
+      mocks.loadConfigReturn = agentConfig({
+        "test-agent": { workspace: "/workspace/test-agent" },
+      });
     });
 
     const respond = await call("agents.delete", { agentId: "test-agent" });
@@ -371,10 +311,12 @@ export function registerAgentDeleteRollbackTests(harness: AgentDeleteRecoveryHar
     expectRespondErrorContaining(respond, "only configured agent");
     expect(mocks.beginAgentDeletionRetire).toHaveBeenCalledOnce();
     expect(mocks.beginAgentDeletionRollback).toHaveBeenCalledOnce();
-    expect(mocks.closeOpenClawAgentDatabaseByPath).not.toHaveBeenCalled();
-    expect(mocks.movePathToTrash).not.toHaveBeenCalled();
-    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
-    expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalled();
+    expectUncalled(
+      mocks.closeOpenClawAgentDatabaseByPath,
+      mocks.movePathToTrash,
+      mocks.writeConfigFile,
+      mocks.beginAgentDeletionFinish,
+    );
   });
 
   it("rolls cron back and keeps the roster when authority cleanup fails", async () => {
@@ -404,51 +346,49 @@ export function registerAgentDeleteRollbackTests(harness: AgentDeleteRecoveryHar
       { id: "other-job", agentId: "other-agent" },
     ]);
     expect(mocks.beginAgentDeletionRollback).toHaveBeenCalledOnce();
-    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
     expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalledTimes(1);
-    expect(mocks.movePathToTrash).not.toHaveBeenCalled();
+    expectUncalled(mocks.writeConfigFile, mocks.movePathToTrash);
   });
 
-  it("keeps a recovered deletion journal fenced when retry cleanup fails", async () => {
-    mocks.readAgentDeletionJournal.mockReturnValue(deletionJournal());
-    mocks.withAgentExecApprovalsRemoved.mockRejectedValueOnce(new Error("approvals busy"));
-
-    const { promise } = makeCall("agents.delete", { agentId: "test-agent" });
-
-    await expect(promise).rejects.toThrow("approvals busy");
-    expect(mocks.beginAgentDeletionRollback).not.toHaveBeenCalled();
-    expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalled();
-    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
-  });
-
-  it("keeps a new deletion fenced when authority rollback fails", async () => {
-    mocks.withAgentExecApprovalsRemoved.mockRejectedValueOnce(
-      new AgentDeletionAuthorityRollbackError(
-        [new Error("config failed"), new Error("approval restore failed")],
-        "approval rollback failed",
-      ),
-    );
-
-    const { promise } = makeCall("agents.delete", { agentId: "test-agent" });
-
-    await expect(promise).rejects.toThrow("approval rollback failed");
-    expectUncalled(mocks.beginAgentDeletionRollback, mocks.writeConfigFile);
-  });
-
-  it("keeps deletion fenced when config persistence succeeds before reporting failure", async () => {
-    mocks.writeConfigFile.mockImplementationOnce(async (nextConfig?: unknown) => {
-      if (!nextConfig || typeof nextConfig !== "object") {
-        throw new Error("expected config object");
+  it.each([
+    ["recovered cleanup", "approvals busy"],
+    ["authority rollback", "approval rollback failed"],
+    ["post-write refresh", "post-write refresh failed"],
+  ])("keeps deletion fenced after %s failure", async (label, message) => {
+    if (label === "post-write refresh") {
+      mocks.writeConfigFile.mockImplementationOnce(async (nextConfig) => {
+        if (!nextConfig || typeof nextConfig !== "object") {
+          throw new Error("expected config object");
+        }
+        mocks.loadConfigReturn = nextConfig as Record<string, unknown>;
+        throw new Error(message);
+      });
+    } else {
+      if (label === "recovered cleanup") {
+        mocks.readAgentDeletionJournal.mockReturnValue(deletionJournal());
       }
-      mocks.loadConfigReturn = nextConfig as Record<string, unknown>;
-      throw new Error("post-write refresh failed");
-    });
-
-    const { promise } = makeCall("agents.delete", { agentId: "test-agent" });
-
-    await expect(promise).rejects.toThrow("post-write refresh failed");
+      mocks.withAgentExecApprovalsRemoved.mockRejectedValueOnce(
+        label === "recovered cleanup"
+          ? new Error(message)
+          : new AgentDeletionAuthorityRollbackError(
+              [new Error("config failed"), new Error("approval restore failed")],
+              message,
+            ),
+      );
+    }
+    await expect(makeCall("agents.delete", { agentId: "test-agent" }).promise).rejects.toThrow(
+      message,
+    );
     expect(mocks.beginAgentDeletionRollback).not.toHaveBeenCalled();
-    expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalled();
-    expect(mocks.movePathToTrash).not.toHaveBeenCalled();
+    if (label !== "post-write refresh") {
+      expect(mocks.writeConfigFile).not.toHaveBeenCalled();
+    }
+    if (label === "recovered cleanup") {
+      expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalled();
+    }
+    if (label === "post-write refresh") {
+      expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalled();
+      expect(mocks.movePathToTrash).not.toHaveBeenCalled();
+    }
   });
 }

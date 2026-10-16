@@ -1,6 +1,3 @@
-// Agent mutation tests cover create/update/delete handlers, safe workspace file
-// access, config preconditions, trash cleanup, and workspace-state handling.
-
 import fs from "node:fs";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
@@ -26,15 +23,14 @@ import {
   expectRecordFields,
   expectRespondErrorContaining,
   expectRespondOk,
+  agentConfig,
   expectPendingDeletion,
-  firstRespondResult,
   getAgentList,
   makeFileStat,
   expectUncalled,
   mergeAgentConfig,
   mockCallArg,
   registerAgentCreationCommitTests,
-  resolveMockWorkspaceDir,
   type MockAgentEntry,
 } from "./agents-mutate.test-support.js";
 function makeRootMetadata(size = 0) {
@@ -193,17 +189,7 @@ vi.mock("../../config/config.js", async () => {
       if (params.writeOptions) {
         getRuntimeConfigWriteApplication(params.writeOptions)?.claim()?.settle("applied");
       }
-      return {
-        path: "/tmp/openclaw/config.json",
-        previousHash: "test-hash",
-        persistedHash: "persisted-hash",
-        snapshot: { path: "/tmp/openclaw/config.json" },
-        nextConfig: draft,
-        result: mocks.omitConfigMutationResult ? undefined : result,
-        attempts: 1,
-        afterWrite: { mode: "auto" },
-        followUp: { action: "none" },
-      };
+      return { nextConfig: draft, result: mocks.omitConfigMutationResult ? undefined : result };
     },
     transformConfigFileWithRetry: async (params: {
       writeOptions?: object;
@@ -224,14 +210,9 @@ vi.mock("../../config/config.js", async () => {
       }
       return {
         path: "/tmp/openclaw/config.json",
-        previousHash: "test-hash",
         persistedHash: "persisted-hash",
-        snapshot: { path: "/tmp/openclaw/config.json" },
         nextConfig: transformed.nextConfig,
         result: transformed.result,
-        attempts: 1,
-        afterWrite: { mode: "auto" },
-        followUp: { action: "none" },
       };
     },
     withConfigMutationExclusive: async (fn: (config: unknown) => Promise<unknown>) =>
@@ -325,9 +306,7 @@ vi.mock("../../agents/agent-lifecycle-registry.js", () => ({
       rollback: mocks.beginAgentDeletionRollback,
       runDatabaseCleanup: mocks.runAgentDatabaseCleanup,
       runWithWorker: async (operation: (scope: { execute: () => void }) => unknown) =>
-        operation({
-          execute: () => mocks.assertNoOpenClawAgentDatabaseLeases(_agentId, {}),
-        }),
+        operation({ execute: () => mocks.assertNoOpenClawAgentDatabaseLeases(_agentId, {}) }),
     })),
   claimCompletedAgentDeletion: mocks.claimCompletedAgentDeletion,
   isAgentDeletionBlocked: () => false,
@@ -567,8 +546,10 @@ beforeEach(() => {
   mocks.applyAgentConfig.mockImplementation((cfg: unknown, opts: unknown) =>
     mergeAgentConfig(cfg, opts),
   );
-  mocks.resolveAgentWorkspaceDir.mockImplementation((cfg: unknown, agentId?: string) =>
-    resolveMockWorkspaceDir(cfg, agentId),
+  mocks.resolveAgentWorkspaceDir.mockImplementation(
+    (cfg: unknown, agentId?: string) =>
+      getAgentList(cfg).find((entry) => entry.id === (agentId ?? ""))?.workspace ??
+      "/workspace/" + (agentId ?? ""),
   );
   mocks.rootOpen.mockResolvedValue(makeRootOpen());
   mocks.rootRead.mockResolvedValue(makeRootRead());
@@ -620,6 +601,43 @@ async function call(method: keyof typeof agentsHandlers, params: Record<string, 
   return respond;
 }
 
+function createHarness() {
+  return {
+    mocks,
+    makeCall,
+    call,
+    makeFileStat,
+    createEnoentError,
+    resume: () => resumeAgentDeletions(createContext() as never),
+    expectTrashedWithinParent,
+    expectNotTrashed,
+  };
+}
+export type AgentMutationHarness = ReturnType<typeof createHarness>;
+
+async function deleteAgent(expected: Record<string, unknown> = { ok: true }) {
+  return expectRespondOk(await call("agents.delete", { agentId: "test-agent" }), expected);
+}
+
+function stageDeletionJournal(journal = deletionJournal()) {
+  mocks.loadConfigReturn = agentConfig({ main: {} });
+  mocks.readAgentDeletionJournal.mockReturnValue(journal);
+  return journal;
+}
+
+function retryTrashOnce(failedPath: string) {
+  const trashed = new Set<string>();
+  let attempts = 0;
+  mocks.movePathToTrash.mockImplementation(async (pathname) => {
+    if (pathname === failedPath && attempts++ === 0) {
+      throw new Error("workspace trash failed");
+    }
+    trashed.add(pathname ?? "");
+    return "/trashed";
+  });
+  return trashed;
+}
+
 function makeCleanupStat(overrides: Partial<fs.BigIntStats> = {}): fs.BigIntStats {
   return Object.assign(fs.statSync(new URL(import.meta.url), { bigint: true }), {
     dev: 1n,
@@ -634,7 +652,7 @@ function makeCleanupStat(overrides: Partial<fs.BigIntStats> = {}): fs.BigIntStat
 async function listAgentFileNames(agentId = "main") {
   const respond = await call("agents.files.list", { agentId });
 
-  const result = firstRespondResult(respond);
+  const result = mockCallArg(respond, 0, 1);
   const files = (result as { files: Array<{ name: string }> }).files;
   return files.map((file) => file.name);
 }
@@ -678,31 +696,21 @@ describe("agents.create", () => {
     vi.clearAllMocks();
     mocks.captureDeletedAgentDatabaseFences.mockReturnValue([]);
     mocks.reviveAgentDatabases.mockReset().mockResolvedValue(undefined);
-    mocks.loadConfigReturn = {
-      agents: { entries: { main: {} } },
-    };
+    mocks.loadConfigReturn = agentConfig({ main: {} });
   });
 
-  registerAgentCreationCommitTests({
-    ...mocks,
-    create: (params) => makeCall("agents.create", params),
-    configuredConfig: () => mocks.loadConfigReturn,
-  });
+  registerAgentCreationCommitTests(createHarness());
 });
 
 describe("agents.update", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.loadConfigReturn = {
-      agents: {
-        entries: {
-          "test-agent": {
-            workspace: "/workspace/test-agent",
-            identity: { name: "Current Agent", theme: "steady", emoji: "🐢" },
-          },
-        },
+    mocks.loadConfigReturn = agentConfig({
+      "test-agent": {
+        workspace: "/workspace/test-agent",
+        identity: { name: "Current Agent", theme: "steady", emoji: "🐢" },
       },
-    };
+    });
   });
 
   it("rejects updating a nonexistent agent", async () => {
@@ -726,17 +734,15 @@ describe("agents.update", () => {
   });
 
   it("clears an existing model override", async () => {
-    mocks.loadConfigReturn = {
-      agents: {
-        defaults: { model: { primary: "openai/gpt-5.6-luna" } },
-        entries: {
-          "test-agent": {
-            workspace: "/workspace/test-agent",
-            model: "anthropic/claude-sonnet-4-6",
-          },
+    mocks.loadConfigReturn = agentConfig(
+      {
+        "test-agent": {
+          workspace: "/workspace/test-agent",
+          model: "anthropic/claude-sonnet-4-6",
         },
       },
-    };
+      { model: { primary: "openai/gpt-5.6-luna" } },
+    );
 
     const respond = await call("agents.update", { agentId: "test-agent", model: null });
 
@@ -749,7 +755,7 @@ describe("agents.update", () => {
     expect(agent).not.toHaveProperty("model");
   });
 
-  registerAgentIdentityUpdateTests({ mocks, makeCall, makeFileStat, createEnoentError });
+  registerAgentIdentityUpdateTests(createHarness());
 });
 
 describe("agents.delete", () => {
@@ -760,14 +766,10 @@ describe("agents.delete", () => {
     );
     mocks.fsLstat.mockResolvedValue(makeCleanupStat());
     mocks.fsRealpath.mockImplementation(async (pathname: string) => pathname);
-    mocks.loadConfigReturn = {
-      agents: {
-        entries: {
-          "test-agent": { workspace: "/workspace/test-agent" },
-          main: {},
-        },
-      },
-    };
+    mocks.loadConfigReturn = agentConfig({
+      "test-agent": { workspace: "/workspace/test-agent" },
+      main: {},
+    });
     mocks.pruneAgentConfig.mockImplementation((cfg, agentId) => {
       const config = structuredClone(cfg);
       delete config.agents?.entries?.[agentId];
@@ -777,27 +779,15 @@ describe("agents.delete", () => {
     mocks.purgeAgentSessionStoreEntries.mockReset().mockResolvedValue(false);
   });
 
-  const recoveryHarness = {
-    mocks,
-    makeCall,
-    call,
-    resume: () => resumeAgentDeletions(createContext() as never),
-    expectTrashedWithinParent,
-    expectNotTrashed,
-  };
+  const recoveryHarness = createHarness();
   registerAgentDeleteDrainRecoveryTests(recoveryHarness);
 
   it("rejects deleting the auth-inheritance owner before starting cleanup", async () => {
     mocks.sharedAuthStoreOwnership = { location: "state-db" };
-    mocks.loadConfigReturn = {
-      agents: {
-        defaults: { authInheritance: { agentId: "test-agent" } },
-        entries: {
-          "test-agent": { workspace: "/workspace/test-agent" },
-          main: {},
-        },
-      },
-    };
+    mocks.loadConfigReturn = agentConfig(
+      { "test-agent": { workspace: "/workspace/test-agent" }, main: {} },
+      { authInheritance: { agentId: "test-agent" } },
+    );
     const respond = await call("agents.delete", { agentId: "test-agent" });
 
     expectRespondErrorContaining(respond, "agents.defaults.authInheritance.agentId");
@@ -842,21 +832,14 @@ describe("agents.delete", () => {
       workspaceDir: "/workspace/test-agent",
       sessionsDir: "/transcripts/test-agent",
     });
-    const trashed = new Set<string>();
-    let workspaceAttempts = 0;
+    const trashed = retryTrashOnce(journal.workspaceDir);
     mocks.fsLstat.mockImplementation(async (pathname: unknown) => {
       if (trashed.has(String(pathname))) {
         throw createEnoentError();
       }
       return makeCleanupStat();
     });
-    mocks.movePathToTrash.mockImplementation(async (pathname?: string) => {
-      if (pathname === journal.workspaceDir && workspaceAttempts++ === 0) {
-        throw new Error("workspace trash failed");
-      }
-      trashed.add(pathname ?? "");
-      return "/trashed";
-    });
+
     mocks.beginAgentDeletionFinish.mockImplementation(() => {
       journal.cleanupCompleted = true;
     });
@@ -875,7 +858,6 @@ describe("agents.delete", () => {
       mocks.movePathToTrash.mock.invocationCallOrder[0]!,
     );
     expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalled();
-    expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalledWith({ unregisterDatabases: true });
     expect(mocks.unregisterResolvedAgentDir).toHaveBeenCalledWith({
       agentId: "test-agent",
       agentDir: journal.agentDir,
@@ -926,8 +908,7 @@ describe("agents.delete", () => {
         cleanupPath("/journal/sessions", { dev: 1, ino: 30, done: true }),
       ],
     });
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
-    mocks.readAgentDeletionJournal.mockReturnValue(journal);
+    stageDeletionJournal(journal);
     mocks.fsRealpath.mockImplementation(async (pathname: string) =>
       pathname === workspaceAlias ? workspaceDir : pathname,
     );
@@ -935,9 +916,7 @@ describe("agents.delete", () => {
       makeCleanupStat({ dev: 2n, ino: pathname === workspaceDir ? 200n : 100n }),
     );
 
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { failed: [] });
+    await deleteAgent({ failed: [] });
     // The journal fence blocked legitimate claims while this path was prepared
     // absent, so the appeared occupant is leaked deleted-agent state: sweep it
     // instead of preserving it and finishing over a surviving tree.
@@ -964,8 +943,7 @@ describe("agents.delete", () => {
         cleanupPath(workspaceDir, { parentPath: "/journal", dev: 1, ino: 20 }),
       ],
     });
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
-    mocks.readAgentDeletionJournal.mockReturnValue(journal);
+    stageDeletionJournal(journal);
     mocks.fsLstat.mockImplementation(async (pathname: unknown) => {
       if (pathname !== completedChild && pathname !== workspaceDir) {
         throw createEnoentError();
@@ -976,11 +954,8 @@ describe("agents.delete", () => {
       });
     });
 
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { failed: [] });
-    expectNotTrashed(completedChild);
-    expectNotTrashed(workspaceDir);
+    await deleteAgent({ failed: [] });
+    expectNotTrashed(completedChild, workspaceDir);
     expect(journal.cleanupPaths.find((entry) => entry.path === workspaceDir)).toMatchObject({
       done: true,
       note: "completed cleanup path is occupied; replacement preserved",
@@ -1003,9 +978,7 @@ describe("agents.delete", () => {
       return "/trashed";
     });
 
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    const result = expectRespondOk(respond, { failed: [] });
+    const result = await deleteAgent({ failed: [] });
     expect(result.removed).toEqual(
       expect.arrayContaining([{ path: "/workspace/test-agent", method: "missing" }]),
     );
@@ -1015,8 +988,7 @@ describe("agents.delete", () => {
   it("does not move a symlink ancestor when its canonical descendant fails", async () => {
     const agentLink = "/deep/journal/link";
     const agentTarget = "/target";
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
-    mocks.readAgentDeletionJournal.mockReturnValue(
+    stageDeletionJournal(
       deletionJournal({
         agentDir: agentLink,
         workspaceDir: "/deep",
@@ -1047,15 +1019,13 @@ describe("agents.delete", () => {
     expectPendingDeletion(respond, {
       failed: [{ path: agentTarget, reason: "agent trash failed" }],
     });
-    expectNotTrashed(agentLink);
-    expectNotTrashed("/deep");
+    expectNotTrashed(agentLink, "/deep");
     expectTrashedWithinParent(agentTarget, agentLink);
     expectUncalled(mocks.unregisterResolvedAgentDir, mocks.beginAgentDeletionFinish);
   });
 
   it("does not trash a replacement at a journaled symlink path", async () => {
     const workspaceLink = "/journal/workspace-link";
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
     const journal = deletionJournal({
       workspaceDir: workspaceLink,
       cleanupPaths: [
@@ -1069,11 +1039,9 @@ describe("agents.delete", () => {
         cleanupPath("/journal/sessions"),
       ],
     });
-    mocks.readAgentDeletionJournal.mockReturnValue(journal);
+    stageDeletionJournal(journal);
 
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { failed: [] });
+    await deleteAgent({ failed: [] });
     expectNotTrashed(workspaceLink);
     const replacementRecord = expectDefined(
       journal.cleanupPaths.find((entry) => entry.path === workspaceLink),
@@ -1094,10 +1062,7 @@ describe("agents.delete", () => {
     const workspaceTarget = "/real-tmp/workspace";
     const agentDir = `${workspaceLink}/agent`;
     const sessionsDir = `${workspaceLink}/transcripts`;
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
-    mocks.readAgentDeletionJournal.mockReturnValue(
-      deletionJournal({ agentDir, workspaceDir: workspaceLink, sessionsDir }),
-    );
+    stageDeletionJournal(deletionJournal({ agentDir, workspaceDir: workspaceLink, sessionsDir }));
     mocks.resolveRegisteredAgentIdForDir.mockImplementation((pathname?: string) =>
       pathname === agentDir ? "test-agent" : undefined,
     );
@@ -1116,9 +1081,7 @@ describe("agents.delete", () => {
       }),
     );
 
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { failed: [] });
+    await deleteAgent({ failed: [] });
     const trashedPaths = mocks.movePathToTrash.mock.calls.map(([pathname]) => String(pathname));
     const targetIndex = trashedPaths.indexOf(workspaceTarget);
     expectTrashedWithinParent(`${workspaceTarget}/agent`, agentDir);
@@ -1165,10 +1128,8 @@ describe("agents.delete", () => {
       workspaceDir: workspaceLink,
       sessionsDir: `${workspaceLink}/transcripts`,
     });
-    const trashed = new Set<string>();
-    let workspaceAttempts = 0;
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
-    mocks.readAgentDeletionJournal.mockReturnValue(journal);
+    const trashed = retryTrashOnce(originalTarget);
+    stageDeletionJournal(journal);
     mocks.resolveRegisteredAgentIdForDir.mockImplementation((pathname?: string) =>
       pathname === journal.agentDir ? "test-agent" : undefined,
     );
@@ -1191,13 +1152,6 @@ describe("agents.delete", () => {
       }
       return makeCleanupStat({ isSymbolicLink: () => pathname === workspaceLink });
     });
-    mocks.movePathToTrash.mockImplementation(async (pathname?: string) => {
-      if (pathname === originalTarget && workspaceAttempts++ === 0) {
-        throw new Error("workspace trash failed");
-      }
-      trashed.add(pathname ?? "");
-      return "/trashed";
-    });
 
     const firstDelete = makeCall("agents.delete", { agentId: "test-agent" });
     await firstDelete.promise;
@@ -1217,9 +1171,11 @@ describe("agents.delete", () => {
 
     expectRespondOk(recovery.respond, { failed: [] });
     expect(mocks.fsRealpath).not.toHaveBeenCalled();
-    expectNotTrashed(missingTranscriptTarget);
-    expectNotTrashed(retargetedWorkspace);
-    expectNotTrashed(`${retargetedWorkspace}/transcripts`);
+    expectNotTrashed(
+      missingTranscriptTarget,
+      retargetedWorkspace,
+      `${retargetedWorkspace}/transcripts`,
+    );
     expectTrashedWithinParent(originalTarget, workspaceLink);
     expectTrashedWithinParent(workspaceLink);
     expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledOnce();
@@ -1248,8 +1204,7 @@ describe("agents.delete", () => {
         }),
       ],
     });
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
-    mocks.readAgentDeletionJournal.mockReturnValue(journal);
+    stageDeletionJournal(journal);
     mocks.resolveRegisteredAgentIdForDir.mockImplementation((pathname?: string) =>
       pathname === journal.agentDir ? "test-agent" : undefined,
     );
@@ -1277,39 +1232,43 @@ describe("agents.delete", () => {
     expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalled();
   });
 
-  it.each([
-    { encoding: "released numeric", savedIno: 123, replaced: false },
-    { encoding: "released numeric", savedIno: 123, replaced: true },
-    { encoding: "released rounded numeric", savedIno: 9_007_199_254_740_992, replaced: false },
-    { encoding: "released rounded numeric", savedIno: 9_007_199_254_740_992, replaced: true },
-    { encoding: "exact full-width", savedIno: "9007199254740992", replaced: false },
-    { encoding: "exact full-width", savedIno: "9007199254740992", replaced: true },
-    {
-      encoding: "released unsigned high-bit",
-      savedDev: 9_223_372_036_854_775_808,
-      observedDev: -9_223_372_036_854_775_808n,
-      savedIno: 9_223_372_036_854_775_808,
-      observedIno: -9_223_372_036_854_775_807n,
-      replaced: false,
-    },
-    {
-      encoding: "released unsigned high-bit",
-      savedIno: 9_223_372_036_854_775_808,
-      observedIno: -9_223_372_036_854_771_712n,
-      replaced: true,
-    },
-    { encoding: "exact signed high-bit", savedIno: "-9223372036854775808", replaced: false },
-    { encoding: "exact signed high-bit", savedIno: "-9223372036854775808", replaced: true },
+  it.each<[string, string | number, boolean, number?, bigint?, bigint?]>([
+    ["released numeric", 123, false],
+    ["released numeric", 123, true],
+    ["released rounded numeric", 9_007_199_254_740_992, false],
+    ["released rounded numeric", 9_007_199_254_740_992, true],
+    ["exact full-width", "9007199254740992", false],
+    ["exact full-width", "9007199254740992", true],
+    [
+      "released unsigned high-bit",
+      9_223_372_036_854_775_808,
+      false,
+      9_223_372_036_854_775_808,
+      -9_223_372_036_854_775_808n,
+      -9_223_372_036_854_775_807n,
+    ],
+    [
+      "released unsigned high-bit",
+      9_223_372_036_854_775_808,
+      true,
+      42,
+      42n,
+      -9_223_372_036_854_771_712n,
+    ],
+    ["exact signed high-bit", "-9223372036854775808", false],
+    ["exact signed high-bit", "-9223372036854775808", true],
   ])(
-    "resumes $encoding cleanup through the deletion handler (replaced=$replaced)",
-    async ({ savedDev = 42, observedDev = 42n, savedIno, observedIno: suppliedIno, replaced }) => {
+    "resumes %s cleanup (inode=%s, replaced=%s)",
+    async (_encoding, savedIno, replaced, inputDev, inputObservedDev, suppliedIno) => {
+      const savedDev = inputDev ?? 42;
+      const observedDev = inputObservedDev ?? 42n;
       const workspaceDir = path.resolve("/journal/workspace");
       // v2026.10.2 persisted the prepared numeric identity in cleanup_paths_json.
       const journal = deletionJournal({
         workspaceDir,
         cleanupPaths: [cleanupPath(workspaceDir, { dev: savedDev, ino: savedIno })],
       });
-      mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
+      mocks.loadConfigReturn = agentConfig({ main: {} });
       mocks.readAgentDeletionJournal.mockReturnValue(journal);
       const observedIno =
         suppliedIno ??
@@ -1346,8 +1305,7 @@ describe("agents.delete", () => {
 
   it("reclaims durable journal ownership after a process restart", async () => {
     const directoryOwners = new Map<string, string>();
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
-    mocks.readAgentDeletionJournal.mockReturnValue(deletionJournal());
+    stageDeletionJournal(deletionJournal());
     mocks.resolveRegisteredAgentIdForDir.mockImplementation((pathname?: string) =>
       directoryOwners.get(pathname ?? ""),
     );
@@ -1365,9 +1323,7 @@ describe("agents.delete", () => {
       },
     );
 
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { ok: true });
+    await deleteAgent();
     expect(mocks.registerResolvedAgentDir).toHaveBeenCalledWith({
       agentId: "test-agent",
       agentDir: "/journal/agent",
@@ -1383,8 +1339,7 @@ describe("agents.delete", () => {
 
   it("revalidates database ownership after earlier filesystem cleanup", async () => {
     let claimed = false;
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
-    mocks.readAgentDeletionJournal.mockReturnValue(deletionJournal());
+    stageDeletionJournal(deletionJournal());
     mocks.listOpenClawRegisteredAgentDatabases.mockImplementation(() =>
       claimed ? [{ agentId: "other-agent", path: "/journal/agent/survivor.sqlite" }] : [],
     );
@@ -1395,13 +1350,10 @@ describe("agents.delete", () => {
       return "/trashed";
     });
 
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { ok: true });
+    await deleteAgent();
     expectTrashedWithinParent("/journal/agent/openclaw-agent.sqlite");
     expectTrashedWithinParent("/journal/workspace");
-    expectNotTrashed("/journal/agent");
-    expectNotTrashed("/journal/agent/survivor.sqlite");
+    expectNotTrashed("/journal/agent", "/journal/agent/survivor.sqlite");
     expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledOnce();
   });
 
@@ -1417,9 +1369,7 @@ describe("agents.delete", () => {
     );
     mocks.listOpenClawRegisteredAgentDatabases.mockImplementation(() => databaseRows);
 
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { ok: true });
+    await deleteAgent();
     expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalledTimes(2);
     expect(mocks.closeOpenClawAgentDatabaseByPath).toHaveBeenCalledWith(
       "/agents/test-agent/openclaw-agent.sqlite",
@@ -1429,8 +1379,7 @@ describe("agents.delete", () => {
       "/linked/shared/agent.sqlite",
       "test-agent",
     );
-    expectNotTrashed("/linked/shared/agent.sqlite");
-    expectNotTrashed("/linked/shared/agent.sqlite-wal");
+    expectNotTrashed("/linked/shared/agent.sqlite", "/linked/shared/agent.sqlite-wal");
     expect(mocks.closeDeletedAgentDatabases).toHaveBeenCalledWith(
       "test-agent",
       ["/agents/test-agent/openclaw-agent.sqlite"],
@@ -1444,12 +1393,9 @@ describe("agents.delete", () => {
   });
 
   it("preserves the original keep-files intent while recovering deletion", async () => {
-    mocks.loadConfigReturn = { agents: { entries: { main: {} } } };
-    mocks.readAgentDeletionJournal.mockReturnValue(deletionJournal({ deleteFiles: false }));
+    stageDeletionJournal(deletionJournal({ deleteFiles: false }));
 
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { ok: true, removed: [], failed: [] });
+    await deleteAgent({ ok: true, removed: [], failed: [] });
     expect(mocks.movePathToTrash).not.toHaveBeenCalled();
     expect(mocks.beginAgentDeletionFinish).not.toHaveBeenCalledWith({ unregisterDatabases: true });
     expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledOnce();
@@ -1527,13 +1473,9 @@ describe("agents.delete", () => {
       },
     );
 
-    const respond = await call("agents.delete", { agentId: "test-agent" });
-
-    expectRespondOk(respond, { failed: [] });
+    await deleteAgent({ failed: [] });
     const trashedPaths = mocks.movePathToTrash.mock.calls.map(([pathname]) => pathname);
-    expect(trashedPaths).toContain(walPath);
-    expect(trashedPaths).toContain(shmPath);
-    expect(trashedPaths).toContain(agentDir);
+    expect(trashedPaths).toEqual(expect.arrayContaining([walPath, shmPath, agentDir]));
     expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledOnce();
   });
 
@@ -1576,9 +1518,7 @@ describe("agents.delete", () => {
   });
 
   it("rejects deleting the main agent", async () => {
-    mocks.loadConfigReturn = {
-      agents: { entries: { main: {}, ops: {} } },
-    };
+    mocks.loadConfigReturn = agentConfig({ main: {}, ops: {} });
     const respond = await call("agents.delete", { agentId: "main" });
 
     expectRespondErrorContaining(respond, "owns the legacy shared auth store");
@@ -1588,9 +1528,7 @@ describe("agents.delete", () => {
 
   it("rejects an unrepresentable id before targeting the main agent", async () => {
     mocks.sharedAuthStoreOwnership = { location: "state-db" };
-    mocks.loadConfigReturn = {
-      agents: { entries: { main: {}, ops: {} } },
-    };
+    mocks.loadConfigReturn = agentConfig({ main: {}, ops: {} });
 
     const respond = await call("agents.delete", { agentId: "агент✨" });
 
@@ -1657,7 +1595,7 @@ describe("agents.files.list", () => {
 
     const respond = await call("agents.files.get", { agentId: "main", name: "SOUL.md" });
 
-    const result = firstRespondResult(respond);
+    const result = mockCallArg(respond, 0, 1);
     expectRecordFields((result as { file: unknown }).file, {
       name: "SOUL.md",
       missing: true,
@@ -1677,7 +1615,7 @@ describe("agents.files.list", () => {
 
     const respond = await call("agents.files.list", { agentId: "main" });
 
-    const result = firstRespondResult(respond);
+    const result = mockCallArg(respond, 0, 1);
     const files = (
       result as {
         files: Array<{ name: string; missing: boolean; size?: number; expectedAbsent?: boolean }>;
@@ -1717,7 +1655,7 @@ describe("agents.files.list", () => {
 
     const respond = await call("agents.files.list", { agentId: "main" });
 
-    const result = firstRespondResult(respond);
+    const result = mockCallArg(respond, 0, 1);
     const files = (result as { files: Array<{ name: string; missing: boolean; size?: number }> })
       .files;
     const file = files.find((entry) => entry.name === "AGENTS.md");
@@ -1729,11 +1667,7 @@ describe("agents.files.list", () => {
 describe("agents.files.get/set symlink safety", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.loadConfigReturn = {
-      agents: {
-        entries: { main: { workspace: "/workspace/test-agent" } },
-      },
-    };
+    mocks.loadConfigReturn = agentConfig({ main: { workspace: "/workspace/test-agent" } });
     mocks.fsMkdir.mockResolvedValue(undefined);
   });
 
