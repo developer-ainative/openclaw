@@ -411,33 +411,53 @@ describe("candidate update admission", () => {
     "acp/event-ledger.json.doctor-import",
     "restart-sentinel.json",
     "restart-sentinel.json.doctor-importing",
-  ])("admits retired %s for the candidate Doctor to migrate or archive", async (relative) => {
-    const stateDir = path.dirname(configPath);
-    const custom = relative.startsWith("custom-cron/");
-    const filename = path.join(custom ? home : stateDir, relative);
-    if (custom) {
-      writeConfig({ cron: { store: filename } });
-    }
-    fs.mkdirSync(path.dirname(filename), { recursive: true });
-    fs.writeFileSync(filename, "retained operator data\n");
-    const before = snapshotFiles();
+  ])(
+    "preserves retired %s and requires importable sources to be repaired first",
+    async (relative) => {
+      const stateDir = path.dirname(configPath);
+      const custom = relative.startsWith("custom-cron/");
+      const filename = path.join(custom ? home : stateDir, relative);
+      if (custom) {
+        writeConfig({ cron: { store: filename } });
+      }
+      fs.mkdirSync(path.dirname(filename), { recursive: true });
+      fs.writeFileSync(filename, "retained operator data\n");
+      const before = snapshotFiles();
 
-    await updateAdmitCommand(contextPath);
+      await updateAdmitCommand(contextPath);
 
-    expect(process.exitCode).toBe(0);
-    expect(readVerdict()).toMatchObject({
-      verdict: "admit",
-      reasons: [],
-      facts: {
-        checks: expect.arrayContaining([
-          { name: "state-format", status: "warn", detail: expect.any(String) },
-        ]),
-      },
-    });
-    expect(stderr).toBe("");
-    expect(snapshotFiles()).toEqual(before);
-    expect(fs.existsSync(resolveOpenClawStateSqlitePath())).toBe(false);
-  });
+      const importable =
+        relative.startsWith("settings/") ||
+        relative.startsWith("bindings/") ||
+        relative.endsWith("jobs.json") ||
+        relative.endsWith("jobs-state.json");
+      expect(process.exitCode).toBe(importable ? 3 : 0);
+      expect(readVerdict()).toMatchObject(
+        importable
+          ? {
+              verdict: "refuse",
+              reasons: [
+                expect.objectContaining({
+                  code: "retired-state-format",
+                  message: expect.stringContaining("doctor --fix"),
+                }),
+              ],
+            }
+          : {
+              verdict: "admit",
+              reasons: [],
+              facts: {
+                checks: expect.arrayContaining([
+                  { name: "state-format", status: "warn", detail: expect.any(String) },
+                ]),
+              },
+            },
+      );
+      expect(stderr).toBe("");
+      expect(snapshotFiles()).toEqual(before);
+      expect(fs.existsSync(resolveOpenClawStateSqlitePath())).toBe(false);
+    },
+  );
 
   it.each([
     { selector: "default", store: "referenced" },
@@ -509,11 +529,11 @@ describe("candidate update admission", () => {
       await updateAdmitCommand(contextPath);
 
       const invalidConfig = selector.startsWith("prefixed-");
-      expect(process.exitCode).toBe(storeKind === "unreadable" || invalidConfig ? 3 : 0);
+      expect(process.exitCode).toBe(storeKind !== "other-id" || invalidConfig ? 3 : 0);
       expect(readVerdict()).toMatchObject(
         invalidConfig
           ? { verdict: "refuse", reasons: [expect.objectContaining({ code: "invalid-config" })] }
-          : storeKind !== "unreadable"
+          : storeKind === "other-id"
             ? { verdict: "admit", reasons: [] }
             : {
                 verdict: "refuse",
@@ -521,7 +541,9 @@ describe("candidate update admission", () => {
                   expect.objectContaining({
                     code: "retired-state-format",
                     message: expect.stringContaining(
-                      `Cannot inspect potentially retired state at ${store}`,
+                      storeKind === "unreadable"
+                        ? `Cannot inspect potentially retired state at ${store}`
+                        : "doctor --fix",
                     ),
                   }),
                 ],

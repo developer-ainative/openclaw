@@ -1,7 +1,5 @@
 // Doctor cron storage repair mechanics for quarantine, payloads, and Codex refs.
 
-import fs from "node:fs/promises";
-import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import {
@@ -27,12 +25,14 @@ import {
 import { cronStoreKey } from "../../../cron/store/key.js";
 import { fingerprintCronJobRows } from "../../../cron/store/row-codec.js";
 import type { CronJob } from "../../../cron/types.js";
-import { hasErrnoCode } from "../../../infra/errno.js";
 import {
   collectErrorGraphCandidates,
   formatErrorMessage as errorMessage,
 } from "../../../infra/errors.js";
 import type { EngineConnection } from "../../../infra/sql-connection.js";
+import { importRetiredStateSource } from "../../../infra/state-migrations.retired-archive.js";
+import { listRetiredCronStateFiles } from "../../../infra/state-migrations.retired-cron-files.js";
+import { listExistingRetiredStateFiles } from "../../../infra/state-migrations.retired-files.js";
 import { backupLegacyStateSource } from "../../../infra/state-migrations.source-backup.js";
 import { parseAgentSessionKey } from "../../../routing/session-key.js";
 import { captureOpenClawStateReadContext } from "../../../state/openclaw-state-worker-context.js";
@@ -126,13 +126,7 @@ export async function loadLegacyCronRepairState(params: {
   if (params.onlyIfLegacyDetected && !legacyQuarantine) {
     return null;
   }
-  let persistedQuarantine: CronQuarantinedJob[];
-  try {
-    persistedQuarantine = await loadCronQuarantinedJobs(storePath, params.env);
-  } catch (err) {
-    rethrowSqliteSchemaVersionError(err);
-    persistedQuarantine = [];
-  }
+  const persistedQuarantine = await loadCronQuarantinedJobs(storePath, params.env);
 
   const loaded = params.readOnly
     ? await loadCronJobsStoreWithConfigJobsReadOnly(storePath, params.env)
@@ -402,6 +396,9 @@ export async function applyLegacyCronStoreRepair(params: {
       }
     } catch (err) {
       rethrowSqliteSchemaVersionError(err);
+      if (state.legacyImport) {
+        throw err;
+      }
       const snapshotChanged = collectErrorGraphCandidates(err, (current) => [current.cause]).some(
         (cause) => cause instanceof CronJobsStoreChangedError,
       );
@@ -501,88 +498,62 @@ export async function migrateRetiredCronState(params: {
   const env = params.env ?? process.env;
   await assertCronStateSchemaSupportedAsync(env);
   const storePath = resolveCronJobsStorePath(readLegacyCronStorePath(params.cfg), env);
-  const statePath = `${storePath.endsWith(".json") ? storePath.slice(0, -5) : storePath}-state.json`;
-  const runsDir = path.join(path.dirname(storePath), "runs");
-  const runFiles = await fs.readdir(runsDir).catch((error: unknown) => {
-    if (hasErrnoCode(error, "ENOENT")) {
-      return [];
-    }
-    throw error;
-  });
-  const candidates = [
-    storePath,
-    statePath,
-    ...runFiles
-      .filter((name) => name.endsWith(".jsonl"))
-      .toSorted()
-      .map((name) => path.join(runsDir, name)),
-  ];
+  const candidates = await listRetiredCronStateFiles(storePath);
+  const statePath = candidates[1]!;
   const source = captureOpenClawStateReadContext();
   const assertCurrent = () => {
     source.admission.assertCurrent();
     source.maintenanceScope?.assertDatabaseAccess(source.admission.databasePath);
   };
   const backups = new Map<string, Awaited<ReturnType<typeof backupLegacyStateSource>>>();
-  for (const filePath of candidates) {
-    try {
-      await fs.lstat(filePath);
-    } catch (error) {
-      if (hasErrnoCode(error, "ENOENT")) {
-        continue;
-      }
-      throw error;
-    }
+  for (const filePath of listExistingRetiredStateFiles(candidates)) {
     backups.set(filePath, await backupLegacyStateSource({ filePath, assertCurrent }));
   }
   const result: LegacyCronRepairResult = { changes: [], warnings: [] };
   const jobsSource = backups.get(storePath);
   if (jobsSource) {
-    try {
-      const legacy = parseLegacyCronJobs(jobsSource.bytes, backups.get(statePath)?.bytes);
-      result.warnings.push(...legacy.warnings);
-      const state = await loadLegacyCronRepairState({ cfg: params.cfg, storePath, env });
-      if (!state) {
-        throw new Error("Cron repair snapshot unavailable");
-      }
-      const ids = new Set(state.rawJobs.map((job) => normalizeOptionalStringifiedId(job.id)));
-      const imported = legacy.jobs.filter((job) => {
-        const id = normalizeOptionalStringifiedId(job.id);
-        if (ids.has(id)) {
-          return false;
+    await importRetiredStateSource({
+      source: jobsSource,
+      label: "legacy cron jobs",
+      parse: (bytes) => parseLegacyCronJobs(bytes, backups.get(statePath)?.bytes),
+      recoveryInstructions: `Recover job definitions from ${jobsSource.backupPath} with openclaw automations add.`,
+      result,
+      commit: async (legacy) => {
+        result.warnings.push(...legacy.warnings);
+        const state = await loadLegacyCronRepairState({ cfg: params.cfg, storePath, env });
+        if (!state) {
+          throw new Error("Cron repair snapshot unavailable");
         }
-        ids.add(id);
-        return true;
-      });
-      if (imported.length) {
-        state.rawJobs.push(...imported);
-        state.legacyImport = {
-          count: imported.length,
-          assertCurrent: () => {
-            jobsSource.assertUnchanged();
-            backups.get(statePath)?.assertUnchanged();
-          },
-        };
-        const repaired = await applyLegacyCronStoreRepair({ cfg: params.cfg, state });
-        result.changes.push(...repaired.changes);
-        result.warnings.push(...repaired.warnings);
-        if (
-          repaired.warnings.some(
-            (warning) =>
-              warning.startsWith("Failed writing") || warning.includes("changed while doctor"),
-          )
-        ) {
-          return result;
+        const ids = new Set(state.rawJobs.map((job) => normalizeOptionalStringifiedId(job.id)));
+        const imported = legacy.jobs.filter((job) => {
+          const id = normalizeOptionalStringifiedId(job.id);
+          if (ids.has(id)) {
+            return false;
+          }
+          ids.add(id);
+          return true;
+        });
+        if (imported.length) {
+          state.rawJobs.push(...imported);
+          state.legacyImport = {
+            count: imported.length,
+            assertCurrent: () => {
+              jobsSource.assertUnchanged();
+              backups.get(statePath)?.assertUnchanged();
+            },
+          };
+          const repaired = await applyLegacyCronStoreRepair({ cfg: params.cfg, state });
+          result.changes.push(...repaired.changes);
+          result.warnings.push(...repaired.warnings);
+          result.changes.push(`Imported ${imported.length} legacy cron job(s) into SQLite.`);
         }
-        result.changes.push(`Imported ${imported.length} legacy cron job(s) into SQLite.`);
-      }
-    } catch (error) {
-      rethrowSqliteSchemaVersionError(error);
-      result.warnings.push(
-        `Could not import legacy cron jobs: ${errorMessage(error)}. Recover job definitions from ${jobsSource.backupPath} with openclaw automations add.`,
-      );
-    }
+      },
+    });
   }
   for (const [filePath, backup] of backups) {
+    if (filePath === storePath) {
+      continue;
+    }
     assertCurrent();
     backup.removeSource(() => undefined);
     result.warnings.push(

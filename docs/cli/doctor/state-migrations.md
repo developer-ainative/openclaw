@@ -71,8 +71,11 @@ Sandbox containers can be recreated through `openclaw sandbox recreate --all`.
 Doctor also imports old cron job definitions and matching runtime state. Current
 SQLite jobs win on ID collisions. Historical `cron/runs/*.jsonl` files are archived
 for inspection; new runs use current SQLite history. These JSON formats no longer
-require an intermediate OpenClaw release, and update admission leaves them for the
-candidate Doctor to repair after backup.
+require an intermediate OpenClaw release. Run `openclaw doctor --fix` before
+updating when these importable sources are present. If a SQLite load or commit
+fails, Doctor keeps the live source files for retry and reports the database error.
+Update admission refuses until that import succeeds. Malformed input is archived
+with recovery instructions; transient archives remain nonblocking.
 
 Retired `subagents/runs.json` files are ignored and left untouched;
 transient runs are never restored from them.

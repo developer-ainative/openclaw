@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { repairRetiredDoctorState } from "../commands/doctor-retired-state-repair.js";
 import { readPluginBindingApprovalsInDatabase } from "../plugins/conversation-binding-state.kernel.js";
 import { writeConfigMachineState } from "../state/config-machine-state-write.js";
 import { readConfigMachineState } from "../state/config-machine-state.js";
@@ -12,6 +13,7 @@ import {
 import { inspectCurrentConversationBindingRecordsInDatabase } from "./outbound/current-conversation-bindings.kernel.js";
 import { assertNoRetiredRuntimeStateFiles } from "./state-migrations.retired-runtime-files.js";
 import { migrateRetiredRuntimeState } from "./state-migrations.retired-runtime.js";
+import { runLegacyStateMigrationSteps } from "./state-migrations.steps.js";
 
 describe("Doctor retired runtime state recovery", () => {
   const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
@@ -119,6 +121,86 @@ describe("Doctor retired runtime state recovery", () => {
     );
     expect(fs.readFileSync(`${source.file}.migrated`)).toEqual(source.bytes);
     expect(() => assertNoRetiredRuntimeStateFiles(stateDir, env)).not.toThrow();
+  });
+
+  it.each([
+    {
+      relative: "settings/voicewake.json",
+      value: { triggers: ["retained"] },
+      table: "config_machine_state",
+    },
+    {
+      relative: "settings/voicewake-routing.json",
+      value: { version: 1, routes: [] },
+      table: "config_machine_state",
+    },
+    {
+      relative: "bindings/current-conversations.json",
+      value: {
+        version: 1,
+        bindings: [
+          {
+            conversation: { channel: "discord", conversationId: "123" },
+            targetSessionKey: "agent:main:test",
+          },
+        ],
+      },
+      table: "current_conversation_bindings",
+    },
+    {
+      relative: "plugin-binding-approvals.json",
+      value: {
+        version: 1,
+        approvals: [{ pluginRoot: "/plugins/test", pluginId: "test", channel: "discord" }],
+      },
+      table: "plugin_binding_approvals",
+    },
+  ])(
+    "retains $relative after SQLite rejection and retries the import",
+    async ({ relative, value, table }) => {
+      const source = write(relative, value);
+      const { db } = openOpenClawStateDatabase({ env });
+      db.exec(
+        `CREATE TRIGGER reject_legacy_import BEFORE INSERT ON ${table} BEGIN SELECT RAISE(ABORT, 'synthetic runtime import failure'); END`,
+      );
+      try {
+        await expect(migrate()).rejects.toThrow("synthetic runtime import failure");
+        expect(fs.readFileSync(source.file)).toEqual(source.bytes);
+        expect(() => assertNoRetiredRuntimeStateFiles(stateDir, env)).toThrow("doctor --fix");
+        expect(db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toMatchObject({
+          count: 0,
+        });
+      } finally {
+        db.exec("DROP TRIGGER reject_legacy_import");
+      }
+      await migrate();
+      expect(fs.existsSync(source.file)).toBe(false);
+      expect(fs.readFileSync(`${source.file}.migrated`)).toEqual(source.bytes);
+      expect(db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toMatchObject({
+        count: 1,
+      });
+      expect(() => assertNoRetiredRuntimeStateFiles(stateDir, env)).not.toThrow();
+    },
+  );
+
+  it("reports a successful Doctor import as an advisory step, not a refusal", async () => {
+    const source = write("settings/voicewake.json", { triggers: ["retained"] });
+    const result = await runLegacyStateMigrationSteps([
+      {
+        id: "retired-core-state",
+        phase: "shared",
+        source: [{ kind: "path", path: source.file }],
+        target: [],
+        requiredness: "required",
+        reversibility: "checkpoint-required",
+        run: () => repairRetiredDoctorState(env),
+      },
+    ]);
+    expect(result.haltedBy).toBeUndefined();
+    expect(result.receipts[0]?.outcome).toBe("warning");
+    expect(readConfigMachineState("voicewake.triggers", { env })).toEqual(["retained"]);
+    expect(fs.existsSync(source.file)).toBe(false);
+    expect(fs.readFileSync(`${source.file}.migrated`)).toEqual(source.bytes);
   });
 
   it("does not import another profile's default-home approval", async () => {

@@ -55,7 +55,7 @@ export async function repairRetiredDoctorState(
         result.changes.push(...archived.changes);
         result.warnings.push(...archived.warnings);
       }
-      return result;
+      return { ...result, warningDisposition: "recoverable" };
     },
   });
 }

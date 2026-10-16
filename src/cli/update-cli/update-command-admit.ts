@@ -22,10 +22,14 @@ import { nodeVersionSatisfiesEngine } from "../../infra/runtime-guard.js";
 import { listRetiredCronStateFiles } from "../../infra/state-migrations.retired-cron-files.js";
 import { listRetiredDeliveryQueueFiles } from "../../infra/state-migrations.retired-delivery-files.js";
 import {
+  assertNoRetiredStateFiles,
   listExistingRetiredStateFiles,
   RetiredStateFormatError,
 } from "../../infra/state-migrations.retired-files.js";
-import { listRetiredRuntimeStateFiles } from "../../infra/state-migrations.retired-runtime-files.js";
+import {
+  listImportableRetiredRuntimeStateFiles,
+  listRetiredRuntimeStateFiles,
+} from "../../infra/state-migrations.retired-runtime-files.js";
 import {
   isUpdateAdmissionAuthorityEnvKey,
   parseUpdateAdmissionContext,
@@ -250,21 +254,27 @@ async function inspectUpdateAdmission(
             // The saved partition reads SQLite; admit its schema before inspecting live files
             // that published updaters omit from their later rehearsal snapshots.
             const stateDir = resolveStateDir(databaseContext.env);
-            const retired = listExistingRetiredStateFiles([
-              ...listRetiredRuntimeStateFiles(stateDir, databaseContext.env),
-              ...listRetiredDeliveryQueueFiles(stateDir),
-              resolveLegacyInstalledPluginIndexStorePath({ stateDir }),
+            const cronFiles = await listRetiredCronStateFiles(
+              resolveCronJobsStorePathFromConfig(
+                snapshot.sourceConfigBeforeMigrations ?? snapshot.sourceConfig ?? snapshot.config,
+                databaseContext.env,
+              ),
+            );
+            // A live importable source also represents an interrupted or failed Doctor commit.
+            assertNoRetiredStateFiles("Unmigrated user state", [
+              ...listImportableRetiredRuntimeStateFiles(stateDir, databaseContext.env),
+              ...cronFiles.slice(0, 2),
               ...listReferencedLegacyOAuthSidecarPaths(
                 env,
                 snapshot.sourceConfigBeforeMigrations ?? snapshot.sourceConfig ?? snapshot.config,
               ),
               ...listReferencedLegacyOAuthSidecarPaths(databaseContext.env, databaseContext.config),
-              ...(await listRetiredCronStateFiles(
-                resolveCronJobsStorePathFromConfig(
-                  snapshot.sourceConfigBeforeMigrations ?? snapshot.sourceConfig ?? snapshot.config,
-                  databaseContext.env,
-                ),
-              )),
+            ]);
+            const retired = listExistingRetiredStateFiles([
+              ...listRetiredRuntimeStateFiles(stateDir, databaseContext.env),
+              ...listRetiredDeliveryQueueFiles(stateDir),
+              resolveLegacyInstalledPluginIndexStorePath({ stateDir }),
+              ...cronFiles.slice(2),
             ]);
             if (retired.length > 0) {
               const message = `Doctor will migrate or archive retired state with original bytes preserved: ${retired.join(", ")}`;

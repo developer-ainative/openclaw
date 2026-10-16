@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { asRecord } from "@openclaw/normalization-core/record-coerce";
@@ -11,13 +10,16 @@ import {
 import { importConfigMachineState } from "../state/config-machine-state-write.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
-import { hasErrnoCode } from "./errno.js";
 import { resolveRequiredHomeDir } from "./home-dir.js";
 import { executeSqliteQueryTakeFirstSync, getNodeSqliteKysely } from "./kysely-sync.js";
 import { updateCurrentConversationBindingRecordInDatabase } from "./outbound/current-conversation-bindings.kernel.js";
 import { normalizeConversationRef } from "./outbound/session-binding-normalization.js";
 import type { SessionBindingRecord } from "./outbound/session-binding.types.js";
-import { archiveRetiredStateFiles } from "./state-migrations.retired-archive.js";
+import {
+  archiveRetiredStateFiles,
+  importRetiredStateSource,
+} from "./state-migrations.retired-archive.js";
+import { listExistingRetiredStateFiles } from "./state-migrations.retired-files.js";
 import { backupLegacyStateSource } from "./state-migrations.source-backup.js";
 import type { MigrationMessages } from "./state-migrations.types.js";
 
@@ -75,35 +77,24 @@ export async function migrateRetiredRuntimeState(
 ): Promise<MigrationMessages> {
   const env = { ...(params.env ?? process.env), OPENCLAW_STATE_DIR: params.stateDir };
   const result: MigrationMessages = { changes: [], warnings: [] };
-  async function migrate(
+  async function migrate<T>(
     relative: string,
-    importValue: (value: unknown) => void,
-    recovery: string,
+    parse: (value: unknown) => T,
+    commit: (value: T) => void,
+    recoveryInstructions: string,
   ) {
     const filePath = path.join(params.stateDir, relative);
-    try {
-      fs.lstatSync(filePath);
-    } catch (error) {
-      if (hasErrnoCode(error, "ENOENT")) {
-        return;
-      }
-      throw error;
+    if (listExistingRetiredStateFiles([filePath]).length === 0) {
+      return;
     }
-    const backup = await backupLegacyStateSource({ filePath, assertCurrent: params.assertCurrent });
-    let imported = false;
-    try {
-      const value: unknown = JSON.parse(backup.bytes.toString("utf8"));
-      params.assertCurrent();
-      importValue(value);
-      imported = true;
-      result.changes.push(`Migrated ${relative} → shared SQLite state (existing values retained)`);
-    } catch (error) {
-      result.warnings.push(`Could not import ${relative}: ${String(error)}. ${recovery}`);
-    }
-    backup.removeSource(() => undefined);
-    result.warnings.push(
-      `${relative}: original bytes are preserved at ${backup.backupPath}. ${imported ? "Existing SQLite values were retained." : recovery}`,
-    );
+    await importRetiredStateSource({
+      source: await backupLegacyStateSource({ filePath, assertCurrent: params.assertCurrent }),
+      label: relative,
+      parse: (bytes) => parse(JSON.parse(bytes.toString("utf8"))),
+      commit,
+      recoveryInstructions,
+      result,
+    });
   }
   await migrate(
     "settings/voicewake.json",
@@ -112,6 +103,9 @@ export async function migrateRetiredRuntimeState(
       if (triggers.length === 0) {
         throw new Error("No valid voice wake triggers");
       }
+      return triggers;
+    },
+    (triggers) => {
       importConfigMachineState([["voicewake.triggers", triggers]], { env });
     },
     "Restore the listed trigger phrases through Voice Wake settings.",
@@ -123,7 +117,10 @@ export async function migrateRetiredRuntimeState(
       if (!Array.isArray(routing.routes)) {
         throw new Error("Invalid voice wake routing rules");
       }
-      // The canonical Voice Wake reader owns route normalization, including legacy defaults.
+      return routing;
+    },
+    // The canonical Voice Wake reader owns route normalization, including legacy defaults.
+    (routing) => {
       importConfigMachineState([["voicewake.routing", routing]], { env });
     },
     "Restore the archived defaultTarget and routes through Voice Wake routing settings.",
@@ -135,7 +132,9 @@ export async function migrateRetiredRuntimeState(
       if (file.version !== 1 || !Array.isArray(file.bindings)) {
         throw new Error("Expected version 1 conversation bindings");
       }
-      const records = file.bindings.map(normalizeLegacyBinding);
+      return file.bindings.map(normalizeLegacyBinding);
+    },
+    (records) => {
       runOpenClawStateWriteTransaction(
         ({ db }) => {
           params.assertCurrent();
@@ -174,7 +173,7 @@ export async function migrateRetiredRuntimeState(
         if (file.version !== 1 || !Array.isArray(file.approvals)) {
           throw new Error("Expected version 1 plugin binding approvals");
         }
-        const approvals = file.approvals.map((input: unknown) => {
+        return file.approvals.map((input: unknown) => {
           const entry = asRecord(input);
           const pluginRoot = normalizeOptionalString(entry.pluginRoot);
           const pluginId = normalizeOptionalString(entry.pluginId);
@@ -194,6 +193,8 @@ export async function migrateRetiredRuntimeState(
                 : Date.now(),
           };
         });
+      },
+      (approvals) => {
         runOpenClawStateWriteTransaction(
           ({ db }) => {
             params.assertCurrent();

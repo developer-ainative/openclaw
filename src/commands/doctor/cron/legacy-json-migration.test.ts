@@ -1,9 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+import * as cronStore from "../../../cron/store.js";
 import { loadCronStore, saveCronStore } from "../../../cron/store.js";
 import type { CronJob } from "../../../cron/types.js";
+import { openOpenClawStateDatabase } from "../../../state/openclaw-state-db.js";
 import { withOpenClawTestState } from "../../../test-utils/openclaw-test-state.js";
 import { repairLegacyCronStoreWithoutPrompt } from "./legacy-repair.js";
 
@@ -104,3 +106,90 @@ it("archives uninterpretable cron definitions with actionable recovery instead o
     await expect(fs.stat(storePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
+
+it.each(["load", "commit"])(
+  "retains cron sources after a SQLite %s failure and archives only after retry",
+  async (phase) => {
+    await withOpenClawTestState({ label: "cron-import-retry" }, async (fixture) => {
+      const storePath = await fixture.writeText(
+        "cron/jobs.json",
+        JSON.stringify({
+          version: 1,
+          jobs: [
+            {
+              id: "legacy",
+              name: "Legacy",
+              enabled: true,
+              createdAtMs: 1,
+              updatedAtMs: 1,
+              schedule: { kind: "every", everyMs: 60_000 },
+              sessionTarget: "main",
+              wakeMode: "now",
+              payload: { kind: "systemEvent", text: "keep me" },
+              state: {},
+            },
+          ],
+        }),
+      );
+      const runtimePath = await fixture.writeText(
+        "cron/jobs-state.json",
+        JSON.stringify({
+          version: 1,
+          jobs: { legacy: { updatedAtMs: 12, state: { lastRunAtMs: 11 } } },
+        }),
+      );
+      const originals = await Promise.all(
+        [storePath, runtimePath].map(async (file) => [file, await fs.readFile(file)] as const),
+      );
+      const db = openOpenClawStateDatabase().db;
+      const rejection =
+        "CREATE TRIGGER reject_legacy_cron BEFORE INSERT ON cron_jobs BEGIN SELECT RAISE(ABORT, 'synthetic cron import failure'); END";
+      const save = cronStore.saveCronJobsStore;
+      const fault =
+        phase === "commit"
+          ? vi
+              .spyOn(cronStore, "saveCronJobsStore")
+              .mockImplementationOnce((target, store, options) =>
+                save(target, store, {
+                  ...options,
+                  transactionHooks: {
+                    ...options?.transactionHooks,
+                    beforeWrite: (connection, schema) => {
+                      options?.transactionHooks?.beforeWrite?.(connection, schema);
+                      connection.exec(rejection);
+                    },
+                  },
+                }),
+              )
+          : undefined;
+      if (phase === "load") {
+        db.exec(rejection);
+      }
+      const cfg = { cron: { store: storePath } } as OpenClawConfig;
+      try {
+        await expect(repairLegacyCronStoreWithoutPrompt({ cfg })).rejects.toThrow(
+          phase === "load"
+            ? "unexpected trigger reject_legacy_cron"
+            : "synthetic cron import failure",
+        );
+        for (const [file, bytes] of originals) {
+          expect(await fs.readFile(file)).toEqual(bytes);
+        }
+      } finally {
+        fault?.mockRestore();
+        if (phase === "load") {
+          db.exec("DROP TRIGGER reject_legacy_cron");
+        }
+      }
+      expect((await loadCronStore(storePath)).jobs).toEqual([]);
+      await repairLegacyCronStoreWithoutPrompt({ cfg });
+      expect((await loadCronStore(storePath)).jobs).toMatchObject([
+        { id: "legacy", state: { lastRunAtMs: 11 } },
+      ]);
+      for (const [file, bytes] of originals) {
+        await expect(fs.stat(file)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await fs.readFile(`${file}.migrated`)).toEqual(bytes);
+      }
+    });
+  },
+);

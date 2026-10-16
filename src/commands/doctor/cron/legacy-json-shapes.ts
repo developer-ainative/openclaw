@@ -1,5 +1,6 @@
 // File-era cron shapes are read only by Doctor, before canonical SQLite persistence.
 import { createHash } from "node:crypto";
+import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   normalizeOptionalString,
@@ -81,20 +82,6 @@ function tryLegacyCronScheduleIdentity(job: Record<string, unknown>): string | u
   });
 }
 
-function getRawCronJobs(parsed: unknown): unknown[] {
-  return Array.isArray(parsed)
-    ? parsed
-    : isRecord(parsed) && Array.isArray(parsed.jobs)
-      ? parsed.jobs
-      : [];
-}
-
-function hasInlineState(jobs: Array<Record<string, unknown> | null | undefined>): boolean {
-  return jobs.some(
-    (job) => job != null && isRecord(job.state) && Object.keys(job.state).length > 0,
-  );
-}
-
 function ensureJobStateObject(job: Record<string, unknown>): void {
   if (!isRecord(job.state)) {
     job.state = {};
@@ -108,24 +95,16 @@ function backfillMissingRuntimeFields(job: Record<string, unknown>): void {
   }
 }
 
-function resolveUpdatedAtMs(job: Record<string, unknown>, updatedAtMs: unknown): number {
-  if (typeof updatedAtMs === "number" && Number.isFinite(updatedAtMs)) {
-    return updatedAtMs;
-  }
-  if (typeof job.updatedAtMs === "number" && Number.isFinite(job.updatedAtMs)) {
-    return job.updatedAtMs;
-  }
-  return typeof job.createdAtMs === "number" && Number.isFinite(job.createdAtMs)
-    ? job.createdAtMs
-    : Date.now();
-}
-
 function mergeStateFileEntry(job: Record<string, unknown>, entry: unknown): void {
   if (!isRecord(entry)) {
     backfillMissingRuntimeFields(job);
     return;
   }
-  job.updatedAtMs = resolveUpdatedAtMs(job, entry.updatedAtMs);
+  job.updatedAtMs =
+    asFiniteNumber(entry.updatedAtMs) ??
+    asFiniteNumber(job.updatedAtMs) ??
+    asFiniteNumber(job.createdAtMs) ??
+    Date.now();
   const state = isRecord(entry.state) ? entry.state : {};
   job.state = state;
   if (
@@ -134,10 +113,6 @@ function mergeStateFileEntry(job: Record<string, unknown>, entry: unknown): void
   ) {
     state.nextRunAtMs = undefined;
   }
-}
-
-function resolveCronStateId(job: Record<string, unknown>): string | undefined {
-  return normalizeOptionalString(job.id) ?? normalizeOptionalString(job.jobId);
 }
 
 /** Decode the shipped JSON store and its optional split runtime state. */
@@ -149,12 +124,13 @@ export function parseLegacyCronJobs(
   warnings: string[];
 } {
   const parsed = parseJsonWithJson5Fallback(storeBytes.toString("utf8"));
-  if (!Array.isArray(parsed) && !(isRecord(parsed) && Array.isArray(parsed.jobs))) {
+  const rows = Array.isArray(parsed) ? parsed : isRecord(parsed) ? parsed.jobs : undefined;
+  if (!Array.isArray(rows)) {
     throw new Error("Unrecognized legacy cron job store; expected an array or a jobs array");
   }
   const jobs: Array<Record<string, unknown>> = [];
   const warnings: string[] = [];
-  for (const [index, row] of getRawCronJobs(parsed).entries()) {
+  for (const [index, row] of rows.entries()) {
     if (!isRecord(row)) {
       warnings.push(`Cron row ${index} is not an object and remains available in the archive.`);
       continue;
@@ -173,11 +149,11 @@ export function parseLegacyCronJobs(
   if (stateBytes && !stateFile) {
     warnings.push("Unrecognized legacy cron runtime state remains available in the archive.");
   }
-  const inlineState = !stateFile && hasInlineState(jobs);
+  const inlineState =
+    !stateFile && jobs.some((job) => isRecord(job.state) && Object.keys(job.state).length > 0);
   for (const job of jobs) {
     if (stateFile) {
-      const id = resolveCronStateId(job);
-      mergeStateFileEntry(job, id ? stateFile.jobs[id] : undefined);
+      mergeStateFileEntry(job, stateFile.jobs[String(job.id)]);
     } else if (inlineState) {
       ensureJobStateObject(job);
     } else {
