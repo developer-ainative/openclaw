@@ -14,6 +14,7 @@ import * as stagingToken from "../infra/sqlite-staging-token.js";
 import { createOpenClawDatabaseMaintenanceScope } from "../state/openclaw-state-db-async-lifecycle.js";
 import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
+import { makePluginMetadataIndex } from "./current-plugin-metadata.test-support.js";
 import { writePersistedInstalledPluginIndex } from "./installed-plugin-index-store-write.js";
 import { capturePluginGenerationArtifact } from "./plugin-generation-artifact.js";
 import { clearPluginMetadataLifecycleCaches } from "./plugin-metadata-lifecycle.js";
@@ -36,6 +37,51 @@ const temp = useAutoCleanupTempDirTracker((cleanup) =>
 );
 const hour = 60 * 60 * 1_000;
 const locked = Object.assign(new Error("Fixture Windows sharing violation"), { code: "EPERM" });
+const sourceBytes = "module.exports = 'captured';\n";
+let stateDir: string;
+
+function advanceAge() {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(Date.now() + 2 * hour);
+}
+
+function expectExists(file: string, exists = false) {
+  expect(fs.existsSync(file)).toBe(exists);
+}
+
+function nativeFixture(
+  state: string,
+  bytes: string,
+  filename = "package/bin/native",
+  commit = true,
+) {
+  const root = createPluginNativeCaptureRoot(state);
+  const file = write(root.directory, filename, bytes);
+  if (commit) {
+    root.commit();
+    root.dispose();
+  }
+  return { root, file };
+}
+
+function captureFixture() {
+  const instance = retainPluginSourceCaptureInstance(stateDir);
+  const directory = instance.createDirectory();
+  return { instance, directory, root: path.dirname(path.dirname(directory)) };
+}
+
+function refusePath<P, A extends unknown[], T>(
+  original: (target: P, ...args: A) => T,
+  matches: (target: P) => boolean,
+  failure: Error = locked,
+) {
+  return (target: P, ...args: A): T => {
+    if (matches(target)) {
+      throw failure;
+    }
+    return original(target, ...args);
+  };
+}
 
 function expectBytes(file: string, expected: string) {
   expect(fs.readFileSync(file, "utf8")).toBe(expected);
@@ -59,7 +105,6 @@ function expectPairedFailure(failure: unknown, primary: Error, cleanup: Error) {
 }
 
 async function duringMaintenance<T>(
-  stateDir: string,
   run: (scope: ReturnType<typeof createOpenClawDatabaseMaintenanceScope>) => Promise<T>,
 ) {
   const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
@@ -85,6 +130,7 @@ beforeEach(() => {
   for (const key of ["TMPDIR", "TMP", "TEMP"]) {
     vi.stubEnv(key, temporary);
   }
+  stateDir = temp.make("capture-recovery-state-");
   vi.spyOn(process, "emitWarning").mockImplementation(() => {});
 });
 
@@ -97,14 +143,11 @@ afterEach(() => {
 it.each(["failed removal", "maintenance failed removal", "identity-change return"] as const)(
   "preserves reclamation errors and closes the original token after %s",
   async (mode) => {
-    const stateDir = temp.make("capture-reclaim-close-");
     const root = path.join(stateDir, "tmp", "plugin-captures", "released-producer");
     const captures = path.join(root, "captures");
-    const payload = path.join(captures, "source.js");
+    const payload = write(captures, "source.js", "retained source bytes");
     const tokenPath = path.join(root, stagingToken.SQLITE_STAGING_TOKEN_FILES[0]);
     const extraLink = path.join(stateDir, "token-hardlink.sqlite");
-    fs.mkdirSync(captures, { recursive: true });
-    fs.writeFileSync(payload, "retained source bytes");
     stagingToken.acquireSqliteStagingToken(root, "create")();
     const old = new Date(Date.now() - 2 * hour);
     fs.utimesSync(root, old, old);
@@ -150,7 +193,7 @@ it.each(["failed removal", "maintenance failed removal", "identity-change return
         await sweepPluginSourceCapturesForTest(stateDir);
         return warning.mock.calls.map(([message]) => String(message));
       }
-      return duringMaintenance(stateDir, async (scope) => {
+      return duringMaintenance(async (scope) => {
         const result = await captureDirectory.prunePluginNativeCaptureDirectories(
           stateDir,
           new Set(),
@@ -162,8 +205,7 @@ it.each(["failed removal", "maintenance failed removal", "identity-change return
     try {
       const messages = await collectWarnings();
       expect(closeRefused).toBe(true);
-      expect(messages.length).toBe(1);
-      expect(messages[0]?.includes(cleanup.message)).toBe(true);
+      expect(messages).toEqual([expect.stringContaining(cleanup.message)]);
       if (mode !== "identity-change return") {
         expect(messages[0]?.includes(primary.message)).toBe(true);
         const failure = classification.mock.calls.find(
@@ -175,7 +217,7 @@ it.each(["failed removal", "maintenance failed removal", "identity-change return
         expect(fs.lstatSync(tokenPath).nlink).toBe(2);
       }
       expectBytes(payload, "retained source bytes");
-      expect(fs.existsSync(tokenPath)).toBe(true);
+      expectExists(tokenPath, true);
     } finally {
       removal.mockRestore();
       acquiring.mockRestore();
@@ -185,13 +227,12 @@ it.each(["failed removal", "maintenance failed removal", "identity-change return
     }
     fs.utimesSync(root, old, old);
     const after = await collectWarnings();
-    expect(fs.existsSync(root)).toBe(false);
+    expectExists(root);
     expect(after.length).toBe(mode === "maintenance failed removal" ? 0 : 1);
   },
 );
 
 it("preserves the preparation cause when synchronous token cleanup also fails", async () => {
-  const stateDir = temp.make("capture-error-cause-");
   const instance = retainPluginSourceCaptureInstance(stateDir);
   await sweepPluginSourceCapturesForTest(stateDir);
   const primary = new Error("Fixture first capture refused");
@@ -234,43 +275,36 @@ it("preserves the preparation cause when synchronous token cleanup also fails", 
 });
 
 it("recovers a removed captures directory without releasing a live instance", async () => {
-  const stateDir = temp.make("capture-recovery-missing-");
-  const instance = retainPluginSourceCaptureInstance(stateDir);
-  const first = instance.createDirectory();
-  const captures = path.dirname(first);
-  const root = path.dirname(captures);
+  const { instance, directory, root } = captureFixture();
+  const captures = path.dirname(directory);
   await sweepPluginSourceCapturesForTest(stateDir);
   fs.rmSync(captures, { recursive: true });
   let worker: ReturnType<typeof createPluginSourceCaptureRoot> | undefined;
   try {
     worker = createPluginSourceCaptureRoot(stateDir, "openclaw-model-catalog-");
-    fs.writeFileSync(path.join(worker.directory, "source.js"), "recovered capture");
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(Date.now() + 2 * hour);
+    const payload = write(worker.directory, "source.js", "recovered capture");
+    advanceAge();
     await sweepPluginSourceCapturesForTest(stateDir);
-    expectBytes(path.join(worker.directory, "source.js"), "recovered capture");
+    expectBytes(payload, "recovered capture");
     await worker.release();
-    expect(fs.existsSync(root)).toBe(true);
+    expectExists(root, true);
     const next = instance.createDirectory();
     expect(fs.readdirSync(captures)).toEqual([path.basename(next)]);
   } finally {
     await worker?.release();
     await instance.releaseAsync();
   }
-  expect(fs.existsSync(root)).toBe(false);
+  expectExists(root);
 });
 
 it.each(["sync", "async"])(
   "keeps published native bytes across %s disposal and later ordinary sweeps",
   async (mode) => {
-    const stateDir = temp.make("native-capture-retention-");
     const committed = createPluginNativeCaptureRoot(stateDir);
     const pending = createPluginNativeCaptureRoot(stateDir);
     const worker = createPluginSourceCaptureRoot(stateDir, "openclaw-model-catalog-");
-    const payload = path.join(committed.directory, "package", "bin", "native");
-    fs.mkdirSync(path.dirname(payload), { recursive: true });
-    fs.writeFileSync(payload, "retained native bytes");
-    fs.writeFileSync(path.join(pending.directory, "native"), "unpublished bytes");
+    const payload = write(committed.directory, "package/bin/native", "retained native bytes");
+    write(pending.directory, "native", "unpublished bytes");
     committed.commit();
     if (mode === "sync") {
       committed.dispose();
@@ -280,20 +314,18 @@ it.each(["sync", "async"])(
       await pending.disposeAsync();
     }
     await worker.release();
-    expect(fs.existsSync(pending.directory)).toBe(false);
-    expect(fs.existsSync(worker.directory)).toBe(false);
+    expectExists(pending.directory);
+    expectExists(worker.directory);
     const instance = path.dirname(path.dirname(committed.directory));
-    expect(fs.existsSync(path.join(instance, "owner.sqlite"))).toBe(true);
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(Date.now() + 2 * hour);
+    expectExists(path.join(instance, "owner.sqlite"), true);
+    advanceAge();
     await sweepPluginSourceCapturesForTest(stateDir);
     expectBytes(payload, "retained native bytes");
-    expect(fs.existsSync(path.join(instance, "owner.sqlite"))).toBe(true);
+    expectExists(path.join(instance, "owner.sqlite"), true);
   },
 );
 
 it("preserves native bytes published after an unlocked missing-directory observation", async () => {
-  const stateDir = temp.make("native-capture-publication-race-");
   const instance = path.join(stateDir, "tmp", "plugin-captures", "producer");
   const native = path.join(instance, "native");
   const payload = path.join(native, "admission", "module.node");
@@ -309,8 +341,11 @@ it("preserves native bytes published after an unlocked missing-directory observa
     } catch (error) {
       if (target === native && !published) {
         expect(error).toMatchObject({ code: "ENOENT" });
-        fs.mkdirSync(path.dirname(payload), { recursive: true });
-        fs.writeFileSync(payload, "published while the producer still held its token");
+        write(
+          path.dirname(payload),
+          path.basename(payload),
+          "published while the producer still held its token",
+        );
         producer(true);
         published = true;
       }
@@ -328,7 +363,6 @@ it("preserves native bytes published after an unlocked missing-directory observa
 });
 
 it.each(["sync", "async"])("preserves custody after partial %s disposal", async (mode) => {
-  const stateDir = temp.make("capture-recovery-state-");
   const instance = mode === "sync" ? retainPluginSourceCaptureInstance(stateDir) : undefined;
   const worker =
     mode === "async"
@@ -337,8 +371,7 @@ it.each(["sync", "async"])("preserves custody after partial %s disposal", async 
   await sweepPluginSourceCapturesForTest(stateDir);
   const directory = worker?.directory ?? instance!.createDirectory();
   const root = path.dirname(path.dirname(directory));
-  const payload = path.join(directory, "source.js");
-  fs.writeFileSync(payload, "export default 1");
+  const payload = write(directory, "source.js", "export default 1");
   const removeSync = fs.rmSync.bind(fs);
   const remove = fsPromises.rm.bind(fsPromises);
   const interruptRemoval = (target: fs.PathLike) => {
@@ -375,10 +408,9 @@ it.each(["sync", "async"])("preserves custody after partial %s disposal", async 
     instance?.release();
     await worker?.release();
   }
-  vi.useFakeTimers({ toFake: ["Date"] });
-  vi.setSystemTime(Date.now() + 2 * hour);
+  advanceAge();
   await sweepPluginSourceCapturesForTest(stateDir);
-  expect(fs.existsSync(root)).toBe(false);
+  expectExists(root);
 });
 
 it.each([
@@ -389,51 +421,35 @@ it.each([
 ])(
   "captures usable fallback bytes without tokenless roots after $stage fails with $code",
   async ({ stage, code }) => {
-    const stateDir = temp.make("capture-recovery-allocation-");
     const source = temp.make("capture-recovery-source-");
-    const capturedSource = "module.exports = 'captured';\n";
-    fs.writeFileSync(path.join(source, "index.cjs"), capturedSource);
+    write(source, "index.cjs", sourceBytes);
     const instance = retainPluginSourceCaptureInstance(stateDir);
     await sweepPluginSourceCapturesForTest(stateDir);
     const managed = path.join(stateDir, "tmp", "plugin-captures");
     const failure = Object.assign(new Error("Fixture capture allocation refused"), { code });
+    const managedPath = (file: fs.PathLike) => String(file).startsWith(managed + path.sep);
     const acquire = stagingToken.acquireSqliteStagingToken;
     const realpath = fs.realpathSync.native;
     const mkdir = fs.mkdirSync.bind(fs);
     const mkdtemp = fs.mkdtempSync.bind(fs);
     if (stage === "lease") {
       vi.spyOn(stagingToken, "acquireSqliteStagingToken").mockImplementation(
-        (directory, mode, options) => {
-          if (directory.startsWith(managed + path.sep)) {
-            throw failure;
-          }
-          return acquire(directory, mode, options);
-        },
+        refusePath(acquire, managedPath, failure),
       );
     } else if (stage === "canonical path") {
-      vi.spyOn(fs.realpathSync, "native").mockImplementation((file, options) => {
-        if (String(file).startsWith(managed + path.sep)) {
-          throw failure;
-        }
-        return realpath(file, options);
-      });
+      vi.spyOn(fs.realpathSync, "native").mockImplementation(
+        refusePath(realpath, managedPath, failure),
+      );
     } else if (stage === "captures") {
-      vi.spyOn(fs, "mkdirSync").mockImplementation((file, options) => {
-        if (
-          String(file).startsWith(managed + path.sep) &&
-          path.basename(String(file)) === "captures"
-        ) {
-          throw failure;
-        }
-        return mkdir(file, options);
-      });
+      vi.spyOn(fs, "mkdirSync").mockImplementation(
+        refusePath(
+          mkdir,
+          (file) => managedPath(file) && path.basename(String(file)) === "captures",
+          failure,
+        ),
+      );
     } else {
-      vi.spyOn(fs, "mkdtempSync").mockImplementation((prefix, options) => {
-        if (prefix.startsWith(managed + path.sep)) {
-          throw failure;
-        }
-        return mkdtemp(prefix, options);
-      });
+      vi.spyOn(fs, "mkdtempSync").mockImplementation(refusePath(mkdtemp, managedPath, failure));
     }
     let artifact: ReturnType<typeof capturePluginGenerationArtifact> | undefined;
     try {
@@ -441,16 +457,12 @@ it.each([
         capturePluginGenerationArtifact(source),
       );
       const directory = artifact.boundaryRoot;
-      expect(fs.readFileSync(artifact.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
-        capturedSource,
-      );
+      expectBytes(artifact.resolve(path.join(source, "index.cjs")), sourceBytes);
       expect(directory.startsWith(stateDir + path.sep)).toBe(false);
       expect(fs.readdirSync(managed)).toEqual([]);
-      expect(fs.existsSync(path.join(path.dirname(path.dirname(directory)), "owner.sqlite"))).toBe(
-        true,
-      );
+      expectExists(path.join(path.dirname(path.dirname(directory)), "owner.sqlite"), true);
       await artifact.disposeAsync();
-      expect(fs.existsSync(directory)).toBe(false);
+      expectExists(directory);
     } finally {
       vi.restoreAllMocks();
       try {
@@ -466,7 +478,6 @@ it.each([
 );
 
 it("reclaims aged tokenless roots and retries locked roots", async () => {
-  const stateDir = temp.make("capture-recovery-legacy-");
   const stateTemp = path.join(stateDir, "tmp");
   fs.mkdirSync(stateTemp);
   const create = (parent: string, name: string) => {
@@ -485,8 +496,7 @@ it("reclaims aged tokenless roots and retries locked roots", async () => {
   const unrelated = create(tmpdir(), "unrelated");
   const link = path.join(tmpdir(), "openclaw-plugin-build-link");
   fs.symlinkSync(unrelated, link, "junction");
-  vi.useFakeTimers({ toFake: ["Date"] });
-  vi.setSystemTime(Date.now() + 2 * hour);
+  advanceAge();
   const fresh = create(tmpdir(), "openclaw-plugin-build-fresh");
   // Filesystem timestamps use the real clock even when Date is faked.
   fs.utimesSync(fresh, new Date(), new Date());
@@ -499,9 +509,9 @@ it("reclaims aged tokenless roots and retries locked roots", async () => {
   });
   await sweepPluginSourceCapturesForTest(stateDir);
   expect(old.filter((directory) => fs.existsSync(directory))).toHaveLength(0);
-  expect(fs.existsSync(catalog)).toBe(false);
+  expectExists(catalog);
   for (const kept of [fresh, busy, tokened, unrelated, link]) {
-    expect(fs.existsSync(kept)).toBe(true);
+    expectExists(kept, true);
   }
   expect(fs.readdirSync(stateTemp)).toEqual([]);
   const retainedNames = () =>
@@ -514,18 +524,16 @@ it("reclaims aged tokenless roots and retries locked roots", async () => {
   );
   probe.mockRestore();
   await sweepPluginSourceCapturesForTest(stateDir);
-  expect(fs.existsSync(busy)).toBe(false);
+  expectExists(busy);
   expect(retainedNames()).toEqual(
     [fresh, tokened, link].map((file) => path.basename(file)).toSorted(),
   );
 });
 
 it("retries partial tokenless removal without exhausting directory name limits", async () => {
-  const stateDir = temp.make("capture-recovery-retry-");
   const managed = path.join(stateDir, "tmp", "plugin-captures");
   const directory = path.join(managed, "interrupted-instance");
-  fs.mkdirSync(directory, { recursive: true });
-  fs.writeFileSync(path.join(directory, "source.js"), "retained payload");
+  write(directory, "source.js", "retained payload");
   vi.useFakeTimers({ toFake: ["Date"] });
   const fault = vi.spyOn(fsPromises, "rm").mockRejectedValue(locked);
   for (let cycle = 0; cycle < 8; cycle++) {
@@ -541,7 +549,6 @@ it("retries partial tokenless removal without exhausting directory name limits",
 it.each(["managed", "fallback"] as const)(
   "reclaims only unreferenced native roots under maintenance while preserving live custody (%s)",
   async (location) => {
-    const stateDir = temp.make("native-capture-maintenance-");
     const otherStateDir = temp.make("native-capture-other-state-");
     const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
     if (location === "fallback") {
@@ -551,21 +558,16 @@ it.each(["managed", "fallback"] as const)(
           path.join(directory, "tmp", "plugin-captures"),
         ),
       );
-      vi.spyOn(fs, "mkdirSync").mockImplementation((target, options) => {
-        if (blocked.has(String(target))) {
-          throw locked;
-        }
-        return mkdir(target, options);
-      });
+      vi.spyOn(fs, "mkdirSync").mockImplementation(
+        refusePath(mkdir, (target) => blocked.has(String(target))),
+      );
     }
     const note = vi.spyOn(notes, "note").mockImplementation(() => {});
     const inspectProcesses = vi.spyOn(census, "inspectOtherOpenClawProcesses");
-    vi.spyOn(temporaryDirectories, "inspectDoctorTemporaryDirectories").mockImplementation(
-      async () => ({
-        directories: [],
-        warnings: [],
-      }),
-    );
+    vi.spyOn(temporaryDirectories, "inspectDoctorTemporaryDirectories").mockResolvedValue({
+      directories: [],
+      warnings: [],
+    });
     const realpath = fsPromises.realpath.bind(fsPromises);
     vi.spyOn(fsPromises, "realpath").mockImplementation(async (target) =>
       realpath(String(target) === "/tmp" ? tmpdir() : target),
@@ -575,30 +577,23 @@ it.each(["managed", "fallback"] as const)(
       await noteLegacyPluginSourceCaptures(env, true);
       return note.mock.calls.map(([message]) => String(message)).join("\n");
     };
-    const referenced = createPluginNativeCaptureRoot(stateDir);
-    const captured = write(referenced.directory, "content/bin/native", "published native bytes");
-    referenced.commit();
-    referenced.dispose();
-    const orphan = createPluginNativeCaptureRoot(stateDir);
-    write(orphan.directory, "package/bin/native", "superseded native bytes");
-    orphan.commit();
-    orphan.dispose();
-    const warm = createPluginNativeCaptureRoot(stateDir);
-    const warmFile = write(warm.directory, "package/bin/native", "warm generation bytes");
-    warm.commit();
-    warm.dispose();
+    const { root: referenced, file: captured } = nativeFixture(
+      stateDir,
+      "published native bytes",
+      "content/bin/native",
+    );
+    const { root: orphan } = nativeFixture(stateDir, "superseded native bytes");
+    const { root: warm, file: warmFile } = nativeFixture(stateDir, "warm generation bytes");
     const releaseWarm = retainPluginNativeCapturePath(warmFile);
-    const tokenless = createPluginNativeCaptureRoot(stateDir);
-    const tokenlessFile = write(tokenless.directory, "package/bin/native", "unknown custody");
-    tokenless.commit();
-    tokenless.dispose();
+    const { root: tokenless, file: tokenlessFile } = nativeFixture(stateDir, "unknown custody");
     fs.rmSync(path.join(path.dirname(path.dirname(tokenless.directory)), "owner.sqlite"));
-    const live = createPluginNativeCaptureRoot(stateDir);
-    const liveFile = write(live.directory, "package/bin/native", "currently in use");
-    const other = createPluginNativeCaptureRoot(otherStateDir);
-    const otherFile = write(other.directory, "package/bin/native", "another state's payload");
-    other.commit();
-    other.dispose();
+    const { root: live, file: liveFile } = nativeFixture(
+      stateDir,
+      "currently in use",
+      "package/bin/native",
+      false,
+    );
+    const { file: otherFile } = nativeFixture(otherStateDir, "another state's payload");
     const unknown = path.join(tmpdir(), "openclaw-plugin-captures-legacy");
     fs.mkdirSync(unknown);
     const legacyToken = stagingToken.acquireSqliteStagingToken(unknown, "create");
@@ -608,71 +603,38 @@ it.each(["managed", "fallback"] as const)(
     } finally {
       legacyToken(true);
     }
-    await writePersistedInstalledPluginIndex(
-      {
-        version: 1,
-        hostContractVersion: "fixture",
-        compatRegistryVersion: "fixture",
-        migrationVersion: 1,
-        policyHash: "fixture",
-        generatedAtMs: Date.now(),
-        installRecords: {},
-        plugins: [
-          {
-            pluginId: "fixture",
-            manifestPath: "/fixture/openclaw.plugin.json",
-            manifestHash: "fixture",
-            rootDir: "/fixture",
-            origin: "global",
-            enabled: true,
-            startup: { sidecar: false, memory: false, agentHarnesses: [] },
-            compat: [],
-            sourceAdmissions: {
-              fixture: {
-                signature: "fixture",
-                sourceDigest: "a".repeat(64),
-                nativeArtifacts: {
-                  "bin/native": {
-                    sourceIdentity: "fixture",
-                    contentHash: "b".repeat(64),
-                    sizeBytes: 22,
-                    capturedPath: captured,
-                    namespace: referenced.directory,
-                    capturedIdentity: "fixture",
-                  },
-                },
-                nativeNamespaces: {
-                  [referenced.directory]: {
-                    sourceDirectory: "/fixture",
-                    capturedRoot: referenced.directory,
-                    managed: false,
-                    members: {
-                      "bin/native": {
-                        source: "/fixture/bin/native",
-                        sourceIdentity: "fixture",
-                        capturedIdentity: "fixture",
-                        boundaryChecked: false,
-                        contentHash: "b".repeat(64),
-                        sizeBytes: 22,
-                      },
-                    },
-                  },
-                },
-              },
-            },
+    const index = makePluginMetadataIndex("fixture");
+    index.plugins[0]!.sourceAdmissions = {
+      fixture: {
+        signature: "fixture",
+        sourceDigest: "a".repeat(64),
+        nativeArtifacts: {
+          "bin/native": {
+            sourceIdentity: "fixture",
+            contentHash: "b".repeat(64),
+            sizeBytes: 22,
+            capturedPath: captured,
+            namespace: referenced.directory,
+            capturedIdentity: "fixture",
           },
-        ],
-        diagnostics: [],
+        },
+        nativeNamespaces: {
+          [referenced.directory]: {
+            sourceDirectory: "/fixture",
+            capturedRoot: referenced.directory,
+            managed: false,
+            members: {},
+          },
+        },
       },
-      { stateDir },
-    );
-    vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(Date.now() + 2 * 60 * 60 * 1_000);
+    };
+    await writePersistedInstalledPluginIndex(index, { stateDir });
+    advanceAge();
     try {
       inspectProcesses.mockReturnValue({ error: "fixture unreadable host argv" });
-      const output = await duringMaintenance(stateDir, runCaptureReport);
+      const output = await duringMaintenance(runCaptureReport);
       expect(output).toContain("Removed 1 unreferenced native plugin capture root(s).");
-      expect(fs.existsSync(orphan.directory)).toBe(false);
+      expectExists(orphan.directory);
       expectBytes(captured, "published native bytes");
       expectBytes(warmFile, "warm generation bytes");
       expectBytes(liveFile, "currently in use");
@@ -681,8 +643,8 @@ it.each(["managed", "fallback"] as const)(
       expectBytes(tokenlessFile, "unknown custody");
       expect(inspectProcesses).not.toHaveBeenCalled();
       releaseWarm();
-      await duringMaintenance(stateDir, runCaptureReport);
-      expect(fs.existsSync(warm.directory)).toBe(false);
+      await duringMaintenance(runCaptureReport);
+      expectExists(warm.directory);
       expectBytes(otherFile, "another state's payload");
       expectBytes(legacyFile, "unqualified legacy payload");
       expectBytes(tokenlessFile, "unknown custody");
@@ -694,11 +656,8 @@ it.each(["managed", "fallback"] as const)(
 );
 
 it("preserves artifact setup failure and borrowed custody when partial removal fails", async () => {
-  const stateDir = temp.make("capture-artifact-cleanup-");
   const source = temp.make("capture-artifact-source-");
-  const owner = retainPluginSourceCaptureInstance(stateDir);
-  const first = owner.createDirectory();
-  const root = path.dirname(path.dirname(first));
+  const { instance: owner, directory: first, root } = captureFixture();
   await sweepPluginSourceCapturesForTest(stateDir);
   const primary = new Error("Fixture artifact permissions refused");
   const cleanup = new Error("Fixture partial capture removal refused");
@@ -718,12 +677,9 @@ it("preserves artifact setup failure and borrowed custody when partial removal f
     return chmod(target, mode);
   });
   const remove = fs.rmSync.bind(fs);
-  vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-    if (target === created) {
-      throw cleanup;
-    }
-    return remove(target, options);
-  });
+  vi.spyOn(fs, "rmSync").mockImplementation(
+    refusePath(remove, (target) => target === created, cleanup),
+  );
   try {
     let failure: unknown;
     try {
@@ -750,5 +706,5 @@ it("preserves artifact setup failure and borrowed custody when partial removal f
       await owner.releaseAsync();
     }
   }
-  expect(fs.existsSync(root)).toBe(false);
+  expectExists(root);
 });
