@@ -1,6 +1,7 @@
 // Covers plugin CLI command behavior and output paths.
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ChannelPlugin } from "../channels/plugins/types.public.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import { listRegisteredPluginAgentPromptGuidance } from "./command-registry-state.js";
 import {
@@ -83,20 +84,20 @@ function executeCommand({
   });
 }
 
+function channelRegistration(id: string, label: string, options: Partial<ChannelPlugin> = {}) {
+  return {
+    pluginId: id,
+    source: "test",
+    plugin: { ...createChannelTestPluginBase({ id, label }), ...options },
+  };
+}
+
 function createCommandRegistry() {
   return createPluginRegistry({
     logger: { info() {}, warn() {}, error() {}, debug() {} },
     runtime: {} as PluginRuntime,
     activateGlobalSideEffects: true,
   });
-}
-
-function registerHostTrustedReservedCommandForTest(
-  command: Parameters<typeof registerPluginCommand>[1],
-) {
-  const pluginRegistry = createCommandRegistry();
-  pluginRegistry.registerCommand(createBundledPluginRecord(command.name), command);
-  setActivePluginRegistry(pluginRegistry.registry);
 }
 
 function registerVoiceCommandForTest(
@@ -123,28 +124,14 @@ function requirePluginCommandMatch(commandBody: string) {
   return match;
 }
 
-function expectProviderCommandSpecs(
-  provider: Parameters<typeof getPluginCommandSpecs>[0],
-  expectedNames: readonly string[],
-) {
-  expect(getPluginCommandSpecs(provider)).toEqual(
-    expectedNames.map((name) => ({
-      name,
-      description: "Demo command",
-      acceptsArgs: false,
-    })),
-  );
-}
-
 function expectProviderCommandSpecCases(
-  cases: ReadonlyArray<{
-    provider: Parameters<typeof getPluginCommandSpecs>[0];
-    expectedNames: readonly string[];
-  }>,
+  cases: ReadonlyArray<readonly [Parameters<typeof getPluginCommandSpecs>[0], readonly string[]]>,
 ) {
-  cases.forEach(({ provider, expectedNames }) => {
-    expectProviderCommandSpecs(provider, expectedNames);
-  });
+  for (const [provider, names] of cases) {
+    expect(getPluginCommandSpecs(provider)).toEqual(
+      names.map((name) => ({ name, description: "Demo command", acceptsArgs: false })),
+    );
+  }
 }
 
 function expectUnsupportedBindingApiResult(result: { text?: string }) {
@@ -200,54 +187,18 @@ beforeEach(() => {
   });
   setActivePluginRegistry(
     createTestRegistry([
-      {
-        pluginId: "telegram",
-        source: "test",
-        plugin: {
-          ...createChannelTestPluginBase({ id: "telegram", label: "Telegram" }),
-          commands: {
-            nativeCommandsAutoEnabled: true,
-          },
-          bindings: {
-            selfParentConversationByDefault: true,
-            resolveCommandConversation: () => null,
-          },
-        },
-      },
-      {
-        pluginId: "discord",
-        source: "test",
-        plugin: {
-          ...createChannelTestPluginBase({ id: "discord", label: "Discord" }),
-          commands: {
-            nativeCommandsAutoEnabled: true,
-          },
-          bindings: {
-            resolveCommandConversation: () => null,
-          },
-        },
-      },
-      {
-        pluginId: "signal",
-        source: "test",
-        plugin: {
-          ...createChannelTestPluginBase({ id: "signal", label: "Signal" }),
-          commands: {
-            nativeCommandsAutoEnabled: true,
-          },
-        },
-      },
-      {
-        pluginId: "slack",
-        source: "test",
-        plugin: {
-          ...createChannelTestPluginBase({
-            id: "slack",
-            label: "Slack",
-            capabilities: { nativeCommands: true, chatTypes: ["direct", "group"] },
-          }),
-        },
-      },
+      channelRegistration("telegram", "Telegram", {
+        commands: { nativeCommandsAutoEnabled: true },
+        bindings: { selfParentConversationByDefault: true, resolveCommandConversation: () => null },
+      }),
+      channelRegistration("discord", "Discord", {
+        commands: { nativeCommandsAutoEnabled: true },
+        bindings: { resolveCommandConversation: () => null },
+      }),
+      channelRegistration("signal", "Signal", { commands: { nativeCommandsAutoEnabled: true } }),
+      channelRegistration("slack", "Slack", {
+        capabilities: { nativeCommands: true, chatTypes: ["direct", "group"] },
+      }),
     ]),
   );
 });
@@ -370,27 +321,13 @@ describe("registerPluginCommand", () => {
       handler: okHandler(),
     });
     expect(result).toEqual({ ok: true });
-    expect(listPluginCommands()).toEqual([
-      {
-        name: "demo_cmd",
-        description: "Demo command",
-        pluginId: "demo-plugin",
-        acceptsArgs: false,
-      },
-    ]);
-    expect(getPluginCommandSpecs()).toEqual([
-      {
-        name: "demo_cmd",
-        description: "Demo command",
-        acceptsArgs: false,
-      },
-    ]);
+    const spec = { name: "demo_cmd", description: "Demo command", acceptsArgs: false };
+    expect(listPluginCommands()).toEqual([{ ...spec, pluginId: "demo-plugin" }]);
+    expect(getPluginCommandSpecs()).toEqual([spec]);
     expect(getPluginCommandEntrySpecs()).toEqual([
       {
-        name: "demo_cmd",
+        ...spec,
         nativeName: "demo_cmd",
-        description: "Demo command",
-        acceptsArgs: false,
         clientPresentation: {
           when: "no-arguments",
           action: { kind: "device-pairing" },
@@ -572,10 +509,10 @@ describe("registerPluginCommand", () => {
 
     expect(result).toEqual({ ok: true });
     expectProviderCommandSpecCases([
-      { provider: undefined, expectedNames: ["talkvoice"] },
-      { provider: "discord", expectedNames: ["discordvoice"] },
-      { provider: "telegram", expectedNames: ["talkvoice"] },
-      { provider: "slack", expectedNames: [] },
+      [undefined, ["talkvoice"]],
+      ["discord", ["discordvoice"]],
+      ["telegram", ["talkvoice"]],
+      ["slack", []],
     ]);
   });
 
@@ -587,14 +524,13 @@ describe("registerPluginCommand", () => {
 
     expect(result).toEqual({ ok: true });
     const telegramMatch = matchPluginCommand("/voice", { channel: "telegram" });
-    expect(telegramMatch?.command.name).toBe("voice");
-    expect(telegramMatch?.command.channels).toEqual(["telegram"]);
+    expect(telegramMatch?.command).toMatchObject({ name: "voice", channels: ["telegram"] });
     expect(matchPluginCommand("/voice", { channel: "discord" })).toBeNull();
     expect(matchPluginCommand("/voice")?.command.name).toBe("voice");
     expectProviderCommandSpecCases([
-      { provider: undefined, expectedNames: ["voice"] },
-      { provider: "telegram", expectedNames: ["voice"] },
-      { provider: "discord", expectedNames: [] },
+      [undefined, ["voice"]],
+      ["telegram", ["voice"]],
+      ["discord", []],
     ]);
     expect(listProviderPluginCommandSpecs("discord")).toStrictEqual([]);
   });
@@ -716,81 +652,53 @@ describe("registerPluginCommand", () => {
     expect(observedArgs).toBe("a".repeat(4094));
   });
 
-  it("ignores owner status opt-in from direct plugin command registration", async () => {
+  it.each([
+    ["direct", undefined],
+    ["workspace", undefined],
+    ["bundled", true],
+    ["reserved", true],
+  ] as const)("exposes owner status only to trusted %s commands", async (origin, expected) => {
     const handler = okHandler();
-    registerPluginCommand("demo-plugin", {
-      name: "voice",
-      description: "Voice command",
-      exposeSenderIsOwner: true,
+    const name = origin === "reserved" ? "codex" : "voice";
+    const command = createVoiceCommand({
+      name,
       handler,
+      ...(origin === "reserved" ? { ownership: "reserved" } : { exposeSenderIsOwner: true }),
     });
-    const match = requirePluginCommandMatch("/voice");
-
+    if (origin === "direct") {
+      registerPluginCommand("demo-plugin", command);
+    } else {
+      const registry = createCommandRegistry();
+      const record = createBundledPluginRecord(
+        origin === "reserved"
+          ? "codex"
+          : origin === "workspace"
+            ? "external-plugin"
+            : "device-pair",
+      );
+      registry.registerCommand(
+        origin === "workspace"
+          ? {
+              ...record,
+              origin: "workspace",
+              source: "/workspace/external-plugin/index.ts",
+              rootDir: "/workspace/external-plugin",
+            }
+          : record,
+        command,
+      );
+      setActivePluginRegistry(registry.registry);
+    }
     await executeCommand({
-      command: match.command,
+      command: requirePluginCommandMatch(`/${name}`).command,
       senderIsOwner: true,
-      commandBody: "/voice",
     });
-
-    expect(handler.mock.calls[0]?.[0].senderIsOwner).toBeUndefined();
-  });
-
-  it("ignores owner status opt-in from external plugin registry commands", async () => {
-    const pluginRegistry = createCommandRegistry();
-    const handler = okHandler();
-    pluginRegistry.registerCommand(
-      {
-        ...createBundledPluginRecord("external-plugin"),
-        origin: "workspace",
-        source: "/workspace/external-plugin/index.ts",
-        rootDir: "/workspace/external-plugin",
-      },
-      {
-        name: "external",
-        description: "External command",
-        exposeSenderIsOwner: true,
-        handler,
-      },
-    );
-    setActivePluginRegistry(pluginRegistry.registry);
-    const match = requirePluginCommandMatch("/external");
-
-    await executeCommand({
-      command: match.command,
-      senderIsOwner: true,
-      commandBody: "/external",
-    });
-
-    expect(handler.mock.calls[0]?.[0].senderIsOwner).toBeUndefined();
-  });
-
-  it("exposes owner status to trusted bundled plugin commands that opt in", async () => {
-    const pluginRegistry = createCommandRegistry();
-    const handler = okHandler();
-    pluginRegistry.registerCommand(createBundledPluginRecord("device-pair"), {
-      name: "pair_test",
-      description: "Pair test command",
-      exposeSenderIsOwner: true,
-      handler,
-    });
-    setActivePluginRegistry(pluginRegistry.registry);
-    const match = requirePluginCommandMatch("/pair_test");
-
-    await executeCommand({
-      command: match.command,
-      senderIsOwner: true,
-      commandBody: "/pair_test",
-    });
-
-    expect(handler.mock.calls[0]?.[0].senderIsOwner).toBe(true);
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handler.mock.calls[0]?.[0].senderIsOwner).toBe(expected);
   });
 
   it("skips direct plugin command execution on unsupported channels", async () => {
-    let handlerCalled = false;
-    const handler = async () => {
-      handlerCalled = true;
-      return { text: "ok" };
-    };
+    const handler = okHandler();
 
     const result = await executeCommand({
       command: {
@@ -804,7 +712,7 @@ describe("registerPluginCommand", () => {
     });
 
     expect(result).toEqual({ continueAgent: true });
-    expect(handlerCalled).toBe(false);
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("does not allow direct reserved command registrations to claim owner status", () => {
@@ -826,25 +734,6 @@ describe("registerPluginCommand", () => {
     expect(matchPluginCommand("/codex")).toBeNull();
   });
 
-  it("exposes owner status only to host-trusted reserved command owners", async () => {
-    const handler = okHandler();
-    registerHostTrustedReservedCommandForTest({
-      name: "codex",
-      description: "Codex command",
-      ownership: "reserved",
-      handler,
-    });
-    const match = requirePluginCommandMatch("/codex");
-
-    await executeCommand({
-      command: match.command,
-      senderIsOwner: true,
-      commandBody: "/codex",
-    });
-
-    expect(handler.mock.calls[0]?.[0].senderIsOwner).toBe(true);
-  });
-
   it("rejects mismatched reserved command owners", () => {
     const pluginRegistry = createCommandRegistry();
     pluginRegistry.registerCommand(createBundledPluginRecord("bundled-plugin"), {
@@ -857,10 +746,11 @@ describe("registerPluginCommand", () => {
     const diagnostic = pluginRegistry.registry.diagnostics.find(
       (entry) => entry.pluginId === "bundled-plugin",
     );
-    expect(diagnostic?.level).toBe("error");
-    expect(diagnostic?.message).toBe(
-      'command registration failed: Reserved command ownership requires plugin id "bundled-plugin" to match reserved command name "codex"',
-    );
+    expect(diagnostic).toMatchObject({
+      level: "error",
+      message:
+        'command registration failed: Reserved command ownership requires plugin id "bundled-plugin" to match reserved command name "codex"',
+    });
   });
 
   it("shares plugin commands across duplicate module instances", async () => {
@@ -888,8 +778,7 @@ describe("registerPluginCommand", () => {
       },
     ]);
     const secondMatch = second.matchPluginCommand("/voice");
-    expect(secondMatch?.command.name).toBe("voice");
-    expect(secondMatch?.command.pluginId).toBe("demo-plugin");
+    expect(secondMatch?.command).toMatchObject({ name: "voice", pluginId: "demo-plugin" });
 
     second.clearPluginCommands();
   });
@@ -921,34 +810,21 @@ describe("registerPluginCommand", () => {
     },
   );
 
-  it.each([
-    {
-      name: "rejects provider aliases that collide with another registered command",
-      setup: () =>
-        registerPluginCommand(
-          "demo-plugin",
-          createVoiceCommand({
-            nativeNames: {
-              telegram: "pair_device",
-            },
-          }),
-        ),
-      candidate: {
-        name: "pair",
-        nativeNames: {
-          telegram: "pair_device",
-        },
-        description: "Pair command",
-        handler: okHandler(),
-      },
-      expected: {
-        ok: false,
-        error: 'Command "pair_device" already registered by plugin "demo-plugin"',
-      },
-    },
-  ] as const)("$name", ({ setup, candidate, expected }) => {
-    setup?.();
-    expect(registerPluginCommand("other-plugin", candidate)).toEqual(expected);
+  it("rejects provider aliases that collide with another registered command", () => {
+    registerVoiceCommandForTest({ nativeNames: { telegram: "pair_device" } });
+    expect(
+      registerPluginCommand(
+        "other-plugin",
+        createVoiceCommand({
+          name: "pair",
+          nativeNames: { telegram: "pair_device" },
+          description: "Pair command",
+        }),
+      ),
+    ).toEqual({
+      ok: false,
+      error: 'Command "pair_device" already registered by plugin "demo-plugin"',
+    });
   });
 
   it("does not expose binding APIs to plugin commands on unsupported channels", async () => {
@@ -993,14 +869,7 @@ describe("registerPluginCommand", () => {
     const resolveCommandConversation = vi.fn(() => null);
     setActivePluginRegistry(
       createTestRegistry([
-        {
-          pluginId: "slack",
-          source: "test",
-          plugin: {
-            ...createChannelTestPluginBase({ id: "slack", label: "Slack" }),
-            bindings: { resolveCommandConversation },
-          },
-        },
+        channelRegistration("slack", "Slack", { bindings: { resolveCommandConversation } }),
       ]),
     );
     const handler = vi.fn(async () => ({ text: "ok" }));
@@ -1047,8 +916,10 @@ describe("registerPluginCommand", () => {
     });
 
     expect(result).toEqual({ text: "ok" });
-    expect(receivedCtx?.sessionKey).toBe("agent:main:whatsapp:direct:123");
-    expect(receivedCtx?.sessionId).toBe("session-123");
+    expect(receivedCtx).toMatchObject({
+      sessionKey: "agent:main:whatsapp:direct:123",
+      sessionId: "session-123",
+    });
   });
 
   it("binds legacy main session plugin llm runtime to the default agent", async () => {

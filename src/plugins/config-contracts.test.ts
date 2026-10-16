@@ -88,15 +88,11 @@ function expectContracts(
 
 describe("resolvePluginConfigContractsById", () => {
   beforeEach(() => {
-    mocks.discoverOpenClawPlugins.mockReset();
-    mocks.discoverOpenClawPlugins.mockReturnValue({ candidates: [], diagnostics: [] });
+    mocks.discoverOpenClawPlugins.mockReset().mockReturnValue({ candidates: [], diagnostics: [] });
     mocks.findBundledPluginMetadataById.mockReset();
-    mocks.loadBundledManifestRegistry.mockReset();
-    mocks.loadBundledManifestRegistry.mockReturnValue(createRegistry());
-    mocks.loadPluginManifestRegistryForInstalledIndex.mockReset();
-    mocks.loadPluginManifestRegistryForInstalledIndex.mockReturnValue(createRegistry());
-    mocks.loadPluginRegistrySnapshot.mockReset();
-    mocks.loadPluginRegistrySnapshot.mockReturnValue({ plugins: [] });
+    mocks.loadBundledManifestRegistry.mockReset().mockReturnValue(createRegistry());
+    mocks.loadPluginManifestRegistryForInstalledIndex.mockReset().mockReturnValue(createRegistry());
+    mocks.loadPluginRegistrySnapshot.mockReset().mockReturnValue({ plugins: [] });
   });
 
   it("uses a supplied manifest registry as the authoritative contract source", () => {

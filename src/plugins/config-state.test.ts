@@ -40,24 +40,12 @@ function expectResolvedEnableState(
   }
 }
 
-function expectNormalizedEnableState(params: {
-  id: string;
-  origin: "bundled" | "workspace";
-  config: Record<string, unknown>;
-  manifestEnabledByDefault?: boolean;
-  expected: ReturnType<typeof resolveEnableState>;
-  provenance?: ActivationProvenance;
-}) {
-  expectResolvedEnableState(
-    [
-      params.id,
-      params.origin,
-      normalizePluginsConfig(params.config),
-      params.manifestEnabledByDefault,
-    ],
-    params.expected,
-    params.provenance,
-  );
+function expectNormalizedEnableState(
+  [id, origin, config]: [string, "bundled" | "workspace", Record<string, unknown>],
+  expected: ReturnType<typeof resolveEnableState>,
+  provenance?: ActivationProvenance,
+) {
+  expectResolvedEnableState([id, origin, normalizePluginsConfig(config)], expected, provenance);
 }
 
 function activation(
@@ -68,6 +56,13 @@ function activation(
 ) {
   return { enabled, activated: enabled, explicitlyEnabled, source, reason };
 }
+
+const hookPolicy = {
+  allowPromptInjection: false,
+  allowConversationAccess: true,
+  timeoutMs: 250,
+  timeouts: { before_prompt_build: 90_000, agent_end: 60_000 },
+};
 
 describe("normalizePluginsConfig", () => {
   afterEach(() => clearRuntimeConfigSnapshot());
@@ -129,25 +124,9 @@ describe("normalizePluginsConfig", () => {
     {
       name: "normalizes plugin hook policy flags",
       entry: {
-        hooks: {
-          allowPromptInjection: false,
-          allowConversationAccess: true,
-          timeoutMs: 250,
-          timeouts: {
-            before_prompt_build: 90_000,
-            agent_end: 60_000,
-          },
-        },
+        hooks: hookPolicy,
       },
-      expectedHooks: {
-        allowPromptInjection: false,
-        allowConversationAccess: true,
-        timeoutMs: 250,
-        timeouts: {
-          before_prompt_build: 90_000,
-          agent_end: 60_000,
-        },
-      },
+      expectedHooks: hookPolicy,
     },
     {
       name: "drops invalid plugin hook policy values",
@@ -229,25 +208,15 @@ describe("normalizePluginsConfig", () => {
   });
 });
 
-describe("resolveEffectiveEnableState", () => {
-  function resolveConfigOriginTelegramState(config: Parameters<typeof normalizePluginsConfig>[0]) {
-    const normalized = normalizePluginsConfig(config);
-    return resolveEffectiveEnableState({
+it("does not bypass allowlists for non-bundled plugins that reuse a channel id", () => {
+  expect(
+    resolveEffectiveEnableState({
       id: "telegram",
       origin: "config",
-      config: normalized,
+      config: normalizePluginsConfig({ enabled: true, allow: ["browser"] }),
       rootConfig: { channels: { telegram: { enabled: true } } },
-    });
-  }
-
-  it("does not bypass allowlists for non-bundled plugins that reuse a channel id", () => {
-    expect(
-      resolveConfigOriginTelegramState({
-        enabled: true,
-        allow: ["browser"] as string[],
-      }),
-    ).toEqual({ enabled: false, reason: "not in allowlist" });
-  });
+    }),
+  ).toEqual({ enabled: false, reason: "not in allowlist" });
 });
 
 describe("resolveEffectivePluginActivationState", () => {
@@ -422,42 +391,24 @@ describe("resolveEnableState", () => {
     },
   );
 
-  it.each([
-    {
-      name: "keeps the selected memory slot plugin enabled even when omitted from plugins.allow",
-      config: {
-        allow: ["telegram"],
-        slots: { memory: "memory-core" },
-      },
-      expected: { enabled: true },
-      provenance: {
+  it.each([true, false])("resolves selected memory slot with enabled=%s", (enabled) => {
+    expectNormalizedEnableState(
+      [
+        "memory-core",
+        "bundled",
+        {
+          allow: ["telegram"],
+          slots: { memory: "memory-core" },
+          ...(enabled ? {} : { entries: { "memory-core": { enabled: false } } }),
+        },
+      ],
+      enabled ? { enabled: true } : { enabled: false, reason: "disabled in config" },
+      {
         explicitlyEnabled: true,
-        source: "explicit",
-        reason: "selected memory slot",
+        source: enabled ? "explicit" : "disabled",
+        reason: enabled ? "selected memory slot" : "disabled in config",
       },
-    },
-    {
-      name: "keeps explicit disable authoritative for the selected memory slot plugin",
-      config: {
-        allow: ["telegram"],
-        slots: { memory: "memory-core" },
-        entries: { "memory-core": { enabled: false } },
-      },
-      expected: { enabled: false, reason: "disabled in config" },
-      provenance: {
-        explicitlyEnabled: true,
-        source: "disabled",
-        reason: "disabled in config",
-      },
-    },
-  ] as const)("$name", ({ config, expected, provenance }) => {
-    expectNormalizedEnableState({
-      id: "memory-core",
-      origin: "bundled",
-      config,
-      expected,
-      provenance,
-    });
+    );
   });
 
   it.each([
@@ -478,65 +429,43 @@ describe("resolveEnableState", () => {
   });
 
   it("does not let the default memory slot auto-enable an untrusted workspace plugin", () => {
-    expectNormalizedEnableState({
-      id: "memory-core",
-      origin: "workspace",
-      config: {
-        slots: { memory: "memory-core" },
-      },
-      expected: {
-        enabled: false,
-        reason: "workspace plugin (disabled by default)",
-      },
-      provenance: {
-        explicitlyEnabled: true,
-        source: "disabled",
-        reason: "workspace plugin (disabled by default)",
-      },
-    });
+    const reason = "workspace plugin (disabled by default)";
+    expectNormalizedEnableState(
+      ["memory-core", "workspace", { slots: { memory: "memory-core" } }],
+      { enabled: false, reason },
+      { explicitlyEnabled: true, source: "disabled", reason },
+    );
   });
 
   it("keeps an explicitly selected workspace context engine enabled when omitted from plugins.allow", () => {
-    expectNormalizedEnableState({
-      id: "lossless-claw",
-      origin: "workspace",
-      config: {
-        allow: ["telegram"],
-        slots: { contextEngine: "lossless-claw" },
-      },
-      expected: {
-        enabled: true,
-      },
-    });
+    expectNormalizedEnableState(
+      [
+        "lossless-claw",
+        "workspace",
+        {
+          allow: ["telegram"],
+          slots: { contextEngine: "lossless-claw" },
+        },
+      ],
+      { enabled: true },
+    );
   });
 });
 
 describe("resolveMemorySlotDecision", () => {
-  const decide = (kind: "memory" | ("memory" | "context-engine")[], slot: string | null) =>
-    resolveMemorySlotDecision({ id: "memory-plugin", kind, slot, selectedId: null });
-
-  it("disables a memory-only plugin when slot points elsewhere", () => {
-    expect(decide("memory", "new-memory").enabled).toBe(false);
-  });
-
-  it("keeps a dual-kind plugin enabled when memory slot points elsewhere", () => {
-    const result = decide(["memory", "context-engine"], "new-memory");
-    expect(result.enabled).toBe(true);
-    expect(result.selected).toBeUndefined();
-  });
-
-  it("selects a dual-kind plugin when it owns the memory slot", () => {
-    expect(decide(["memory", "context-engine"], "memory-plugin")).toMatchObject({
-      enabled: true,
-      selected: true,
+  it.each([
+    ["memory", "new-memory", { enabled: false }],
+    [["memory", "context-engine"], "new-memory", { enabled: true, selected: undefined }],
+    [["memory", "context-engine"], "memory-plugin", { enabled: true, selected: true }],
+    [["memory", "context-engine"], null, { enabled: true }],
+    ["memory", null, { enabled: false }],
+  ] as const)("resolves kind=%j slot=%s", (kind, slot, expected) => {
+    const result = resolveMemorySlotDecision({
+      id: "memory-plugin",
+      kind: typeof kind === "string" ? kind : [...kind],
+      slot,
+      selectedId: null,
     });
-  });
-
-  it("keeps a dual-kind plugin enabled when memory slot is null", () => {
-    expect(decide(["memory", "context-engine"], null).enabled).toBe(true);
-  });
-
-  it("disables a memory-only plugin when memory slot is null", () => {
-    expect(decide("memory", null).enabled).toBe(false);
+    expect({ enabled: result.enabled, selected: result.selected }).toMatchObject(expected);
   });
 });

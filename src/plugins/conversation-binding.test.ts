@@ -5,6 +5,7 @@ import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-syn
 import type {
   ConversationRef,
   SessionBindingAdapter,
+  SessionBindingBindInput,
   SessionBindingRecord,
 } from "../infra/outbound/session-binding-service.js";
 import { drainGlobalSingletonLifecycleState } from "../shared/global-singleton.js";
@@ -44,36 +45,25 @@ const sessionBindingState = vi.hoisted(() => {
   }
 
   function toKey(ref: ConversationRef): string {
-    const normalized = normalizeRef(ref);
-    return JSON.stringify(normalized);
+    return JSON.stringify(normalizeRef(ref));
   }
 
   return {
-    records,
-    bind: vi.fn(
-      async (input: {
-        targetSessionKey: string;
-        targetKind: "session" | "subagent";
-        conversation: ConversationRef;
-        metadata?: Record<string, unknown>;
-      }) => {
-        const normalized = normalizeRef(input.conversation);
-        const record: SessionBindingRecord = {
-          bindingId: `binding-${nextId++}`,
-          targetSessionKey: input.targetSessionKey,
-          targetKind: input.targetKind,
-          conversation: normalized,
-          status: "active",
-          boundAt: Date.now(),
-          metadata: input.metadata,
-        };
-        records.set(toKey(normalized), record);
-        return record;
-      },
-    ),
-    resolveByConversation: vi.fn((ref: ConversationRef) => {
-      return records.get(toKey(ref)) ?? null;
+    bind: vi.fn(async (input: SessionBindingBindInput) => {
+      const normalized = normalizeRef(input.conversation);
+      const record: SessionBindingRecord = {
+        bindingId: `binding-${nextId++}`,
+        targetSessionKey: input.targetSessionKey,
+        targetKind: input.targetKind,
+        conversation: normalized,
+        status: "active",
+        boundAt: Date.now(),
+        metadata: input.metadata,
+      };
+      records.set(toKey(normalized), record);
+      return record;
     }),
+    resolveByConversation: vi.fn((ref: ConversationRef) => records.get(toKey(ref)) ?? null),
     touch: vi.fn(),
     unbind: vi.fn(async (input: { bindingId?: string }) => {
       const removed: SessionBindingRecord[] = [];
@@ -140,11 +130,7 @@ function createAdapter(channel: string, accountId: string): SessionBindingAdapte
   return {
     channel,
     accountId,
-    capabilities: {
-      bindSupported: true,
-      unbindSupported: true,
-      placements: ["current", "child"],
-    },
+    capabilities: { bindSupported: true, unbindSupported: true, placements: ["current", "child"] },
     bind: sessionBindingState.bind,
     listBySession: () => [],
     resolveByConversation: sessionBindingState.resolveByConversation,
@@ -184,11 +170,8 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
-async function requestPendingBinding(
-  input: PluginBindingRequestInput,
-  requestBinding = requestPluginConversationBinding,
-) {
-  const request = await requestBinding(input);
+async function requestPendingBinding(input: PluginBindingRequestInput) {
+  const request = await requestPluginConversationBinding(input);
   expect(request.status).toBe("pending");
   if (request.status !== "pending") {
     throw new Error("expected pending bind request");
@@ -196,12 +179,13 @@ async function requestPendingBinding(
   return request;
 }
 
-async function approveBindingRequest(
-  approvalId: string,
-  decision: PluginBindingDecision,
-  resolveApproval = resolvePluginConversationBindingApproval,
-) {
-  return await resolveApproval({
+const discordRequest = (id: string, account = "isolated") =>
+  createDiscordCodexBindRequest(id, "Bind Codex.", account);
+const pendingDiscord = (id: string, account = "isolated") =>
+  requestPendingBinding(discordRequest(id, account));
+
+async function approveBindingRequest(approvalId: string, decision: PluginBindingDecision) {
+  return await resolvePluginConversationBindingApproval({
     approvalId,
     decision,
     senderId: "user-1",
@@ -313,16 +297,13 @@ describe("plugin conversation binding approvals", () => {
   });
 
   it("does not roll back a newer successful Control UI binding", async () => {
-    let rejectFirst = (_error: Error) => {};
-    const firstPublication = new Promise<void>((_resolve, reject) => {
-      rejectFirst = reject;
-    });
+    const firstPublication = createDeferred();
     const first = bindPluginSessionConversation({
       pluginId: "codex",
       pluginRoot: "/codex",
       sessionKey: "agent:main:adopted",
       binding: { data: { kind: "remote-runtime", generation: 1 } },
-      afterBind: async () => await firstPublication,
+      afterBind: async () => await firstPublication.promise,
     });
     await vi.waitFor(() => expect(sessionBindingState.bind).toHaveBeenCalledOnce());
 
@@ -334,7 +315,7 @@ describe("plugin conversation binding approvals", () => {
       sessionKey: "agent:main:adopted",
       binding: { data: { kind: "remote-runtime", generation: 2 } },
     });
-    rejectFirst(new Error("older publication failed"));
+    firstPublication.reject(new Error("older publication failed"));
     await expect(first).rejects.toThrow("older publication failed");
     await second;
 
@@ -369,9 +350,7 @@ describe("plugin conversation binding approvals", () => {
     await closeOpenClawStateDatabaseAsync();
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
-    const request = await requestPendingBinding(
-      createDiscordCodexBindRequest("channel:ttl", "Bind this conversation to Codex."),
-    );
+    const request = await pendingDiscord("channel:ttl");
 
     // The deadline check is authoritative even when the event loop has not dispatched the timer.
     vi.setSystemTime(1_000 + 30 * 60_000);
@@ -389,14 +368,7 @@ describe("plugin conversation binding approvals", () => {
     vi.useFakeTimers();
     const requests = [];
     for (let index = 0; index < 513; index += 1) {
-      requests.push(
-        await requestPendingBinding(
-          createDiscordCodexBindRequest(
-            `channel:bounded-${index}`,
-            `Bind this conversation to Codex thread ${index}.`,
-          ),
-        ),
-      );
+      requests.push(await pendingDiscord(`channel:bounded-${index}`));
     }
 
     // Pending approvals outlive database actors; count only their owned timers.
@@ -416,9 +388,7 @@ describe("plugin conversation binding approvals", () => {
   });
 
   it("keeps allow-once approval scoped to its requester and conversation", async () => {
-    const firstRequest = await requestPendingBinding(
-      createDiscordCodexBindRequest("channel:1", "Bind this conversation to Codex thread 123."),
-    );
+    const firstRequest = await pendingDiscord("channel:1");
     await expect(
       resolvePluginConversationBindingApproval({
         approvalId: firstRequest.approvalId,
@@ -430,91 +400,56 @@ describe("plugin conversation binding approvals", () => {
 
     expect(approved.status).toBe("approved");
 
-    const secondRequest = await requestPluginConversationBinding(
-      createDiscordCodexBindRequest("channel:2", "Bind this conversation to Codex thread 456."),
-    );
-
-    expect(secondRequest.status).toBe("pending");
+    await pendingDiscord("channel:2");
   });
 
   it("does not leak an in-memory auto-approval when persisting an allow-always grant fails", async () => {
-    const pendingRequest = await requestPendingBinding(
-      createDiscordCodexBindRequest("channel:persist-fail-1", "Bind Codex thread persist-fail-1."),
-    );
+    const pendingRequest = await pendingDiscord("channel:persist-fail-1");
 
     const writeSpy = vi
       .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
       .mockRejectedValueOnce(new Error("approval operation unavailable"));
 
-    // A failed persist must propagate; the grant was never durably recorded.
     await expect(approveBindingRequest(pendingRequest.approvalId, "allow-always")).rejects.toThrow(
       "approval operation unavailable",
     );
 
     writeSpy.mockRestore();
 
-    // Nothing reached disk.
     expect(readPluginBindingApprovalRows()).toEqual([]);
 
-    // No in-memory grant leaked: the next same-scope request still prompts instead of
-    // silently auto-approving from a cache entry that was never persisted.
-    const sameScope = await requestPluginConversationBinding(
-      createDiscordCodexBindRequest("channel:persist-fail-2", "Bind Codex thread persist-fail-2."),
-    );
-
-    expect(sameScope.status).toBe("pending");
+    // Failed persistence must not leave an in-memory grant.
+    await pendingDiscord("channel:persist-fail-2");
   });
 
   it("persists overlapping always-allow approvals", async () => {
-    const firstRequest = await requestPendingBinding(
-      createDiscordCodexBindRequest(
-        "channel:race-1",
-        "Bind this conversation to Codex thread race-1.",
-        "default",
-      ),
-    );
-    const secondRequest = await requestPendingBinding(
-      createDiscordCodexBindRequest(
-        "channel:race-2",
-        "Bind this conversation to Codex thread race-2.",
-        "work",
-      ),
-    );
+    const firstRequest = await pendingDiscord("channel:race-1", "default");
+    const secondRequest = await pendingDiscord("channel:race-2", "work");
 
     const [firstResult, secondResult] = await Promise.all([
       approveBindingRequest(firstRequest.approvalId, "allow-always"),
       approveBindingRequest(secondRequest.approvalId, "allow-always"),
     ]);
 
-    expect(firstResult.status).toBe("approved");
-    expect(secondResult.status).toBe("approved");
-    expect(readPluginBindingApprovalRows()).toEqual([
-      {
-        account_id: "default",
+    expect([firstResult.status, secondResult.status]).toEqual(["approved", "approved"]);
+    expect(readPluginBindingApprovalRows()).toEqual(
+      ["default", "work"].map((account_id) => ({
+        account_id,
         channel: "discord",
         plugin_id: "codex",
         plugin_root: "/plugins/codex-a",
-      },
-      {
-        account_id: "work",
-        channel: "discord",
-        plugin_id: "codex",
-        plugin_root: "/plugins/codex-a",
-      },
-    ]);
+      })),
+    );
 
-    // Both grants must stay live in the in-memory cache: publishing the cache only after
-    // the persist await must recompute from the latest cache, not clobber a concurrently
-    // approved scope with a stale pre-await snapshot. Follow-up binds auto-approve from cache.
+    // Concurrent publication must retain both cached grants.
     const firstFollowUp = await requestPluginConversationBinding(
-      createDiscordCodexBindRequest("channel:race-1b", "Rebind Codex thread race-1.", "default"),
+      discordRequest("channel:race-1b", "default"),
     );
     const secondFollowUp = await requestPluginConversationBinding(
-      createDiscordCodexBindRequest("channel:race-2b", "Rebind Codex thread race-2.", "work"),
+      discordRequest("channel:race-2b", "work"),
     );
 
-    expect(firstFollowUp.status).toBe("bound");
-    expect(secondFollowUp.status).toBe("bound");
+    expect([firstFollowUp.status, secondFollowUp.status]).toEqual(["bound", "bound"]);
   });
 
   it("expires pending approvals when their Gateway lifecycle closes", async () => {
@@ -543,7 +478,7 @@ describe("plugin conversation binding approvals", () => {
     );
     await approveBindingRequest(request.approvalId, "allow-always");
 
-    const samePluginNewPath = await requestPluginConversationBinding(
+    await requestPendingBinding(
       createTelegramCodexBindRequest(
         "-10099:topic:78",
         "78",
@@ -551,8 +486,6 @@ describe("plugin conversation binding approvals", () => {
         "/plugins/codex-b",
       ),
     );
-
-    expect(samePluginNewPath.status).toBe("pending");
   });
 
   it("does not wait for an approved bind callback before returning", async () => {
@@ -609,22 +542,12 @@ describe("plugin conversation binding approvals", () => {
       bindingId: "binding-core",
       targetSessionKey,
       targetKind: "session",
-      conversation: {
-        channel: "discord",
-        accountId: "default",
-        conversationId: "channel:1",
-      },
+      conversation: { channel: "discord", accountId: "default", conversationId: "channel:1" },
       status: "active",
       boundAt: Date.now(),
       metadata: { owner: "core" },
     });
-    const result = await requestPluginConversationBinding(
-      createDiscordCodexBindRequest(
-        "channel:1",
-        "Bind this conversation to Codex thread 123.",
-        "default",
-      ),
-    );
+    const result = await requestPluginConversationBinding(discordRequest("channel:1", "default"));
     expect(result).toEqual({
       status: "error",
       message:
