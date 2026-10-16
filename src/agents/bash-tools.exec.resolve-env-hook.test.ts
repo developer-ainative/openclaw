@@ -17,7 +17,7 @@ declare module "../plugins/hook-types.js" {
 const CHANNEL_CONTEXT_ENV_KEY = "OPENCLAW_CHANNEL_CONTEXT";
 const OPENCLAW_CLI_ENV_VALUE = "1";
 const sessionKey = "agent:main:telegram:chat-1";
-const channelContext = { sender: { id: "ou_1", unionId: "on_1" }, chat: { id: "oc_1" } };
+const channelContext = () => ({ sender: { id: "ou_1", unionId: "on_1" }, chat: { id: "oc_1" } });
 type CapturedNodeHostParams = Pick<
   ExecuteNodeHostCommandParams,
   "env" | "requestedEnv" | "workdir"
@@ -202,7 +202,7 @@ describe("exec resolve_exec_env hook wiring", () => {
       sessionId: "session-1",
       messageProvider: "telegram",
       currentChannelId: "chat-1",
-      channelContext,
+      channelContext: channelContext(),
     });
     await tool.execute("call-1", {
       command: "echo ok",
@@ -222,7 +222,7 @@ describe("exec resolve_exec_env hook wiring", () => {
         sessionId: "session-1",
         messageProvider: "telegram",
         channelId: "chat-1",
-        channelContext,
+        channelContext: channelContext(),
       },
     );
     for (const env of [
