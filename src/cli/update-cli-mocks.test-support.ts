@@ -45,6 +45,11 @@ const isPlistStdinConversion = vi.hoisted(
     args[5] === "-",
 );
 
+function parseVersion(value: string | null): [number, number, number] | null {
+  const match = value?.match(/(\d+)\.(\d+)\.(\d+)/);
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
 export const existingHostUri = nodeSqlite.resolveExistingSqliteFileUri;
 export const immutableHostUri = nodeSqlite.resolveImmutableSqliteFileUri;
 
@@ -339,18 +344,8 @@ vi.mock("../infra/runtime-guard.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../infra/runtime-guard.js")>()),
   nodeVersionSatisfiesEngine,
   parseSemver: (version: string | null) => {
-    if (!version) {
-      return null;
-    }
-    const match = version.match(/(\d+)\.(\d+)\.(\d+)/);
-    if (!match) {
-      return null;
-    }
-    return {
-      major: Number.parseInt(match[1] ?? "0", 10),
-      minor: Number.parseInt(match[2] ?? "0", 10),
-      patch: Number.parseInt(match[3] ?? "0", 10),
-    };
+    const parts = parseVersion(version);
+    return parts && { major: parts[0], minor: parts[1], patch: parts[2] };
   },
 }));
 
@@ -506,38 +501,31 @@ vi.mock("../plugins/official-external-install-records.js", async (importOriginal
 }));
 
 vi.mock("../plugins/update.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../plugins/update.js")>();
   return {
-    ...actual,
+    ...(await importOriginal<typeof import("../plugins/update.js")>()),
     syncPluginsForUpdateChannel: (...args: unknown[]) => syncPluginsForUpdateChannel(...args),
     updateNpmInstalledPlugins: (...args: unknown[]) => updateNpmInstalledPlugins(...args),
   };
 });
 
 vi.mock("../plugins/installed-plugin-index-records.js", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("../plugins/installed-plugin-index-records.js")>();
   return {
-    ...actual,
+    ...(await importOriginal<typeof import("../plugins/installed-plugin-index-records.js")>()),
     loadInstalledPluginIndexInstallRecords,
     writePersistedInstalledPluginIndexInstallRecordsWithLease,
   };
 });
 
 vi.mock("../plugins/installed-plugin-index-store.js", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("../plugins/installed-plugin-index-store.js")>();
   return {
-    ...actual,
+    ...(await importOriginal<typeof import("../plugins/installed-plugin-index-store.js")>()),
     readPersistedInstalledPluginIndex,
   };
 });
 
 vi.mock("../plugins/installed-plugin-index-store-write.js", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("../plugins/installed-plugin-index-store-write.js")>();
   return {
-    ...actual,
+    ...(await importOriginal<typeof import("../plugins/installed-plugin-index-store-write.js")>()),
     restorePersistedInstalledPluginIndexIfCurrent,
   };
 });
@@ -673,9 +661,8 @@ vi.mock("../commands/doctor/legacy-config-repair.js", async (importOriginal) => 
   repairLegacyConfigForUpdateChannel: legacyConfigRepairMocks.repairLegacyConfigForUpdateChannel,
 }));
 vi.mock("./completion-runtime.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./completion-runtime.js")>();
   return {
-    ...actual,
+    ...(await importOriginal<typeof import("./completion-runtime.js")>()),
     installCompletion: (...args: unknown[]) => installCompletion(...args),
   };
 });

@@ -12,69 +12,17 @@ import { isBetaTag } from "../infra/update-channels.js";
 import type { UpdateRunResult } from "../infra/update-runner-types.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { VERSION } from "../version.js";
-import {
-  freshRestartCalls,
-  gatewayCommandCall,
-  getLogOutput,
-  requireValue,
-} from "./update-cli-assertions.test-support.js";
+import * as assertions from "./update-cli-assertions.test-support.js";
 import { registerUpdateCliLifecycle } from "./update-cli-lifecycle.test-support.js";
-import {
-  callGateway,
-  gatewayFixturePid,
-  pathExists,
-  readPackageVersion,
-  resumeScheduledTaskAutoStartAfterUpdate,
-  serviceLoaded,
-  serviceReadCommand,
-  serviceReadRuntime,
-  serviceStop,
-  sqliteHostPlatform,
-  suspendScheduledTaskAutoStartForUpdate,
-  syncPluginsForUpdateChannel,
-  updateNpmInstalledPlugins,
-} from "./update-cli-mocks.test-support.js";
-import {
-  checkUpdateStatus,
-  completePostCorePluginUpdate,
-  CONTROL_PLANE_UPDATE_SENTINEL_META_ENV,
-  createUpdateStateProfileInitializer,
-  defaultRuntime,
-  ExitError,
-  invokeUpdateCli,
-  makeOkUpdateResult,
-  mockGitUpdateAfterMutation,
-  readConfigFileSnapshot,
-  readRestartSentinel,
-  resolveGatewayInstallEntrypoint,
-  resolveNpmChannelTag,
-  resolveOpenClawPackageRoot,
-  resolveUpdateInstallIdentity,
-  resolveUpdateInstallKind,
-  runCommandWithTimeout,
-  runExec,
-  updateCommand,
-  updateGitCheckout,
-} from "./update-cli-modules.test-support.js";
-import {
-  createChangedPostCoreUpdateOptions,
-  createUpdateCliBaseSnapshot,
-  createUpdateCliConfigFixtures,
-} from "./update-cli/update-cli-config.test-support.js";
-import {
-  createCurrentProcessFreshDoctorFixture,
-  createUpdateCliPackageFixtures,
-  writeGitUpdateResultFixture,
-  writeJsonFixture,
-  writeNpmPackageInstall,
-} from "./update-cli/update-cli-package.test-support.js";
+import * as mocks from "./update-cli-mocks.test-support.js";
+import * as update from "./update-cli-modules.test-support.js";
+import * as configSupport from "./update-cli/update-cli-config.test-support.js";
+import * as packageSupport from "./update-cli/update-cli-package.test-support.js";
 
 await vi.hoisted(() => import("./update-cli-mocks.test-support.js"));
 
 export function createUpdateCliFixture() {
-  // Per-run unique root: concurrent runs on one machine (CI shards, sibling checkouts) must
-  // never share fixture paths — some cases write real files and rm them in cleanup. Realpath'd
-  // because macOS os.tmpdir() is a /var -> /private/var symlink.
+  // Unique across concurrent runs; realpath normalizes macOS's /var symlink.
   const fixtureRoot = fsSync.realpathSync(
     fsSync.mkdtempSync(path.join(os.tmpdir(), "openclaw-update-tests-")),
   );
@@ -98,16 +46,13 @@ export function createUpdateCliFixture() {
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
   const tempDirsToCleanup = new Set<string>();
 
-  const createCaseDir = (prefix: string) => {
-    const dir = path.join(fixtureRoot, `${prefix}-${fixtureCount++}`);
-    // Callers that only need a stable path skip creating it; real-I/O callers mkdir themselves.
-    return dir;
-  };
+  // Real-I/O callers create the directory; others only need a stable path.
+  const createCaseDir = (prefix: string) => path.join(fixtureRoot, `${prefix}-${fixtureCount++}`);
 
-  const initializeExistingUpdateProfile = createUpdateStateProfileInitializer(fixtureRoot);
+  const initializeExistingUpdateProfile = update.createUpdateStateProfileInitializer(fixtureRoot);
 
   const baseConfig: OpenClawConfig = {};
-  const baseSnapshot = createUpdateCliBaseSnapshot(baseConfig);
+  const baseSnapshot = configSupport.createUpdateCliBaseSnapshot(baseConfig);
 
   const clawHubRiskWarning =
     "╭─ ClawHub Security Audit ─────────────────────────────────╮\n" +
@@ -121,34 +66,26 @@ export function createUpdateCliFixture() {
   const clawHubSyncRiskError =
     "Failed to update demo: ClawHub blocked this release; update was not started. (ClawHub clawhub:demo@1.2.4).";
 
+  const setStreamTty = (
+    stream: NodeJS.ReadStream | NodeJS.WriteStream,
+    value: boolean | undefined,
+  ) => Object.defineProperty(stream, "isTTY", { value, configurable: true });
   const setTty = (value: boolean | undefined) => {
-    Object.defineProperty(process.stdin, "isTTY", {
-      value,
-      configurable: true,
-    });
+    setStreamTty(process.stdin, value);
   };
-
   const setStdoutTty = (value: boolean | undefined) => {
-    Object.defineProperty(process.stdout, "isTTY", {
-      value,
-      configurable: true,
-    });
+    setStreamTty(process.stdout, value);
   };
 
   const mockPackageInstallStatus = (root: string) => {
-    vi.mocked(resolveOpenClawPackageRoot).mockResolvedValue(root);
-    vi.mocked(resolveUpdateInstallKind).mockResolvedValue("package");
-    vi.mocked(resolveUpdateInstallIdentity).mockResolvedValue({ installKind: "package" });
-    vi.mocked(checkUpdateStatus).mockResolvedValue({
+    vi.mocked(update.resolveOpenClawPackageRoot).mockResolvedValue(root);
+    vi.mocked(update.resolveUpdateInstallKind).mockResolvedValue("package");
+    vi.mocked(update.resolveUpdateInstallIdentity).mockResolvedValue({ installKind: "package" });
+    vi.mocked(update.checkUpdateStatus).mockResolvedValue({
       root,
       installKind: "package",
       packageManager: "npm",
-      deps: {
-        manager: "npm",
-        status: "ok",
-        lockfilePath: null,
-        markerPath: null,
-      },
+      deps: { manager: "npm", status: "ok", lockfilePath: null, markerPath: null },
     });
   };
 
@@ -157,14 +94,13 @@ export function createUpdateCliFixture() {
       createCaseDir(prefix),
       version,
     );
-    // A real global npm prefix always owns its launcher directory, even when
-    // this scenario has no launcher entries to publish.
+    // The global prefix owns bin even when no launchers are published.
     await fs.mkdir(path.join(path.dirname(path.dirname(nodeModules)), "bin"), {
       recursive: true,
     });
     mockNpmGlobalCommands(nodeModules, async (argv) => {
       if (argv[0] === "npm" && argv[1] === "i") {
-        await writeNpmPackageInstall(argv, pkgRoot);
+        await packageSupport.writeNpmPackageInstall(argv, pkgRoot);
       }
     });
     mockCurrentProcessFreshDoctor({ packageRoot: pkgRoot });
@@ -172,7 +108,7 @@ export function createUpdateCliFixture() {
   };
 
   const primeNpmChannelTag = (tag: string, version: string | null): void => {
-    vi.mocked(resolveNpmChannelTag).mockResolvedValue({ tag, version });
+    vi.mocked(update.resolveNpmChannelTag).mockResolvedValue({ tag, version });
   };
 
   const primeServiceCommand = (
@@ -184,7 +120,7 @@ export function createUpdateCliFixture() {
       programArguments,
       ...(environment === undefined ? {} : { environment }),
     };
-    serviceReadCommand.mockResolvedValue({
+    mocks.serviceReadCommand.mockResolvedValue({
       ...managedDefinition,
       managedDefinition,
       ...(sourcePath ? { sourcePath } : {}),
@@ -223,7 +159,7 @@ export function createUpdateCliFixture() {
       undefined,
       process.platform === "win32" ? resolveGatewayTaskScriptPath(process.env) : undefined,
     );
-    pathExists.mockImplementation(
+    mocks.pathExists.mockImplementation(
       async (candidate: string) =>
         candidate === path.join(root, "package.json") || candidate === serviceEntrypoint,
     );
@@ -233,10 +169,10 @@ export function createUpdateCliFixture() {
     const nativeTaskControl = await vi.importActual<typeof import("../daemon/schtasks-control.js")>(
       "../daemon/schtasks-control.js",
     );
-    suspendScheduledTaskAutoStartForUpdate.mockImplementation(
+    mocks.suspendScheduledTaskAutoStartForUpdate.mockImplementation(
       nativeTaskControl.suspendScheduledTaskAutoStartForUpdate,
     );
-    resumeScheduledTaskAutoStartAfterUpdate.mockImplementation(
+    mocks.resumeScheduledTaskAutoStartAfterUpdate.mockImplementation(
       nativeTaskControl.resumeScheduledTaskAutoStartAfterUpdate,
     );
   };
@@ -244,27 +180,29 @@ export function createUpdateCliFixture() {
   const runRestartFallbackScenario = async (params: { daemonInstall: "ok" | "fail" }) => {
     mockOwnedGitService();
     const entrypoint = path.join(process.cwd(), "dist", "index.js");
-    mockGitUpdateAfterMutation(makeOkUpdateResult({ root: process.cwd() }));
-    vi.mocked(resolveGatewayInstallEntrypoint).mockResolvedValue(entrypoint);
+    update.mockGitUpdateAfterMutation(update.makeOkUpdateResult({ root: process.cwd() }));
+    vi.mocked(update.resolveGatewayInstallEntrypoint).mockResolvedValue(entrypoint);
     if (params.daemonInstall === "fail") {
       mockGatewayInstallFailure(entrypoint);
     }
-    serviceLoaded.mockResolvedValue(true);
+    mocks.serviceLoaded.mockResolvedValue(true);
 
-    await updateCommand({});
+    await update.updateCommand({});
 
-    expect(gatewayCommandCall(entrypoint, "install")).toBeDefined();
-    expect(freshRestartCalls()).toHaveLength(1);
+    expect(assertions.gatewayCommandCall(entrypoint, "install")).toBeDefined();
+    expect(assertions.freshRestartCalls()).toHaveLength(1);
   };
 
   const setupNonInteractiveDowngrade = async () => {
     const tempDir = await mockPackageInstallAtCaseDir();
     setTty(false);
-    readPackageVersion.mockResolvedValue("2.0.0");
+    mocks.readPackageVersion.mockResolvedValue("2.0.0");
     primeNpmChannelTag(isBetaTag(VERSION) ? "beta" : "latest", "0.0.1");
-    vi.mocked(updateGitCheckout).mockResolvedValue(makeOkUpdateResult({ mode: "npm" }));
-    vi.mocked(defaultRuntime.error).mockClear();
-    vi.mocked(defaultRuntime.exit).mockClear();
+    vi.mocked(update.updateGitCheckout).mockResolvedValue(
+      update.makeOkUpdateResult({ mode: "npm" }),
+    );
+    vi.mocked(update.defaultRuntime.error).mockClear();
+    vi.mocked(update.defaultRuntime.exit).mockClear();
 
     return tempDir;
   };
@@ -294,39 +232,38 @@ export function createUpdateCliFixture() {
       );
       tempDirsToCleanup.add(packageRoot);
     }
-    pathExists.mockImplementation(
+    mocks.pathExists.mockImplementation(
       async (candidate: string) =>
         packageJsonPaths.has(candidate) || entrypoints.includes(candidate),
     );
-    const readPreviousPackageVersion = requireValue(
-      readPackageVersion.getMockImplementation(),
+    const readPreviousPackageVersion = assertions.requireValue(
+      mocks.readPackageVersion.getMockImplementation(),
       "package version fixture",
     );
-    readPackageVersion.mockImplementation(async (packageRoot: string) =>
+    mocks.readPackageVersion.mockImplementation(async (packageRoot: string) =>
       packageRoots.includes(packageRoot) ? targetVersion : readPreviousPackageVersion(packageRoot),
     );
-    vi.mocked(updateGitCheckout).mockImplementation(async ({ opts: options }) => {
-      // The real Git runner admits its original owner even without activation.
-      // Finalization-only fixtures retain that read/prepare callback, not a fake fence.
+    vi.mocked(update.updateGitCheckout).mockImplementation(async ({ opts: options }) => {
+      // Admit the original owner even without activation, as the Git runner does.
       await options.inspectGitTarget({});
       // Baseline-capture cases separately exercise the actual mutation callback.
       if (params?.admitMutation) {
-        await requireValue(options.beforeGitMutation, "Git mutation admission")({});
+        await assertions.requireValue(options.beforeGitMutation, "Git mutation admission")({});
       }
       return params?.gatewayUpdateImpl
         ? params.gatewayUpdateImpl(root)
-        : makeOkUpdateResult({ mode: "npm", root, after: { version: targetVersion } });
+        : update.makeOkUpdateResult({ mode: "npm", root, after: { version: targetVersion } });
     });
     mockGatewayHealth(targetVersion, "updated-gateway");
-    serviceLoaded.mockResolvedValue(true);
+    mocks.serviceLoaded.mockResolvedValue(true);
     primeServiceCommand(["node", entrypoints[0], "gateway", "run"]);
     return { root, entrypoints };
   };
 
   const FRESH_POST_UPDATE_ENTRYPOINT = "/tmp/openclaw-updated-entry.mjs";
 
-  const mockCurrentProcessFreshDoctor = createCurrentProcessFreshDoctorFixture(
-    resolveGatewayInstallEntrypoint,
+  const mockCurrentProcessFreshDoctor = packageSupport.createCurrentProcessFreshDoctorFixture(
+    update.resolveGatewayInstallEntrypoint,
     FRESH_POST_UPDATE_ENTRYPOINT,
   );
 
@@ -335,7 +272,7 @@ export function createUpdateCliFixture() {
     workspaceSuggestions?: boolean;
   }) => {
     const calls = vi
-      .mocked(runExec)
+      .mocked(update.runExec)
       .mock.calls.filter(
         ([, args]) => args[0] === FRESH_POST_UPDATE_ENTRYPOINT && args[1] === "doctor",
       );
@@ -350,62 +287,59 @@ export function createUpdateCliFixture() {
     ]);
   };
 
-  const configFixtures = createUpdateCliConfigFixtures({
+  const configFixtures = configSupport.createUpdateCliConfigFixtures({
     baseConfig,
     baseSnapshot,
-    readConfigFileSnapshot,
-    syncPluginsForUpdateChannel,
-    updateNpmInstalledPlugins,
+    readConfigFileSnapshot: update.readConfigFileSnapshot,
+    syncPluginsForUpdateChannel: mocks.syncPluginsForUpdateChannel,
+    updateNpmInstalledPlugins: mocks.updateNpmInstalledPlugins,
     createCaseDir,
   });
 
   const runPostCoreCommand = (
-    options: Parameters<typeof updateCommand>[0],
+    options: Parameters<typeof update.updateCommand>[0],
     env: NodeJS.ProcessEnv = {},
-  ) => {
-    return withEnvAsync(
+  ) =>
+    withEnvAsync(
       {
         OPENCLAW_UPDATE_POST_CORE: "1",
         OPENCLAW_UPDATE_POST_CORE_CHANNEL: "stable",
         OPENCLAW_COMPATIBILITY_HOST_VERSION: process.env.OPENCLAW_COMPATIBILITY_HOST_VERSION,
         ...env,
       },
-      async () => {
-        await updateCommand(options);
-      },
+      () => update.updateCommand(options),
     );
-  };
 
   const runPostCoreUpdate = (env: NodeJS.ProcessEnv = {}) =>
     runPostCoreCommand({ yes: true, restart: false }, env);
 
   const expectFailedManagedGitRestart = (message: string) => {
-    const logs = getLogOutput();
-    expect(serviceStop).toHaveBeenCalledTimes(1);
-    expect(freshRestartCalls()).toHaveLength(1);
-    expect(defaultRuntime.exit).not.toHaveBeenCalled();
-    expect([logs, ...vi.mocked(defaultRuntime.error).mock.calls.flat()].join("\n")).toContain(
-      message,
-    );
+    const logs = assertions.getLogOutput();
+    expect(mocks.serviceStop).toHaveBeenCalledTimes(1);
+    expect(assertions.freshRestartCalls()).toHaveLength(1);
+    expect(update.defaultRuntime.exit).not.toHaveBeenCalled();
+    expect(
+      [logs, ...vi.mocked(update.defaultRuntime.error).mock.calls.flat()].join("\n"),
+    ).toContain(message);
     expect(logs).not.toContain("Gateway: restarted and verified.");
     expect(logs).not.toContain("Update Result: OK");
   };
 
   const mockGatewayHealth = (version: string, connId: string, buildId?: string) => {
-    callGateway.mockImplementation(
+    mocks.callGateway.mockImplementation(
       gatewayHealthResponse({ server: { version, connId, buildId, bootId: "test-gateway-boot" } }),
     );
   };
 
-  const packageFixtures = createUpdateCliPackageFixtures({
-    runCommandWithTimeout,
-    serviceStop,
-    serviceReadRuntime,
-    serviceReadCommand,
-    serviceLoaded,
-    pathExists,
-    gatewayFixturePid,
-    sqliteHostPlatform,
+  const packageFixtures = packageSupport.createUpdateCliPackageFixtures({
+    runCommandWithTimeout: update.runCommandWithTimeout,
+    serviceStop: mocks.serviceStop,
+    serviceReadRuntime: mocks.serviceReadRuntime,
+    serviceReadCommand: mocks.serviceReadCommand,
+    serviceLoaded: mocks.serviceLoaded,
+    pathExists: mocks.pathExists,
+    gatewayFixturePid: mocks.gatewayFixturePid,
+    sqliteHostPlatform: mocks.sqliteHostPlatform,
     mockGatewayHealth,
     mockPackageInstallStatus,
   });
@@ -417,8 +351,11 @@ export function createUpdateCliFixture() {
   } = packageFixtures;
 
   const completeChangedPostCorePluginUpdate = (
-    overrides: Partial<Parameters<typeof completePostCorePluginUpdate>[0]> = {},
-  ) => completePostCorePluginUpdate(createChangedPostCoreUpdateOptions(overrides));
+    overrides: Partial<Parameters<typeof update.completePostCorePluginUpdate>[0]> = {},
+  ) =>
+    update.completePostCorePluginUpdate(
+      configSupport.createChangedPostCoreUpdateOptions(overrides),
+    );
 
   const setupNpmUpdatedRootRefresh = () => {
     const updatedRoot = createCaseDir("openclaw-updated-root");
@@ -427,7 +364,7 @@ export function createUpdateCliFixture() {
       entrypoints: [updatedEntrypoint],
       targetVersion: "2026.4.24",
       gatewayUpdateImpl: async () =>
-        makeOkUpdateResult({
+        update.makeOkUpdateResult({
           mode: "npm",
           root: updatedRoot,
           before: { version: "2026.4.23" },
@@ -439,10 +376,10 @@ export function createUpdateCliFixture() {
 
   const setupManagedGitRootRefresh = async (reinspect = false) => {
     const { root, entrypoints } = setupUpdatedRootRefresh();
-    const updatedEntrypoint = requireValue(entrypoints[0], "updated entrypoint");
+    const updatedEntrypoint = assertions.requireValue(entrypoints[0], "updated entrypoint");
     mockOwnedGitService();
-    mockGitUpdateAfterMutation(
-      await writeGitUpdateResultFixture({
+    update.mockGitUpdateAfterMutation(
+      await packageSupport.writeGitUpdateResultFixture({
         root,
         before: { sha: "old-managed-sha", version: "2026.4.26" },
         after: { sha: "new-managed-sha", version: VERSION },
@@ -450,24 +387,24 @@ export function createUpdateCliFixture() {
       reinspect,
     );
     mockFileBackedPathExists();
-    serviceLoaded.mockResolvedValue(true);
-    serviceReadRuntime.mockResolvedValue({
+    mocks.serviceLoaded.mockResolvedValue(true);
+    mocks.serviceReadRuntime.mockResolvedValue({
       status: "running",
-      pid: gatewayFixturePid,
+      pid: mocks.gatewayFixturePid,
       state: "running",
     });
-    serviceStop.mockImplementationOnce(async () => {
-      serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
+    mocks.serviceStop.mockImplementationOnce(async () => {
+      mocks.serviceReadRuntime.mockResolvedValue({ status: "stopped", state: "stopped" });
     });
-    const runFixtureCommand = requireValue(
-      vi.mocked(runCommandWithTimeout).getMockImplementation(),
+    const runFixtureCommand = assertions.requireValue(
+      vi.mocked(update.runCommandWithTimeout).getMockImplementation(),
       "default command fixture",
     );
-    vi.mocked(runCommandWithTimeout).mockImplementation(async (argv, options) => {
+    vi.mocked(update.runCommandWithTimeout).mockImplementation(async (argv, options) => {
       const result = await runFixtureCommand(argv, options);
       if (argv[2] === "gateway" && argv[3] === "install" && result.code === 0) {
         expect(argv[1]).toBe(updatedEntrypoint);
-        const env = requireValue(
+        const env = assertions.requireValue(
           typeof options === "number" ? undefined : options.env,
           "gateway install environment",
         );
@@ -475,9 +412,9 @@ export function createUpdateCliFixture() {
       }
       if (argv[2] === "gateway" && argv[3] === "restart" && result.code === 0) {
         expect(argv[1]).toBe(updatedEntrypoint);
-        serviceReadRuntime.mockResolvedValue({
+        mocks.serviceReadRuntime.mockResolvedValue({
           status: "running",
-          pid: gatewayFixturePid,
+          pid: mocks.gatewayFixturePid,
           state: "running",
         });
         mockGatewayHealth(VERSION, "updated-work");
@@ -488,7 +425,7 @@ export function createUpdateCliFixture() {
   };
 
   const runWithGatewayServiceEnv = (
-    options: Parameters<typeof updateCommand>[0],
+    options: Parameters<typeof update.updateCommand>[0],
     env: NodeJS.ProcessEnv = {},
   ) =>
     withEnvAsync(
@@ -497,14 +434,12 @@ export function createUpdateCliFixture() {
         OPENCLAW_SERVICE_KIND: "gateway",
         ...env,
       },
-      async () => {
-        await invokeUpdateCli(options);
-      },
+      () => update.invokeUpdateCli(options),
     );
 
   const runControlPlaneUpdate = async (params: {
     meta: Record<string, unknown>;
-    options: Parameters<typeof updateCommand>[0];
+    options: Parameters<typeof update.updateCommand>[0];
     beforeUpdate?: () => void | Promise<void>;
     expectedExitCode?: number;
   }) => {
@@ -513,26 +448,26 @@ export function createUpdateCliFixture() {
     await fs.mkdir(stateDir);
     const metaDir = tempDirs.make("openclaw-update-sentinel-meta-");
     const metaPath = path.join(metaDir, "meta.json");
-    await writeJsonFixture(metaPath, { version: 1, meta: params.meta }, false);
+    await packageSupport.writeJsonFixture(metaPath, { version: 1, meta: params.meta }, false);
     await params.beforeUpdate?.();
     await withEnvAsync(
       {
-        [CONTROL_PLANE_UPDATE_SENTINEL_META_ENV]: metaPath,
+        [update.CONTROL_PLANE_UPDATE_SENTINEL_META_ENV]: metaPath,
         HOME: home,
         OPENCLAW_STATE_DIR: stateDir,
       },
       async () => {
         initializeExistingUpdateProfile();
         if (params.expectedExitCode === undefined) {
-          await invokeUpdateCli(params.options);
+          await update.invokeUpdateCli(params.options);
         } else {
-          await expect(invokeUpdateCli(params.options)).rejects.toEqual(
-            new ExitError(params.expectedExitCode),
+          await expect(update.invokeUpdateCli(params.options)).rejects.toEqual(
+            new update.ExitError(params.expectedExitCode),
           );
         }
       },
     );
-    return readRestartSentinel({ OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv);
+    return update.readRestartSentinel({ OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv);
   };
 
   const fixture = {

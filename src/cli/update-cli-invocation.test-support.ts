@@ -9,6 +9,9 @@ import type { UpdateRunResult } from "../infra/update-runner-types.js";
 import { ExitError } from "../runtime.js";
 import type { UpdateCommandOptions } from "./update-cli/shared.js";
 
+const including = (object: Record<string, unknown>) =>
+  expect.arrayContaining([expect.objectContaining(object)]);
+
 export function expectGitMetadataPreview(result: unknown): void {
   expect(result).toMatchObject({
     dryRun: true,
@@ -16,18 +19,16 @@ export function expectGitMetadataPreview(result: unknown): void {
     notes: expect.arrayContaining([
       expect.stringMatching(/Git target manifest or revision[\s\S]*retry openclaw update/),
     ]),
-    failures: expect.arrayContaining([
-      expect.objectContaining({
-        reason: "target-metadata-preflight",
-        message: expect.stringMatching(/Git[\s\S]*openclaw update/),
-        failureFacts: [
-          expect.objectContaining({
-            code: "target-git-metadata",
-            message: expect.stringContaining("a dry-run does not fetch missing objects"),
-          }),
-        ],
-      }),
-    ]),
+    failures: including({
+      reason: "target-metadata-preflight",
+      message: expect.stringMatching(/Git[\s\S]*openclaw update/),
+      failureFacts: [
+        expect.objectContaining({
+          code: "target-git-metadata",
+          message: expect.stringContaining("a dry-run does not fetch missing objects"),
+        }),
+      ],
+    }),
   });
 }
 
@@ -52,12 +53,10 @@ export function expectPluginCapabilityRetryNotice(
     postUpdate: {
       plugins: {
         status: "warning",
-        warnings: expect.arrayContaining([
-          expect.objectContaining({
-            pluginId,
-            message: expect.stringContaining(`openclaw plugins update ${pluginId}`),
-          }),
-        ]),
+        warnings: including({
+          pluginId,
+          message: expect.stringContaining(`openclaw plugins update ${pluginId}`),
+        }),
         npm: {
           outcomes: [
             expect.objectContaining({
@@ -67,18 +66,14 @@ export function expectPluginCapabilityRetryNotice(
             }),
           ],
         },
-        ...(source === "bridge"
-          ? {
-              sync: {
-                errors: [
-                  'Failed to update consent-fixture: Operator review token changed.\nBundled relocation did not install the replacement plugin payload; resolve the error above, then run "openclaw update repair".',
-                ],
-              },
-            }
-          : {}),
       },
     },
   });
+  if (source === "bridge") {
+    expect(result.postUpdate?.plugins?.sync?.errors).toEqual([
+      'Failed to update consent-fixture: Operator review token changed.\nBundled relocation did not install the replacement plugin payload; resolve the error above, then run "openclaw update repair".',
+    ]);
+  }
 }
 
 export function expectUpdateFailureReport(
@@ -133,12 +128,10 @@ export function expectSelectorTriageFailure(
     result: {
       status: "error",
       reason: "update-failed",
-      steps: expect.arrayContaining([
-        expect.objectContaining({
-          exitCode: 1,
-          failureFacts: [expect.objectContaining({ message: cause.message })],
-        }),
-      ]),
+      steps: including({
+        exitCode: 1,
+        failureFacts: [expect.objectContaining({ message: cause.message })],
+      }),
     },
   });
 }
