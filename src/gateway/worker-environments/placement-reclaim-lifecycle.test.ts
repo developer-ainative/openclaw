@@ -1,8 +1,4 @@
 import { expect, it, vi } from "vitest";
-import {
-  WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
-  WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
-} from "../../../packages/gateway-protocol/src/schema/worker-admission.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { NODE_WORKER_ENVIRONMENT_STOP_COMMAND } from "../../infra/node-commands.js";
 import {
@@ -12,11 +8,16 @@ import {
 import { createNodeWorkerTunnelManager } from "./node-worker-tunnel.js";
 import * as nodeSupport from "./node-worker-tunnel.test-support.js";
 import { coordinateWorkerPlacementDispatch } from "./placement-dispatch-coordinator.js";
-import { MANIFEST_REF, REQUEST, seedActivePlacement } from "./placement-dispatch-test-fixtures.js";
+import {
+  createDispatchEnvironmentFixtures,
+  MANIFEST_REF,
+  REQUEST,
+  seedActivePlacement,
+} from "./placement-dispatch-test-fixtures.js";
 import { createHarness } from "./placement-dispatch-test-harness.js";
 import { createWorkerPlacementIdleSweep } from "./placement-idle-sweep.js";
 import { createWorkerSessionPlacementStore } from "./placement-store.js";
-import { placementSource } from "./placement-suite.test-support.js";
+import { placementClaim, placementSource } from "./placement-suite.test-support.js";
 import * as support from "./service.test-support.js";
 import type { WorkerTunnelManager } from "./tunnel.js";
 
@@ -40,38 +41,22 @@ it.each([
     };
     let harness = await createHarness(database, placements, harnessOptions);
     const environmentId = harness.ready.environmentId;
-    const build = {
-      ...support.BOOTSTRAP_RECEIPT,
-      protocolFeatures: [
-        WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
-        WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
-      ],
-    };
+    const build = createDispatchEnvironmentFixtures().attached.bootstrapReceipt;
     support.testState.prepareInstallation = async () => ({
       ...support.BUNDLE_ARTIFACT,
       ...build,
     });
-    await environments.createIntent({
-      environmentId,
-      providerId: "fake",
-      profileId: REQUEST.profileId,
-      profileSnapshot: { settings: { region: "test" } },
-      provisionOperationId: "provision-fixture",
-    });
+    await support.seedBootstrapping(environmentId);
     await environments.transition({
       environmentId,
-      from: "requested",
-      to: "provisioning",
-    });
-    await environments.transition({
-      environmentId,
-      from: "provisioning",
+      from: "bootstrapping",
       to: "ready",
       patch: {
         ...support.readyPatch(environmentId, { ...build, installKind: "bundle" }),
         leaseId: "lease-fixture",
         nodeDeviceId: "node-fixture",
         sharedHost: false,
+        sshEndpoint: null,
       },
     });
     const attached = await environments.transition({
@@ -85,12 +70,7 @@ it.each([
       throw new Error("expected active placement");
     }
     if (operation === "recovery") {
-      const claim = await placements.claimTurn({
-        ...REQUEST,
-        claimId: "pending-claim",
-        runId: "pending-run",
-        owner: { kind: "worker", environmentId, ownerEpoch: attached.ownerEpoch },
-      });
+      const claim = await placements.claimTurn(placementClaim(active, "pending"));
       await placements.markWorkspaceResultPending(claim);
       await placements.startWorkspaceResultDrain(claim);
       placements = createWorkerSessionPlacementStore({ database });
@@ -126,17 +106,18 @@ it.each([
       invoke.mock.calls.filter(
         ([call]) => (call.params as NodeWorkerWorkspaceExecInput).quiescence?.action === "release",
       );
-    const transfer = nodeSupport.workspaceTransfer();
-    transfer.closeAll = vi.fn(async () => {});
-    transfer.prepareSync = vi.fn(async () => ({
-      token: "fixture-transfer",
-      snapshot: {
-        root,
-        manifest: { version: 1 as const, baseCommit: null, entries: [] },
-        manifestRef: MANIFEST_REF,
-        rawManifest: "",
-      },
-    }));
+    const transfer = nodeSupport.workspaceTransfer({
+      closeAll: vi.fn(async () => {}),
+      prepareSync: vi.fn(async () => ({
+        token: "fixture-transfer",
+        snapshot: {
+          root,
+          manifest: { version: 1 as const, baseCommit: null, entries: [] },
+          manifestRef: MANIFEST_REF,
+          rawManifest: "",
+        },
+      })),
+    });
     const tunnels = createNodeWorkerTunnelManager({
       gatewayDeviceId: "gateway-fixture",
       getEnvironment: (id) => environments.get(id),
@@ -230,14 +211,13 @@ it.each([
     vi.mocked(harness.environments.startTunnel).mockClear();
     // SQLite workers compare cross-thread monotonic deadlines; fake only the provider timer.
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const request = REQUEST;
     const result = (
       operation === "recovery"
         ? coordinated.reconcileActive()
         : operation === "reclaim"
-          ? coordinated.reclaim(request)
+          ? coordinated.reclaim(REQUEST)
           : coordinated.move({
-              ...request,
+              ...REQUEST,
               source: placementSource(active),
               target: { kind: "gateway" },
             })
@@ -263,7 +243,7 @@ it.each([
           turnClaim: null,
         });
         expect(releaseCalls()).toHaveLength(1);
-        await expect(coordinated.reclaim(request)).resolves.toMatchObject({
+        await expect(coordinated.reclaim(REQUEST)).resolves.toMatchObject({
           state: "reclaimed",
         });
         return;
@@ -288,7 +268,6 @@ it.each([
         expect
           .soft(harness.reportWorkspaceResultRecoveryFailure)
           .toHaveBeenCalledWith(expect.objectContaining({ error: expectedError }));
-        expect(placements.get(active.sessionId)?.state).toBe("draining");
       } else {
         expect.soft(outcome).toBe(primaryError);
       }

@@ -13,7 +13,6 @@ function remoteExecPlacement() {
     generation: 11,
     environmentId,
     activeOwnerEpoch: 7,
-    workspaceBaseManifestRef: `sha256:${"b".repeat(64)}`,
     remoteWorkspaceDir,
   });
 }
@@ -32,6 +31,16 @@ function attachedEnvironment() {
       keyRef: { source: "file", provider: "worker-keys", id: "/key" },
     },
   } satisfies NonNullable<ReturnType<WorkerEnvironmentService["get"]>>;
+}
+
+function nodeEnvironment() {
+  return {
+    ...attachedEnvironment(),
+    providerId: "device",
+    nodeDeviceId: "paired-node-1",
+    sharedHost: true,
+    sshEndpoint: null,
+  };
 }
 
 function sandboxFor(
@@ -63,12 +72,11 @@ it("binds the exact SSH managed worktree and placement generation into the runti
     runtimeId: "remote-exec:worker:environment-1:7:11",
     workspaceDir: "/local/managed-worktree",
     containerWorkdir: remoteWorkspaceDir,
+    backend: { workdir: remoteWorkspaceDir, workdirRoots: [remoteWorkspaceDir] },
   });
-  expect(sandbox.backend?.workdir).toBe(remoteWorkspaceDir);
-  expect(sandbox.backend?.workdirRoots).toEqual([remoteWorkspaceDir]);
-  expect(sandbox).not.toHaveProperty("placementEnvironmentId");
-  expect(sandbox).not.toHaveProperty("placementSessionId");
-  expect(sandbox).not.toHaveProperty("placementOwnerEpoch");
+  for (const key of ["placementEnvironmentId", "placementSessionId", "placementOwnerEpoch"]) {
+    expect(sandbox).not.toHaveProperty(key);
+  }
 });
 
 it.each([
@@ -81,13 +89,7 @@ it.each([
   "binds an exact $platform paired-node worktree without inventing an SSH backend or filesystem bridge",
   async ({ nodeWorkspaceDir }) => {
     const placement = { ...remoteExecPlacement(), remoteWorkspaceDir: nodeWorkspaceDir };
-    const environment = {
-      ...attachedEnvironment(),
-      providerId: "device",
-      nodeDeviceId: "paired-node-1",
-      sharedHost: true,
-      sshEndpoint: null,
-    } satisfies NonNullable<ReturnType<WorkerEnvironmentService["get"]>>;
+    const environment = nodeEnvironment();
     const resolveSshIdentity = vi.fn();
 
     const sandbox = await sandboxFor({ get: () => environment, resolveSshIdentity }, placement);
@@ -104,8 +106,7 @@ it.each([
       workspaceDir: "/local/managed-worktree",
       containerWorkdir: nodeWorkspaceDir,
     });
-    expect(sandbox.backend).toBeUndefined();
-    expect(sandbox.fsBridge).toBeUndefined();
+    expect([sandbox.backend, sandbox.fsBridge]).toEqual([undefined, undefined]);
     expect(resolveSshIdentity).not.toHaveBeenCalled();
   },
 );
@@ -122,11 +123,7 @@ it.each([
   { label: "POSIX trailing separator", workspaceDir: "/srv/workspace/" },
   { label: "Windows trailing separator", workspaceDir: "C:\\Users\\workspace\\" },
 ])("rejects an ambiguous or noncanonical paired-node $label", async ({ workspaceDir }) => {
-  const environment = {
-    ...attachedEnvironment(),
-    nodeDeviceId: "paired-node-1",
-    sshEndpoint: null,
-  };
+  const environment = nodeEnvironment();
 
   await expect(
     sandboxFor(
@@ -189,11 +186,7 @@ it.each([
   "rejects a paired node's replaced $label before returning its sandbox",
   async ({ replacement }) => {
     const placement = remoteExecPlacement();
-    const environment = {
-      ...attachedEnvironment(),
-      nodeDeviceId: "paired-node-1",
-      sshEndpoint: null,
-    };
+    const environment = nodeEnvironment();
     const get = vi
       .fn<WorkerEnvironmentService["get"]>()
       .mockReturnValueOnce(environment)

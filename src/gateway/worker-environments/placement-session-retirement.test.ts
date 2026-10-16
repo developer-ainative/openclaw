@@ -21,30 +21,14 @@ import {
 
 function createHarness(records: WorkerSessionPlacementRecord[]) {
   const placements = new Map(records.map((record) => [record.sessionId, record]));
-  const environments = new Map<
-    string,
-    { environmentId: string; state: "attached" | "destroyed"; leaseId: string | null }
-  >();
-  for (const { environmentId } of records) {
-    if (environmentId) {
-      environments.set(environmentId, {
-        environmentId,
-        state: "attached",
-        leaseId: `lease:${environmentId}`,
-      });
-    }
-  }
+  const destroyed = new Set<string>();
   const retired: WorkerSessionPlacementRetirement[] = [];
   const resolveSessionEvidence = vi.fn<PlacementSessionEvidenceResolver>(async () => "absent");
   const createSessionEvidenceResolver = vi.fn(
     async (): Promise<PlacementSessionEvidenceResolver> => resolveSessionEvidence,
   );
   const forceDestroyEnvironment = vi.fn(async (environmentId: string) => {
-    environments.set(environmentId, {
-      environmentId,
-      state: "destroyed",
-      leaseId: null,
-    });
+    destroyed.add(environmentId);
     for (const record of placements.values()) {
       if (record.environmentId === environmentId && record.state === "active") {
         placements.set(record.sessionId, {
@@ -81,7 +65,16 @@ function createHarness(records: WorkerSessionPlacementRecord[]) {
       retireSessionPlacementAsync,
     },
     environments: {
-      get: (environmentId) => environments.get(environmentId) as never,
+      get: (environmentId) => {
+        if (!records.some((record) => record.environmentId === environmentId)) {
+          return undefined;
+        }
+        return {
+          environmentId,
+          state: destroyed.has(environmentId) ? "destroyed" : "attached",
+          leaseId: destroyed.has(environmentId) ? null : `lease:${environmentId}`,
+        } as never;
+      },
     },
     forceDestroyEnvironment,
     createSessionEvidenceResolver,
@@ -138,13 +131,7 @@ it("fences the environment before retiring its failed placement", async () => {
   const sessionId = "session-active";
   const harness = createHarness([activePlacement(sessionId)]);
   await harness.retirement.reconcile();
-  expect(harness.retired).toEqual([
-    {
-      sessionId,
-      expectedState: "failed",
-      expectedGeneration: 3,
-    },
-  ]);
+  expect(harness.retired).toEqual([{ sessionId, expectedState: "failed", expectedGeneration: 3 }]);
   expect(harness.forceDestroyEnvironment).toHaveBeenCalledWith(
     `environment:${sessionId}`,
     expect.any(Function),

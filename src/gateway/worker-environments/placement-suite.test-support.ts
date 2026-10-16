@@ -1,4 +1,4 @@
-import type { WorkerSessionPlacementRecord } from "./placement-record.js";
+import { placementTurnOwner, type WorkerSessionPlacementRecord } from "./placement-record.js";
 
 export function sessionIdentity(sessionId: string) {
   return { sessionId, sessionKey: `agent:main:${sessionId}`, agentId: "main" };
@@ -28,6 +28,17 @@ export function localPlacement(sessionId = "session-1") {
 }
 
 type Active = Extract<WorkerSessionPlacementRecord, { state: "active" }>;
+export function placementClaim(placement: Active, name: string) {
+  return {
+    sessionId: placement.sessionId,
+    sessionKey: placement.sessionKey,
+    agentId: placement.agentId,
+    claimId: `${name}-claim`,
+    runId: `${name}-run`,
+    owner: placementTurnOwner(placement),
+  };
+}
+
 export function placementSource(
   placement: Pick<Active, "generation" | "environmentId" | "activeOwnerEpoch">,
 ) {
@@ -35,6 +46,15 @@ export function placementSource(
     generation: placement.generation,
     environmentId: placement.environmentId,
     ownerEpoch: placement.activeOwnerEpoch,
+  };
+}
+
+export function placementTransition(placement: Active) {
+  return {
+    sessionId: placement.sessionId,
+    environmentId: placement.environmentId,
+    ownerEpoch: placement.activeOwnerEpoch,
+    expectedGeneration: placement.generation,
   };
 }
 
