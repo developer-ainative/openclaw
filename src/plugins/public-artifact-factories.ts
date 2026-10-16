@@ -84,7 +84,7 @@ export function loadBundledPublicArtifactEntries<T extends object>(
   }
   for (const error of errors) {
     log.warn(
-      `Unable to initialize some ${params.partialFailureLabel} for plugin ${params.pluginId}; using healthy siblings`,
+      `Unable to initialize some ${params.partialFailureLabel} for plugin ${params.pluginId}`,
       { error },
     );
   }
