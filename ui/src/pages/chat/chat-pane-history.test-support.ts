@@ -1,6 +1,5 @@
 import { onTestFinished, vi } from "vitest";
 /* Shared fixtures for chat pane history pagination suites. */
-import type { SessionCatalogTranscriptItem } from "../../../../packages/gateway-protocol/src/index.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import type { SessionCapability } from "../../lib/sessions/index.ts";
@@ -13,6 +12,7 @@ import {
   createInitializationContext,
   createRenderTestChatPane,
   createPaneTestHost,
+  type TestChatPane as BaseTestChatPane,
 } from "./chat-pane.test-support.ts";
 import type { ChatPageHost } from "./chat-state-host.ts";
 
@@ -36,43 +36,13 @@ export function createRefreshChatPane(client?: GatewayBrowserClient) {
   return { pane, state, context };
 }
 
-export type TestChatPane = HTMLElement & {
-  catalogCursor: string | undefined;
-  catalogMessages: unknown[];
-  context: ApplicationContext;
-  state: ChatPageHost;
-  connectedClient: GatewayBrowserClient | null;
-  connectionGeneration: number;
-  sessionKey: string;
-  catalogItemMessage: (item: SessionCatalogTranscriptItem) => Record<string, unknown> | null;
-  handleTranscriptScroll: (event: Event) => void;
-  handleTranscriptHistoryIntent: (event: Event) => void;
-  historyAutoLoadBlocked: boolean;
-  historyObserverArmed: boolean;
-  syncHistoryObserver: () => void;
-  prependUniqueCatalogMessages: (messages: unknown[]) => unknown[];
+export type TestChatPane = Omit<BaseTestChatPane, "loadOlderMessages"> & {
   loadOlderMessages: () => Promise<boolean>;
   stagedOlder: { page: unknown; load: Promise<void> | null };
-  readReplyMessage: (messageId: string) => unknown;
   replyMessageStatus: (messageId: string) => string | undefined;
   openReplyMessage: (messageId: string) => void;
   currentReplyNavigationId: (sessionKey: string) => string | null;
-  hasOlderMessages: () => boolean;
-  loadingOlder: boolean;
-  presented: boolean;
   visuallyPresented: boolean;
-  resetOlderMessagesViewport: () => void;
-  readonly updateComplete: Promise<boolean>;
-  transcriptScrollTop: number | null;
-  transcript: {
-    activeSessionKey: string | null;
-    readonly isPositionSettled: boolean;
-    readonly isProgrammaticScroll: boolean;
-    readonly isMaintenanceScroll: boolean;
-    readonly scrollElement: HTMLDivElement | null;
-    revealMessage: (messageId: string) => boolean;
-    scrollToOffset: (offset: number) => void;
-  };
 };
 
 function createSessionContext(
@@ -201,26 +171,15 @@ export function createNativeShowEarlierPane(request: ReturnType<typeof vi.fn>) {
 /** Offset-scripted chat.history mock for an 8-message transcript whose tail
  * (seq 7-8) is loaded; overrides replace or extend the default pages. */
 export function stagedPagesRequest(overrides: Record<number, () => unknown> = {}) {
-  const pages: Record<number, () => unknown> = {
-    2: () => ({
-      messages: [nativeHistoryMessage(5), nativeHistoryMessage(6)],
-      hasMore: true,
-      nextOffset: 4,
+  const pages: Record<number, () => unknown> = { ...overrides };
+  for (const offset of [2, 4, 6]) {
+    pages[offset] ??= () => ({
+      messages: [7 - offset, 8 - offset].map((seq) => nativeHistoryMessage(seq)),
+      hasMore: offset < 6,
+      ...(offset < 6 ? { nextOffset: offset + 2 } : {}),
       totalMessages: 8,
-    }),
-    4: () => ({
-      messages: [nativeHistoryMessage(3), nativeHistoryMessage(4)],
-      hasMore: true,
-      nextOffset: 6,
-      totalMessages: 8,
-    }),
-    6: () => ({
-      messages: [nativeHistoryMessage(1), nativeHistoryMessage(2)],
-      hasMore: false,
-      totalMessages: 8,
-    }),
-    ...overrides,
-  };
+    });
+  }
   return vi.fn(async (_method: string, params: { offset?: number }) => {
     const page = pages[params.offset ?? -1];
     if (!page) {

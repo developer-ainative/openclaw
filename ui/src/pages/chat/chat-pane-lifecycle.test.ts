@@ -37,16 +37,43 @@ import { beginQueuedMessageEdit, cancelQueuedMessageEdit } from "./queued-messag
 import { isSidebarSlotVisible, openSlot, setSidebarOpen } from "./sidebar-layout.ts";
 import { buildInitialChatSubmission } from "./user-message-content.ts";
 
-function pendingSuggestion(sessionKey: string, id: string, text: string): SessionSuggestion {
+function pendingSuggestion(
+  sessionKey: string,
+  id: string,
+  text: string,
+  author: SessionSuggestion["author"] = { type: "human", id: "alice", label: "Alice" },
+): SessionSuggestion {
   return {
     id,
     sessionKey,
     agentId: "main",
-    author: { type: "human", id: "alice", label: "Alice" },
+    author,
     text,
     createdAt: 1,
     state: "pending",
   };
+}
+
+function barePane(request = vi.fn()) {
+  return createTestChatPane({
+    client: { request } as unknown as GatewayBrowserClient,
+    sessions: {} as SessionCapability,
+  });
+}
+
+function suggestionRow(state: ChatPageHost, sessionId?: string): GatewaySessionRow {
+  return {
+    key: state.sessionKey,
+    kind: "direct",
+    sessionId,
+    updatedAt: 1,
+    visibility: "suggest",
+    sharingRole: "owner",
+  };
+}
+
+function selectSuggestionRows(state: ChatPageHost, ...sessions: GatewaySessionRow[]) {
+  state.sessionsResult = { count: sessions.length, path: "", sessions } as never;
 }
 
 const SKIP_REWIND_CONFIRM_PREFERENCE = "openclaw:skip-rewind-confirm";
@@ -87,9 +114,7 @@ it("publishes queued-edit retention changes while its pane is parked", async () 
 });
 
 describe("chat pane composer prefill attention", () => {
-  it.each([
-    { label: "repeated draft prefill", draft: "Prefilled prompt", repeat: true, attention: true },
-  ])("focuses with the expected attention cue for $label", ({ draft, repeat, attention }) => {
+  it("renews the attention cue for repeated draft prefill", () => {
     vi.useFakeTimers();
     const { pane } = createTestChatPane({
       client: {} as GatewayBrowserClient,
@@ -105,27 +130,17 @@ describe("chat pane composer prefill attention", () => {
       updated: (changedProperties?: Map<PropertyKey, unknown>) => void;
     };
     lifecycle.focusComposer = true;
-    lifecycle.draft = draft;
+    lifecycle.draft = "Prefilled prompt";
     const attentionClass = "agent-chat__input--prefill-attention";
-    const mutations = new MutationObserver(() => {});
-    mutations.observe(input, { attributeFilter: ["class"], attributeOldValue: true });
     lifecycle.updated(new Map([["focusComposer", false]]));
     expect(document.activeElement).toBe(textarea);
-    expect(input.classList.contains(attentionClass)).toBe(attention);
-    if (repeat) {
-      vi.advanceTimersByTime(300);
-      lifecycle.updated(new Map([["focusComposer", false]]));
-    }
+    expect(input.classList.contains(attentionClass)).toBe(true);
+    vi.advanceTimersByTime(300);
+    lifecycle.updated(new Map([["focusComposer", false]]));
     vi.advanceTimersByTime(599);
-    expect(input.classList.contains(attentionClass)).toBe(attention);
+    expect(input.classList.contains(attentionClass)).toBe(true);
     vi.advanceTimersByTime(1);
     expect(input.classList.contains(attentionClass)).toBe(false);
-    if (!attention) {
-      expect(
-        mutations.takeRecords().some(({ oldValue }) => oldValue?.includes(attentionClass)),
-      ).toBe(false);
-    }
-    mutations.disconnect();
     input.remove();
   });
 });
@@ -236,8 +251,8 @@ describe("chat pane initial panel layout", () => {
 });
 
 describe("chat pane session suggestion lifecycle", () => {
-  function createSuggestionPane(client: GatewayBrowserClient) {
-    const fixture = createTestChatPane({ client, sessions: {} as SessionCapability });
+  function createSuggestionPane(request = vi.fn()) {
+    const fixture = barePane(request);
     fixture.pane.presencePayload = {
       presence: [{ user: { id: "owner" } }, { user: { id: "alice" } }],
     };
@@ -247,15 +262,10 @@ describe("chat pane session suggestion lifecycle", () => {
   it("does not let a stale add completion clear a newer session operation", async () => {
     const first = createDeferred<{ suggestion: SessionSuggestion }>();
     const second = createDeferred<{ suggestion: SessionSuggestion }>();
-    const client = {
-      request: vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise),
-    } as unknown as GatewayBrowserClient;
-    const sessions = {} as SessionCapability;
-    const { pane, state } = createTestChatPane({ client, sessions });
+    const { pane, state } = createSuggestionPane(
+      vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise),
+    );
     state.chatAttachments = [];
-    pane.presencePayload = {
-      presence: [{ user: { id: "owner" } }, { user: { id: "alice" } }],
-    };
     const row = (id: string, text: string) => pendingSuggestion(state.sessionKey, id, text);
 
     state.chatMessage = "first";
@@ -277,8 +287,7 @@ describe("chat pane session suggestion lifecycle", () => {
     "rejects suggestion submission while %s remain",
     async (content) => {
       const request = vi.fn();
-      const client = { request } as unknown as GatewayBrowserClient;
-      const { pane, state } = createSuggestionPane(client);
+      const { pane, state } = createSuggestionPane(request);
       state.chatMessage = "@Alex text only";
       state.chatAttachments =
         content === "attachments"
@@ -307,23 +316,8 @@ describe("chat pane session suggestion lifecycle", () => {
       .fn()
       .mockReturnValueOnce(firstList.promise)
       .mockReturnValueOnce(secondList.promise);
-    const client = {
-      request,
-    } as unknown as GatewayBrowserClient;
-    const { pane, state } = createSuggestionPane(client);
-    state.sessionsResult = {
-      count: 1,
-      path: "",
-      sessions: [
-        {
-          key: state.sessionKey,
-          kind: "direct",
-          updatedAt: 1,
-          visibility: "suggest",
-          sharingRole: "viewer",
-        },
-      ],
-    } as never;
+    const { pane, state } = createSuggestionPane(request);
+    selectSuggestionRows(state, { ...suggestionRow(state), sharingRole: "viewer" });
     const eventSuggestion = pendingSuggestion(state.sessionKey, "event", "new event");
     const existingSuggestion: SessionSuggestion = {
       ...eventSuggestion,
@@ -351,17 +345,8 @@ describe("chat pane session suggestion lifecycle", () => {
   it("clears cached suggestions until a rotated session instance list resolves", async () => {
     const listed = createDeferred<SessionSuggestionsListResult>();
     const request = vi.fn(() => listed.promise);
-    const client = { request } as unknown as GatewayBrowserClient;
-    const { pane, state } = createSuggestionPane(client);
-    const row = (sessionId: string): GatewaySessionRow =>
-      ({
-        key: state.sessionKey,
-        kind: "direct",
-        sessionId,
-        updatedAt: 1,
-        visibility: "suggest",
-        sharingRole: "owner",
-      }) as GatewaySessionRow;
+    const { pane, state } = createSuggestionPane(request);
+    const row = (sessionId: string) => suggestionRow(state, sessionId);
     const stale = pendingSuggestion(state.sessionKey, "stale-instance", "old instance");
     const fresh: SessionSuggestion = {
       ...stale,
@@ -373,11 +358,7 @@ describe("chat pane session suggestion lifecycle", () => {
     await pane.refreshSessionSuggestions();
     pane.sessionSuggestions = [stale];
     state.sessionsResultAgentId = "main";
-    state.sessionsResult = {
-      count: 1,
-      path: "",
-      sessions: [row("session-b")],
-    } as never;
+    selectSuggestionRows(state, row("session-b"));
 
     pane.syncSessionSuggestionTarget("main", row("session-b"));
 
@@ -388,23 +369,10 @@ describe("chat pane session suggestion lifecycle", () => {
   });
 
   it("clears displayed typing actors when the session instance rotates", () => {
-    const client = { request: vi.fn() } as unknown as GatewayBrowserClient;
-    const { pane, state } = createSuggestionPane(client);
-    const row = (sessionId: string): GatewaySessionRow =>
-      ({
-        key: state.sessionKey,
-        kind: "direct",
-        sessionId,
-        updatedAt: 1,
-        visibility: "suggest",
-        sharingRole: "owner",
-      }) as GatewaySessionRow;
+    const { pane, state } = createSuggestionPane();
+    const row = (sessionId: string) => suggestionRow(state, sessionId);
     const sessionA = row("session-a");
-    state.sessionsResult = {
-      count: 1,
-      path: "",
-      sessions: [sessionA],
-    } as never;
+    selectSuggestionRows(state, sessionA);
     pane.syncSessionSuggestionTarget("main", sessionA);
     pane.handleSessionTypingEvent({
       sessionKey: state.sessionKey,
@@ -417,11 +385,7 @@ describe("chat pane session suggestion lifecycle", () => {
     expect(pane.typingActors.size).toBe(1);
 
     const sessionB = row("session-b");
-    state.sessionsResult = {
-      count: 1,
-      path: "",
-      sessions: [sessionB],
-    } as never;
+    selectSuggestionRows(state, sessionB);
     pane.syncSessionSuggestionTarget("main", sessionB);
 
     expect(pane.typingActors.size).toBe(0);
@@ -439,31 +403,19 @@ describe("chat pane session suggestion lifecycle", () => {
       }
       throw new Error(`unexpected method: ${method}`);
     });
-    const client = { request } as unknown as GatewayBrowserClient;
-    const { pane, state } = createSuggestionPane(client);
+    const { pane, state } = createSuggestionPane(request);
     pane.context.gateway.snapshot.selfUser = { id: "owner" } as never;
-    state.sessionsResult = {
-      count: 1,
-      path: "",
-      sessions: [
-        {
-          key: state.sessionKey,
-          kind: "direct",
-          updatedAt: 1,
-          visibility: "suggest",
-          sharingRole: "owner",
-        },
-      ],
-    } as never;
-    const pending: SessionSuggestion = {
-      id: "owner-suggestion",
-      sessionKey: state.sessionKey,
-      agentId: "main",
-      author: { type: "human", id: "owner", label: "Owner" },
-      text: "my resolved suggestion",
-      createdAt: 1,
-      state: "pending",
-    };
+    selectSuggestionRows(state, suggestionRow(state));
+    const pending = pendingSuggestion(
+      state.sessionKey,
+      "owner-suggestion",
+      "my resolved suggestion",
+      {
+        type: "human",
+        id: "owner",
+        label: "Owner",
+      },
+    );
     const resolved = { ...pending, state: "accepted" as const };
     pane.sessionSuggestionRole = "owner";
     pane.sessionSuggestions = [pending];
@@ -485,31 +437,18 @@ describe("chat pane session suggestion lifecycle", () => {
 
   it("drops a resolve completion after the same session key rotates instances", async () => {
     const response = createDeferred<{ suggestion: SessionSuggestion }>();
-    const client = {
-      request: vi.fn(() => response.promise),
-    } as unknown as GatewayBrowserClient;
-    const { pane, state } = createTestChatPane({
-      client,
-      sessions: {} as SessionCapability,
-    });
-    const session = (sessionId: string): GatewaySessionRow =>
-      ({
-        key: state.sessionKey,
-        kind: "direct",
-        sessionId,
-        updatedAt: 1,
-        visibility: "suggest",
-        sharingRole: "owner",
-      }) as GatewaySessionRow;
-    const suggestion: SessionSuggestion = {
-      id: "old-instance-resolution",
-      sessionKey: state.sessionKey,
-      agentId: "main",
-      author: { type: "human", id: "owner", label: "Owner" },
-      text: "old instance suggestion",
-      createdAt: 1,
-      state: "pending",
-    };
+    const { pane, state } = barePane(vi.fn(() => response.promise));
+    const session = (sessionId: string) => suggestionRow(state, sessionId);
+    const suggestion = pendingSuggestion(
+      state.sessionKey,
+      "old-instance-resolution",
+      "old instance suggestion",
+      {
+        type: "human",
+        id: "owner",
+        label: "Owner",
+      },
+    );
     pane.context.gateway.snapshot.selfUser = { id: "owner" } as never;
     pane.syncSessionSuggestionTarget("main", session("session-a"));
     pane.sessionSuggestions = [suggestion];
@@ -525,13 +464,7 @@ describe("chat pane session suggestion lifecycle", () => {
 
   it("does not apply an edit failure after the same session key rotates instances", async () => {
     const deferred = createDeferred<never>();
-    const client = {
-      request: vi.fn(() => deferred.promise),
-    } as unknown as GatewayBrowserClient;
-    const { pane, state } = createTestChatPane({
-      client,
-      sessions: {} as SessionCapability,
-    });
+    const { pane, state } = barePane(vi.fn(() => deferred.promise));
     const suggestion = pendingSuggestion(state.sessionKey, "edit", "suggested text");
     state.handleChatDraftChange = (next) => {
       state.chatMessage = next;
@@ -553,13 +486,7 @@ describe("chat pane session suggestion lifecycle", () => {
     "restores only an untouched owner draft after an edit rejection (reselected=%s)",
     async (reselected) => {
       const deferred = createDeferred<never>();
-      const client = {
-        request: vi.fn(() => deferred.promise),
-      } as unknown as GatewayBrowserClient;
-      const { pane, state } = createTestChatPane({
-        client,
-        sessions: {} as SessionCapability,
-      });
+      const { pane, state } = barePane(vi.fn(() => deferred.promise));
       const suggestion = pendingSuggestion(
         state.sessionKey,
         "edit-rejected",
@@ -597,13 +524,7 @@ describe("chat pane session suggestion lifecycle", () => {
     const first = createDeferred<never>();
     const second = createDeferred<never>();
     const request = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
-    const client = {
-      request,
-    } as unknown as GatewayBrowserClient;
-    const { pane, state } = createTestChatPane({
-      client,
-      sessions: {} as SessionCapability,
-    });
+    const { pane, state } = barePane(request);
     const suggestion = (id: string, text: string) => pendingSuggestion(state.sessionKey, id, text);
     state.handleChatDraftChange = (next) => {
       state.chatMessage = next;

@@ -31,6 +31,30 @@ afterEach(() => {
 });
 
 describe("staged attachment composer adoption", () => {
+  function receive(pane: TestChatPane, event = annotationEvent()) {
+    (
+      pane as TestChatPane & { receiveBrowserAnnotation: (event: Event) => void }
+    ).receiveBrowserAnnotation(event);
+  }
+
+  function annotationPane(
+    client: GatewayBrowserClient,
+    sessions = createSessionCapabilityFixture(),
+  ) {
+    const result = createTestChatPane({ client, sessions });
+    result.pane.active = true;
+    return result;
+  }
+
+  function reconnect(pane: TestChatPane, client: GatewayBrowserClient) {
+    pane.applyGatewaySnapshot({
+      ...pane.context.gateway.snapshot,
+      client,
+      phase: "reconnecting",
+      hello: null,
+    });
+  }
+
   function annotationEvent() {
     return new CustomEvent<BrowserAnnotationDraft>("openclaw:browser-annotation", {
       detail: {
@@ -139,14 +163,8 @@ describe("staged attachment composer adoption", () => {
 
   it("releases a real pane's late disconnect after application disposal", () => {
     const owner = {} as GatewayBrowserClient;
-    const { pane, state } = createTestChatPane({
-      client: owner,
-      sessions: {} as SessionCapability,
-    });
-    pane.active = true;
-    (
-      pane as TestChatPane & { receiveBrowserAnnotation: (candidate: Event) => void }
-    ).receiveBrowserAnnotation(annotationEvent());
+    const { pane, state } = annotationPane(owner, {} as SessionCapability);
+    receive(pane);
     const annotation = state.chatAttachments[0]!;
     const ordinary = storedAttachment("late-dispose-ordinary", false);
     state.chatAttachments.push(ordinary);
@@ -211,28 +229,16 @@ describe("staged attachment composer adoption", () => {
       second.pane.active = true;
       first.state.chatAttachments = [];
       second.state.chatAttachments = [];
-      const event = new CustomEvent<BrowserAnnotationDraft>("openclaw:browser-annotation", {
-        detail: {
-          modelContext: "Context",
-          dataUrl: "data:image/png;base64,aGVsbG8=",
-          fileName: "annotated-page.png",
-          card: {
-            title: "",
-            displayUrl: "example.com",
-            markedRegionCount: 1,
-            inspectedElement: false,
-          },
-        },
-        cancelable: true,
+      const event = annotationEvent();
+      event.detail.modelContext = "Context";
+      Object.assign(event.detail.card, {
+        title: "",
+        markedRegionCount: 1,
+        inspectedElement: false,
       });
-
-      const receive = (pane: TestChatPane) =>
-        (
-          pane as TestChatPane & { receiveBrowserAnnotation: (candidate: Event) => void }
-        ).receiveBrowserAnnotation(event);
-      receive(first.pane);
-      receive(second.pane);
-      receive(first.pane);
+      receive(first.pane, event);
+      receive(second.pane, event);
+      receive(first.pane, event);
 
       expect(first.state.chatAttachments).toEqual([]);
       expect(second.state.chatAttachments).toHaveLength(1);
@@ -249,9 +255,7 @@ describe("staged attachment composer adoption", () => {
     pane.active = true;
     (context.gateway.snapshot as { client: GatewayBrowserClient | null }).client = client;
 
-    (
-      pane as TestChatPane & { receiveBrowserAnnotation: (candidate: Event) => void }
-    ).receiveBrowserAnnotation(annotationEvent());
+    receive(pane);
     const captured = pane.state.chatAttachments[0]!;
     pane.disconnectedCallback();
 
@@ -268,9 +272,7 @@ describe("staged attachment composer adoption", () => {
     const context = createSessionContext(owner, createSessionCapabilityFixture());
     const pane = connectPaneThroughAttachmentRestore(context, "p1", "agent:main:replaced-client");
     pane.active = true;
-    (
-      pane as TestChatPane & { receiveBrowserAnnotation: (candidate: Event) => void }
-    ).receiveBrowserAnnotation(annotationEvent());
+    receive(pane);
     const captured = pane.state.chatAttachments[0]!;
     (context.gateway.snapshot as { client: GatewayBrowserClient | null }).client = replacement;
 
@@ -288,14 +290,8 @@ describe("staged attachment composer adoption", () => {
   it("preserves the package on same-client reconnect and clears it on replacement", () => {
     const owner = {} as GatewayBrowserClient;
     const replacement = {} as GatewayBrowserClient;
-    const { pane, state } = createTestChatPane({
-      client: owner,
-      sessions: createSessionCapabilityFixture(),
-    });
-    pane.active = true;
-    (
-      pane as TestChatPane & { receiveBrowserAnnotation: (candidate: Event) => void }
-    ).receiveBrowserAnnotation(annotationEvent());
+    const { pane, state } = annotationPane(owner);
+    receive(pane);
     pane.active = false;
     const current = state.chatAttachments[0]!;
     const fallback = storedAttachment("replacement-fallback", true);
@@ -310,12 +306,7 @@ describe("staged attachment composer adoption", () => {
       },
     };
 
-    pane.applyGatewaySnapshot({
-      ...pane.context.gateway.snapshot,
-      client: owner,
-      phase: "reconnecting",
-      hello: null,
-    });
+    reconnect(pane, owner);
     expect(state.chatAttachments).toEqual([current, ordinary]);
     expect(getChatAttachmentDataUrl(current)).not.toBeNull();
 
@@ -334,12 +325,7 @@ describe("staged attachment composer adoption", () => {
     expect(state.chatAttachments).toEqual([current, ordinary]);
     expect(getChatAttachmentDataUrl(current)).not.toBeNull();
 
-    pane.applyGatewaySnapshot({
-      ...pane.context.gateway.snapshot,
-      client: replacement,
-      phase: "reconnecting",
-      hello: null,
-    });
+    reconnect(pane, replacement);
     // Rotation invalidates annotation-backed attachments only; plain payloads
     // are client-local and survive (live state and fallbacks alike).
     expect(state.chatAttachments).toEqual([ordinary]);
@@ -351,26 +337,15 @@ describe("staged attachment composer adoption", () => {
 
   it("discards a staged package captured without a client when the first client arrives", () => {
     const client = {} as GatewayBrowserClient;
-    const { pane, state } = createTestChatPane({
-      client,
-      sessions: createSessionCapabilityFixture(),
-    });
-    pane.active = true;
+    const { pane, state } = annotationPane(client);
     pane.connectedClient = null;
     (pane.context.gateway.snapshot as { client: GatewayBrowserClient | null }).client = null;
-    (
-      pane as TestChatPane & { receiveBrowserAnnotation: (candidate: Event) => void }
-    ).receiveBrowserAnnotation(annotationEvent());
+    receive(pane);
     const annotation = state.chatAttachments[0]!;
     const ordinary = storedAttachment("no-client-ordinary", false);
     state.chatAttachments.push(ordinary);
 
-    pane.applyGatewaySnapshot({
-      ...pane.context.gateway.snapshot,
-      client,
-      phase: "reconnecting",
-      hello: null,
-    });
+    reconnect(pane, client);
 
     expect(state.chatAttachments).toEqual([ordinary]);
     expect(getChatAttachmentDataUrl(annotation)).toBeNull();
@@ -380,14 +355,8 @@ describe("staged attachment composer adoption", () => {
   it("invalidates annotation Undo when the logical Gateway client is replaced", async () => {
     const owner = {} as GatewayBrowserClient;
     const replacement = {} as GatewayBrowserClient;
-    const { pane, state } = createTestChatPane({
-      client: owner,
-      sessions: createSessionCapabilityFixture(),
-    });
-    pane.active = true;
-    (
-      pane as TestChatPane & { receiveBrowserAnnotation: (candidate: Event) => void }
-    ).receiveBrowserAnnotation(annotationEvent());
+    const { pane, state } = annotationPane(owner);
+    receive(pane);
     const annotation = state.chatAttachments[0]!;
     const ordinary = storedAttachment("undo-ordinary", false);
     state.chatAttachments.push(ordinary);
@@ -405,12 +374,7 @@ describe("staged attachment composer adoption", () => {
     expect(state.chatAttachments).toEqual([ordinary]);
     expect(getChatAttachmentDataUrl(annotation)).not.toBeNull();
 
-    pane.applyGatewaySnapshot({
-      ...pane.context.gateway.snapshot,
-      client: replacement,
-      phase: "reconnecting",
-      hello: null,
-    });
+    reconnect(pane, replacement);
     toastHost.querySelector<HTMLButtonElement>(".app-toast__action")!.click();
 
     expect(state.chatAttachments).toEqual([ordinary]);
