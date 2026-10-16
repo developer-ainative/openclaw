@@ -1,28 +1,42 @@
+import { mkdirSync } from "node:fs";
+import path from "node:path";
 import type { Bot } from "grammy";
-import type { Message, Update } from "grammy/types";
+import type { Update } from "grammy/types";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { testing as bindingTesting } from "openclaw/plugin-sdk/conversation-runtime";
+import {
+  registerSessionBindingAdapter,
+  testing as bindingTesting,
+  type SessionBindingRecord,
+} from "openclaw/plugin-sdk/conversation-runtime";
 import type {
   PluginHookInboundClaimContext,
   PluginHookInboundClaimEvent,
   PluginHookInboundClaimResult,
 } from "openclaw/plugin-sdk/plugin-entry";
 import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import * as hooks from "openclaw/plugin-sdk/plugin-test-runtime";
+import {
+  addTestHook,
+  createPluginRecord,
+  getActivePluginRegistry,
+  initializeGlobalHookRunner,
+  resetGlobalHookRunner,
+} from "openclaw/plugin-sdk/plugin-test-runtime";
 import { getReplyFromConfig } from "openclaw/plugin-sdk/reply-runtime";
 import {
   deleteSessionEntry,
   getSessionEntry,
   normalizeSessionDeliveryState,
+  upsertSessionEntry,
 } from "openclaw/plugin-sdk/session-store-runtime";
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import * as fixture from "./bot-message-context.native.test-support.js";
 import {
   apiCalls,
   chat,
   commandMessage,
   createBot,
+  deliverTelegramUpdate,
+  groupChat,
   groupCommand,
   harness,
   photo,
@@ -33,15 +47,26 @@ import { resetTelegramTopicNameCacheForTest } from "./runtime.test-support.js";
 
 let cfg: OpenClawConfig;
 let storePath: string;
-const session = (sessionKey: string) => getSessionEntry({ agentId: "main", storePath, sessionKey });
-const observed = (index = 0) => harness.replySpy.mock.calls[index]?.[0];
-function expectDestination(sessionKey: string, context: Record<string, unknown>) {
-  expect(session(sessionKey)?.delivery).toMatchObject({ kind: "external", context });
-}
+let updateId = 6000;
 
 beforeEach(() => {
-  storePath = fixture.createContextStorePath();
-  cfg = fixture.contextConfig(storePath, { requireMention: false });
+  const storeDir = harness.state.path("telegram-context-session");
+  mkdirSync(storeDir);
+  storePath = path.join(storeDir, "sessions.json");
+  cfg = {
+    session: { store: storePath },
+    commands: { native: false },
+    channels: {
+      telegram: {
+        dmPolicy: "open",
+        allowFrom: ["*"],
+        groupPolicy: "open",
+        autoTopicLabel: false,
+        streaming: { mode: "off" },
+        groups: { "*": { requireMention: false } },
+      },
+    },
+  };
   bindingTesting.resetSessionBindingAdaptersForTests();
   resetTelegramTopicNameCacheForTest();
 });
@@ -49,47 +74,76 @@ beforeEach(() => {
 afterEach(() => {
   bindingTesting.resetSessionBindingAdaptersForTests();
   resetTelegramTopicNameCacheForTest();
-  hooks.resetGlobalHookRunner();
+  resetGlobalHookRunner();
 });
 
-async function receive(bot: Bot, message: NonNullable<Update["message"]>) {
-  await fixture.receiveContextMessage(bot, {
-    ...message,
-    entities: message.text?.startsWith("@") ? message.entities : [],
+function bind(
+  conversationId: string,
+  targetSessionKey: string,
+  metadata?: SessionBindingRecord["metadata"],
+) {
+  const record: SessionBindingRecord = {
+    bindingId: "context-binding",
+    targetSessionKey,
+    targetKind: "session",
+    conversation: { channel: "telegram", accountId: "default", conversationId },
+    status: "active",
+    boundAt: 1,
+    metadata,
+  };
+  registerSessionBindingAdapter({
+    channel: "telegram",
+    accountId: "default",
+    listBySession: () => [record],
+    resolveByConversation: (conversation) =>
+      conversation.conversationId === conversationId ? record : null,
   });
 }
-const direct = (bot: Bot, text: string, extra: Partial<Message.TextMessage> = {}) =>
-  receive(bot, { ...commandMessage(text), ...extra });
-const group = (bot: Bot, text: string, extra: Partial<Message.TextMessage> = {}) =>
-  receive(bot, { ...groupCommand(text), ...extra });
+
+async function receive(bot: Bot, message: NonNullable<Update["message"]>) {
+  await deliverTelegramUpdate(bot, {
+    update_id: ++updateId,
+    message: { ...message, entities: message.text?.startsWith("@") ? message.entities : [] },
+  });
+}
 
 describe("Telegram recorded session destinations", () => {
   it.each([
-    ["deleted direct session", undefined, "agent:main:telegram:direct:42001", undefined],
-    ["bot-private topic", 77, "agent:main:main:thread:42001:77", "77"],
-  ] as const)(
-    "persists the deliverable destination for %s",
-    async (_name, thread, key, savedThread) => {
-      if (thread === undefined) {
-        cfg.session = { ...cfg.session, dmScope: "per-channel-peer" };
-      }
-      const bot = await createBot(false, true, cfg, thread !== undefined);
-      if (thread === undefined) {
-        await direct(bot, "first turn");
-        await deleteSessionEntry({ storePath, sessionKey: key });
-      }
-      await direct(bot, "remember this destination", { chat, message_thread_id: thread });
-      const delivery = session(key)?.delivery;
-      expect(delivery).toMatchObject({
-        kind: "external",
-        context: { channel: "telegram", to: "telegram:42001" },
-      });
-      expect(delivery?.kind === "external" ? delivery.context.threadId : null).toBe(savedThread);
-      if (thread === undefined) {
-        expect(delivery).toMatchObject({ origin: { provider: "telegram", chatType: "direct" } });
-      }
+    {
+      name: "deleted direct session",
+      thread: undefined,
+      key: "agent:main:telegram:direct:42001",
+      to: "telegram:42001",
+      savedThread: undefined,
     },
-  );
+    {
+      name: "bot-private topic",
+      thread: 77,
+      key: "agent:main:main:thread:42001:77",
+      to: "telegram:42001",
+      savedThread: "77",
+    },
+  ])("persists the deliverable destination for $name", async ({ thread, key, to, savedThread }) => {
+    if (thread === undefined) {
+      cfg.session = { ...cfg.session, dmScope: "per-channel-peer" };
+    }
+    const bot = await createBot(false, true, cfg, thread !== undefined);
+    if (thread === undefined) {
+      await receive(bot, commandMessage("first turn"));
+      await deleteSessionEntry({ storePath, sessionKey: key });
+    }
+    await receive(bot, {
+      ...commandMessage("remember this destination"),
+      chat,
+      message_thread_id: thread,
+    });
+    const delivery = getSessionEntry({ storePath, sessionKey: key })?.delivery;
+    expect(delivery).toMatchObject({ kind: "external", context: { channel: "telegram", to } });
+    expect(delivery?.kind === "external" ? delivery.context.threadId : null).toBe(savedThread);
+    if (thread === undefined) {
+      expect(delivery).toMatchObject({ origin: { provider: "telegram", chatType: "direct" } });
+    }
+  });
 
   it("keeps the Telegram-selected topic session through real /help initialization", async () => {
     const targetSessionKey = "agent:main:telegram-bound";
@@ -116,12 +170,13 @@ describe("Telegram recorded session destinations", () => {
     try {
       const bot = await createBot(false, true, cfg, true);
       await harness.state.writeConfig(cfg);
-      fixture.bindContext(String(chat.id), targetSessionKey);
+      bind(String(chat.id), targetSessionKey);
       for (const sessionKey of [selectedSessionKey, ...wrongSessionKeys]) {
-        expect(session(sessionKey)).toBeUndefined();
+        expect(getSessionEntry({ agentId: "main", storePath, sessionKey })).toBeUndefined();
       }
       harness.replySpy.mockImplementation(async (context, options) => {
-        expect(context).toMatchObject({ SessionKey: selectedSessionKey, CommandSource: "text" });
+        expect(context.SessionKey).toBe(selectedSessionKey);
+        expect(context.CommandSource).toBe("text");
         expect(context.CommandTargetSessionKey).toBeUndefined();
         const reply = await getReplyFromConfig(context, options, cfg);
         const replies = Array.isArray(reply) ? reply : [reply];
@@ -129,23 +184,34 @@ describe("Telegram recorded session destinations", () => {
         return reply;
       });
       const startedAt = Date.now();
-      await direct(bot, "/help", { message_thread_id: 42, is_topic_message: true });
+      await receive(bot, {
+        ...commandMessage("/help"),
+        message_thread_id: 42,
+        is_topic_message: true,
+      });
       expect(harness.replySpy).toHaveBeenCalledOnce();
-      const sends = apiCalls.mock.calls
-        .filter(([method]) => method === "sendMessage")
-        .map(([, data]) => data);
+      const sends = apiCalls.mock.calls.filter(([method]) => method === "sendMessage");
       expect(sends).toEqual([
-        expect.objectContaining({
-          chat_id: String(chat.id),
-          text: expect.stringContaining("Help"),
-          message_thread_id: 42,
-        }),
+        [
+          "sendMessage",
+          expect.objectContaining({
+            chat_id: String(chat.id),
+            text: expect.stringContaining("Help"),
+            message_thread_id: 42,
+          }),
+        ],
       ]);
-      const selected = session(selectedSessionKey);
+      const selected = getSessionEntry({
+        agentId: "main",
+        storePath,
+        sessionKey: selectedSessionKey,
+      });
+      // Inbound metadata can create a row before the resolver; only real reply
+      // initialization records the session start and interaction timestamps.
       expect(selected?.sessionStartedAt).toBeGreaterThanOrEqual(startedAt);
       expect(selected?.lastInteractionAt).toBeGreaterThanOrEqual(startedAt);
       for (const sessionKey of wrongSessionKeys) {
-        expect(session(sessionKey)).toBeUndefined();
+        expect(getSessionEntry({ agentId: "main", storePath, sessionKey })).toBeUndefined();
       }
     } finally {
       vi.stubEnv("OPENCLAW_TEST_FAST", previousFastTest);
@@ -158,17 +224,26 @@ describe("Telegram recorded session destinations", () => {
     const atlas = await createBot(false, true, cfg, false, "atlas");
     const skynet = await createBot(false, true, cfg, false, "skynet");
     for (const bot of [atlas, skynet]) {
-      await direct(bot, "hello from the linked sender", {
+      await receive(bot, {
+        ...commandMessage("hello from the linked sender"),
         chat: { ...chat, id: 999999999 },
         from: { id: 814912386, is_bot: false, first_name: "Alice" },
       });
     }
-    for (const accountId of ["atlas", "skynet"]) {
-      expectDestination(`agent:main:telegram:${accountId}:direct:alice-shared`, {
-        accountId,
-        to: "telegram:999999999",
-      });
-    }
+    expect(
+      getSessionEntry({ storePath, sessionKey: "agent:main:telegram:atlas:direct:alice-shared" })
+        ?.delivery,
+    ).toMatchObject({
+      kind: "external",
+      context: { accountId: "atlas", to: "telegram:999999999" },
+    });
+    expect(
+      getSessionEntry({ storePath, sessionKey: "agent:main:telegram:skynet:direct:alice-shared" })
+        ?.delivery,
+    ).toMatchObject({
+      kind: "external",
+      context: { accountId: "skynet", to: "telegram:999999999" },
+    });
   });
 
   it("admits plugin-bound ambient topics without replacing their channel session", async () => {
@@ -176,12 +251,12 @@ describe("Telegram recorded session destinations", () => {
       "*": { requireMention: true, requireMentionInBotThreads: true },
     };
     const pluginId = "openclaw-codex-app-server";
-    const registry = hooks.getActivePluginRegistry();
+    const registry = getActivePluginRegistry();
     if (!registry) {
       throw new Error("Expected the native Telegram fixture registry");
     }
     registry.plugins.push(
-      hooks.createPluginRecord({ id: pluginId, source: "/tmp/context-plugin/index.ts" }),
+      createPluginRecord({ id: pluginId, source: "/tmp/context-plugin/index.ts" }),
     );
     const claim = vi.fn<
       (
@@ -189,18 +264,24 @@ describe("Telegram recorded session destinations", () => {
         context: PluginHookInboundClaimContext,
       ) => PluginHookInboundClaimResult
     >(() => ({ handled: true }));
-    hooks.addTestHook({ registry, pluginId, hookName: "inbound_claim", handler: claim });
-    hooks.initializeGlobalHookRunner(registry);
+    addTestHook({ registry, pluginId, hookName: "inbound_claim", handler: claim });
+    initializeGlobalHookRunner(registry);
     const bot = await createBot(false, true, cfg);
-    fixture.bindContext("-10042001:topic:99", "plugin-binding:openclaw-codex-app-server:abc123", {
-      metadata: {
-        pluginBindingOwner: "plugin",
-        pluginId: "openclaw-codex-app-server",
-        pluginRoot: "/tmp/context-plugin",
-      },
+    bind("-10042001:topic:99", "plugin-binding:openclaw-codex-app-server:abc123", {
+      pluginBindingOwner: "plugin",
+      pluginId: "openclaw-codex-app-server",
+      pluginRoot: "/tmp/context-plugin",
     });
-    await group(bot, "ambient plugin input", {
-      reply_to_message: fixture.topicService("Plugin topic", telegramBotInfoForTest),
+    await receive(bot, {
+      ...groupCommand("ambient plugin input"),
+      reply_to_message: {
+        message_id: 99,
+        date: 1736380700,
+        chat: groupChat,
+        from: telegramBotInfoForTest,
+        forum_topic_created: { name: "Plugin topic", icon_color: 7322096 },
+        reply_to_message: undefined,
+      },
     });
     expect(claim).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ content: "ambient plugin input" }),
@@ -213,7 +294,8 @@ describe("Telegram recorded session destinations", () => {
         }),
       }),
     );
-    await group(bot, "", {
+    await receive(bot, {
+      ...groupCommand(""),
       text: undefined,
       caption: "ambient plugin media",
       photo,
@@ -224,43 +306,58 @@ describe("Telegram recorded session destinations", () => {
       expect.anything(),
     );
     expect(harness.replySpy).not.toHaveBeenCalled();
-    expectDestination("agent:main:telegram:group:-10042001:topic:99", {
-      channel: "telegram",
-      to: "telegram:-10042001:topic:99",
-      threadId: "99",
+    expect(
+      getSessionEntry({ storePath, sessionKey: "agent:main:telegram:group:-10042001:topic:99" })
+        ?.delivery,
+    ).toMatchObject({
+      kind: "external",
+      context: { channel: "telegram", to: "telegram:-10042001:topic:99", threadId: "99" },
     });
   });
 
   it("keeps ordinary bindings mention-gated and preserves their recorded destination", async () => {
     cfg.channels!.telegram!.groups = { "*": { requireMention: true } };
     const bot = await createBot(false, true, cfg);
-    fixture.bindContext("-10042001:topic:99", "agent:ops:acp:bound");
-    await fixture.seedContextSession(storePath, "agent:ops:acp:bound", {
-      sessionId: "bound-session",
-      updatedAt: 1,
-      delivery: normalizeSessionDeliveryState({
-        context: { channel: "telegram", to: "telegram:555", threadId: "7" },
-      }),
+    bind("-10042001:topic:99", "agent:ops:acp:bound");
+    await upsertSessionEntry({
+      storePath,
+      sessionKey: "agent:ops:acp:bound",
+      entry: {
+        sessionId: "bound-session",
+        updatedAt: 1,
+        delivery: normalizeSessionDeliveryState({
+          context: { channel: "telegram", to: "telegram:555", threadId: "7" },
+        }),
+      },
     });
-    await group(bot, "unmentioned ordinary binding");
+    await receive(bot, groupCommand("unmentioned ordinary binding"));
     expect(harness.replySpy).not.toHaveBeenCalled();
-    await group(bot, "@openclaw_bot hello", {
+    await receive(bot, {
+      ...groupCommand("@openclaw_bot hello"),
       entities: [{ type: "mention", offset: 0, length: 13 }],
     });
-    expect(observed()?.SessionKey).toBe("agent:ops:acp:bound");
-    expectDestination("agent:ops:acp:bound", {
-      channel: "telegram",
-      to: "telegram:555",
-      threadId: "7",
+    expect(harness.replySpy.mock.calls[0]?.[0].SessionKey).toBe("agent:ops:acp:bound");
+    expect(
+      getSessionEntry({ storePath, sessionKey: "agent:ops:acp:bound" })?.delivery,
+    ).toMatchObject({
+      kind: "external",
+      context: { channel: "telegram", to: "telegram:555", threadId: "7" },
     });
   });
 
   it("learns reply topic names and restores them after plugin-state reopen", async () => {
     const bot = await createBot(false, true, cfg);
-    await group(bot, "first topic message", {
-      reply_to_message: fixture.topicService("Deployments", undefined, 3),
+    await receive(bot, {
+      ...groupCommand("first topic message"),
+      reply_to_message: {
+        message_id: 3,
+        date: 1736380700,
+        chat: groupChat,
+        forum_topic_created: { name: "Deployments", icon_color: 0x6fb9f0 },
+        reply_to_message: undefined,
+      },
     });
-    expect(observed()).toMatchObject({
+    expect(harness.replySpy.mock.calls[0]?.[0]).toMatchObject({
       RawBody: "first topic message",
       TopicName: "Deployments",
     });
@@ -270,9 +367,9 @@ describe("Telegram recorded session destinations", () => {
     resetPluginStateStoreForTests();
     setTelegramPluginStateRuntimeForTests();
     const reopened = await createBot(false, true, cfg);
-    await group(reopened, "next message without service metadata");
+    await receive(reopened, groupCommand("next message without service metadata"));
     expect(harness.replySpy).toHaveBeenCalledTimes(2);
-    expect(observed(1)).toMatchObject({
+    expect(harness.replySpy.mock.calls[1]?.[0]).toMatchObject({
       RawBody: "next message without service metadata",
       TopicName: "Deployments",
       SessionKey: "agent:main:telegram:group:-10042001:topic:99",

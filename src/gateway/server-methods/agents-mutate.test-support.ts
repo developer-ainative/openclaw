@@ -1,13 +1,12 @@
 import type { Stats } from "node:fs";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core/expect";
-import { expect, it, type vi, type Mock } from "vitest";
+import { expect, type vi, type Mock } from "vitest";
 import type {
   AgentDeletionJournalCleanupPath,
   AgentDeletionJournalEntry,
 } from "../../state/agent-deletion-journal.js";
 import { expectObjectFields as expectRecordFields } from "../../test-utils/mock-call-assertions.js";
-import type { AgentMutationHarness } from "./agents-mutate.test.js";
 
 export { expectRecordFields };
 
@@ -101,73 +100,6 @@ export function deletionJournal(
     cleanupPaths: [],
     ...overrides,
   };
-}
-
-export function registerAgentCreationCommitTests({ mocks, call }: AgentMutationHarness) {
-  const create = (params: Record<string, unknown>) => call("agents.create", params);
-  it.each([
-    { name: "Test Agent", workspace: "/home/user/agents/test", fancy: false },
-    { name: "Test Agent", workspace: undefined, fancy: false },
-    { name: "Fancy Agent", workspace: "/tmp/ws", fancy: true },
-  ])("creates $name (workspace=$workspace)", async ({ name, workspace, fancy }) => {
-    const respond = await create({
-      name,
-      ...(workspace ? { workspace } : {}),
-      ...(fancy
-        ? { model: "sonnet-4.6", emoji: "🤖", avatar: "https://example.com/avatar.png" }
-        : {}),
-    });
-    expectRespondOk(respond, {
-      ok: true,
-      agentId: fancy ? "fancy-agent" : "test-agent",
-      name,
-      ...(fancy ? { model: "sonnet-4.6" } : {}),
-    });
-    expect(mocks.ensureAgentWorkspace).toHaveBeenCalled();
-    expect(mocks.writeConfigFile).toHaveBeenCalled();
-    expect(mocks.reviveAgentDatabases).not.toHaveBeenCalled();
-    if (!workspace) {
-      expect(mocks.resolveAgentWorkspaceDir).toHaveBeenCalledWith(expect.any(Object), "test-agent");
-      expectRespondOk(respond, { workspace: "/resolved/workspace/test-agent" });
-    }
-    if (fancy) {
-      expectRecordFields(mockCallArg(mocks.applyAgentConfig, 0, 1), {
-        model: "sonnet-4.6",
-        identity: expect.objectContaining({
-          name: "Fancy Agent",
-          emoji: "🤖",
-          avatar: "https://example.com/avatar.png",
-        }),
-      });
-      expectRecordFields(mockCallArg(mocks.rootWrite), {
-        rootDir: "/resolved/tmp/ws",
-        relativePath: "IDENTITY.md",
-        data: "# IDENTITY.md - Agent Identity\n\n- Name: Fancy Agent\n- Emoji: 🤖\n- Avatar: https://example.com/avatar.png\n",
-      });
-    }
-  });
-  it("reports committed creation when deleted database reader revival fails", async () => {
-    mocks.captureDeletedAgentDatabaseFences.mockReturnValue([
-      ["/agents/test-agent/openclaw-agent.sqlite", "test-agent"],
-    ]);
-    mocks.reviveAgentDatabases.mockRejectedValueOnce(new Error("worker acknowledgement failed"));
-    const respond = await create({ name: "Test Agent" });
-
-    expectRespondOk(respond, { ok: true, agentId: "test-agent" });
-    expect(mocks.loadConfigReturn).toMatchObject({
-      agents: { entries: { "test-agent": { name: "Test Agent" } } },
-    });
-    expect(mocks.writeConfigFile).toHaveBeenCalledExactlyOnceWith(mocks.loadConfigReturn);
-    expect(mocks.reviveAgentDatabases).toHaveBeenCalledExactlyOnceWith(["test-agent"]);
-    expect(mocks.logGatewayWarn).toHaveBeenCalledExactlyOnceWith(
-      "agent config committed; worker reader revival will reconcile at next task: worker acknowledgement failed",
-    );
-  });
-
-  it("rejects invalid params (missing name)", async () => {
-    const respond = await create({ workspace: "/tmp/ws" });
-    expectRespondErrorContaining(respond, "invalid");
-  });
 }
 
 export function expectUncalled(...callbacks: unknown[]) {

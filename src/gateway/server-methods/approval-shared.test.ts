@@ -860,7 +860,7 @@ describe("handlePendingApprovalRequest", () => {
     }
     const wait = (
       record: ExecApprovalRecord,
-      respond: ReturnType<typeof vi.fn>,
+      respond: Parameters<typeof handleApprovalWaitDecision>[0]["respond"],
       resolveTerminalReason?: () => "run-aborted",
     ) =>
       handleApprovalWaitDecision({

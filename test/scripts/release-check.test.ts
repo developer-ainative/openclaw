@@ -36,7 +36,6 @@ const workerMissing = "Worker deploy artifact dist/worker/github-exec-launcher.m
 const packing = "Packing OpenClaw package";
 const badLinker = "ERR_PNPM_BUNDLED_DEPENDENCIES_WITHOUT_HOISTED";
 const readText = (...parts: string[]) => readFileSync(join(...parts), "utf8");
-const readJson = <T>(...parts: string[]): T => JSON.parse(readText(...parts));
 function expectExit(
   result: { error?: unknown; status: number | null; stderr: string },
   status: number,
@@ -257,9 +256,10 @@ require("node:module").syncBuiltinESMExports();
     await command.lifetime.run(async () => {
       const { root, packedFiles } = createPackedTargetFixture(command);
       const runtime = { name: "fixture-runtime", version: "1.0.0" };
+      const rootManifest: { packageManager: string } = JSON.parse(readText("package.json"));
       const packageJson = JSON.stringify({
         ...packageManifest,
-        packageManager: readJson<{ packageManager: string }>("package.json").packageManager,
+        packageManager: rootManifest.packageManager,
         dependencies: { [runtime.name]: runtime.version },
         bundleDependencies: [runtime.name],
         scripts: {
@@ -267,7 +267,8 @@ require("node:module").syncBuiltinESMExports();
             "node -e \"require('node:fs').writeFileSync('compat-checked', 'yes')\"",
         },
       });
-      const changelog = "# Changelog\n\n## 2026.9.1\n\n- Preserve prepared source.\n";
+      const changelog =
+        "# Changelog\n\n## 2026.9.1\n\n- Preserve the complete prepared package source.\n";
       const inventoryUrl = pathToFileURL(resolve("scripts/lib/package-dist-inventory.ts")).href;
       writeFiles(root, {
         ...packedFiles,
@@ -440,10 +441,10 @@ require("node:module").syncBuiltinESMExports();
       ["/tmp/openclaw-gateway-client.tgz", "/tmp/openclaw-gateway-protocol.tgz"],
       false,
     );
-    const manifest = readJson<{
+    const manifest: {
       dependencies?: Record<string, string>;
       private?: boolean;
-    }>(root, "package.json");
+    } = JSON.parse(readText(root, "package.json"));
     expect(manifest).toMatchObject({ private: true });
     expect(manifest.dependencies).toEqual({
       "@openclaw/gateway-client": "file:///tmp/openclaw-gateway-client.tgz",
@@ -508,10 +509,10 @@ require("node:module").syncBuiltinESMExports();
   it("seeds packaged activation smoke with an included channel plugin", ({ command }) => {
     const homeDir = command.createTempDir("openclaw-release-check-test-");
     writeActivationConfig(homeDir);
-    const config = readJson<{
+    const config: {
       channels?: Record<string, unknown>;
       plugins?: { entries?: Record<string, unknown> };
-    }>(homeDir, ".openclaw", "openclaw.json");
+    } = JSON.parse(readText(homeDir, ".openclaw", "openclaw.json"));
 
     const pluginEntries = config.plugins?.entries;
     expect(pluginEntries).toBeDefined();
@@ -522,10 +523,8 @@ require("node:module").syncBuiltinESMExports();
     for (const channel of channels) {
       expect(pluginEntries).toHaveProperty(channel);
       expect(excluded.has(channel)).toBe(false);
-      const manifest = readJson<{ channels: string[] }>(
-        "extensions",
-        channel,
-        "openclaw.plugin.json",
+      const manifest: { channels: string[] } = JSON.parse(
+        readText("extensions", channel, "openclaw.plugin.json"),
       );
       expect(manifest.channels).toContain(channel);
       expect(artifacts).toContain(`dist/extensions/${channel}/openclaw.plugin.json`);

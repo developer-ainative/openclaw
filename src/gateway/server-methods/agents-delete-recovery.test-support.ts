@@ -1,4 +1,4 @@
-import { expect, it, vi } from "vitest";
+import { expect, it, vi, type Mock } from "vitest";
 import {
   awaitGateBeforeSettlement,
   createDeferred,
@@ -21,9 +21,54 @@ import {
   agentConfig,
   expectUncalled,
 } from "./agents-mutate.test-support.js";
-import type { AgentMutationHarness } from "./agents-mutate.test.js";
+type AgentDeleteRecoveryHarness = {
+  mocks: {
+    loadConfigReturn: Record<string, unknown>;
+    sharedAuthStoreOwnership: { location: "legacy-main" | "state-db" };
+    findAgentEntryIndex: Mock<(list?: unknown, agentId?: string) => number>;
+    readAgentDeletionJournal: Mock<() => Record<string, unknown> | undefined>;
+    listPendingAgentDeletionJournals: Mock<() => Record<string, unknown>[]>;
+    beginAgentDeletionRetire: Mock<() => void>;
+    beginAgentDeletionFinish: unknown;
+    beginAgentDeletionRollback: unknown;
+    closeOpenClawAgentDatabaseByPath: unknown;
+    resolveOpenClawAgentSqlitePath: Mock<(params?: { path?: string }) => string>;
+    resolveRegisteredAgentIdForDir: Mock<(pathname?: string) => string | undefined>;
+    isPathOwnedByAnotherRegisteredAgent: Mock<
+      (params: { agentId: string; pathname: string }) => boolean
+    >;
+    unregisterResolvedAgentDir: Mock<(params: { agentId: string; agentDir: string }) => boolean>;
+    listOpenClawRegisteredAgentDatabases: Mock<() => Array<Record<string, unknown>>>;
+    assertNoOpenClawAgentDatabaseLeases: unknown;
+    closeDeletedAgentDatabases: unknown;
+    assertAgentDeletionCurrentFinal: unknown;
+    assertAgentDeletionCurrentAsync: unknown;
+    deleteWorkspaceState: unknown;
+    movePathToTrash: unknown;
+    readSessionEntrySummariesInWorker: unknown;
+    logGatewayWarn: unknown;
+    writeConfigFile: Mock<(nextConfig?: unknown, writeOptions?: unknown) => Promise<void>>;
+    cronRemoveAgentJobsTransactional: Mock<
+      (agentId: string, commit: () => Promise<unknown>) => Promise<unknown>
+    >;
+    withAgentExecApprovalsRemoved: Mock<
+      (agentId: string, commit: () => Promise<unknown>) => Promise<unknown>
+    >;
+  };
+  makeCall: (
+    method: "agents.delete" | "agents.create",
+    params: Record<string, unknown>,
+  ) => { respond: Mock; promise: Promise<void> | void };
+  call: (
+    method: "agents.delete" | "agents.create",
+    params: Record<string, unknown>,
+  ) => Promise<Mock>;
+  resume: () => Promise<void>;
+  expectTrashedWithinParent: (pathname: string, declaredPath?: string) => void;
+  expectNotTrashed: (pathname: string) => void;
+};
 
-export function registerAgentDeleteDrainRecoveryTests(harness: AgentMutationHarness): void {
+export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecoveryHarness): void {
   const { mocks, makeCall, call, resume, expectTrashedWithinParent, expectNotTrashed } = harness;
   const remove = () => makeCall("agents.delete", { agentId: "test-agent" });
   const expectStorageUntouched = (...other: unknown[]) =>
@@ -290,7 +335,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentMutationHarn
   );
 }
 
-export function registerAgentDeleteRollbackTests(harness: AgentMutationHarness): void {
+export function registerAgentDeleteRollbackTests(harness: AgentDeleteRecoveryHarness): void {
   const { mocks, makeCall, call } = harness;
   const remove = () => makeCall("agents.delete", { agentId: "test-agent" });
   it("rolls back a fresh deletion when draining leaves it as the only configured agent", async () => {

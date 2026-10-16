@@ -79,6 +79,7 @@ vi.mock("../infra/shell-env.js", async () => {
   };
 });
 
+// mock-isolation: Simulate process output and settlement without launching host commands.
 vi.mock("../process/supervisor/index.js", async () => {
   const { takeHeldSupervisorExit, createRunExit } =
     await import("./bash-tools.exec-runtime.test-support.js");

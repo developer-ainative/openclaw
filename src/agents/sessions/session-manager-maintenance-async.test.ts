@@ -83,7 +83,7 @@ function afterWorkerCommand(type: string, after: () => void | Promise<void>) {
         }),
       controls,
     );
-  return intercept;
+  return vi.spyOn(metadataRuntime, "withSessionMetadataWorker").mockImplementation(intercept);
 }
 
 it("shares admitted immutable payloads when preparing and publishing a rewrite", async () => {
@@ -209,11 +209,7 @@ it.each(["read", "receipt"] as const)(
                 },
               };
             })
-        : vi
-            .spyOn(metadataRuntime, "withSessionMetadataWorker")
-            .mockImplementation(
-              afterWorkerCommand("session.transcript.replaceSuffix", () => manager.resetLeaf()),
-            );
+        : afterWorkerCommand("session.transcript.replaceSuffix", () => manager.resetLeaf());
     const failure = await withRestoredMocks([interception], () =>
       manager
         .removeTrailingEntriesAsync((entry) => entry.id === removed)
@@ -319,11 +315,9 @@ it("adopts only the submitted rewrite snapshot when the prepared manager changes
   await manager.appendLabelChangeAsync(sourceId, "retained label");
   const { replacementId, ...rewrite } = await prepareUserRewrite(manager);
   let laterPreparedId: string | undefined;
-  const observer = vi.spyOn(metadataRuntime, "withSessionMetadataWorker").mockImplementation(
-    afterWorkerCommand("session.transcript.rewrite", async () => {
-      laterPreparedId = await appendUser(rewrite.sessionManager, "uncommitted later edit");
-    }),
-  );
+  const observer = afterWorkerCommand("session.transcript.rewrite", async () => {
+    laterPreparedId = await appendUser(rewrite.sessionManager, "uncommitted later edit");
+  });
   await withRestoredMocks([observer], () => rewrite.commit(new Map([[sourceId, replacementId]])));
   expect(laterPreparedId).toEqual(expect.any(String));
   expect(rewrite.sessionManager.getLeafId()).toBe(laterPreparedId);

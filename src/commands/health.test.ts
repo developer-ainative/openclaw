@@ -73,16 +73,20 @@ const rpc = vi.hoisted(() => ({
 }));
 const TEST_GATEWAY_URL = "ws://127.0.0.1:18789";
 const TEST_GATEWAY_MESSAGE = `Gateway mode: local\nGateway target: ${TEST_GATEWAY_URL}`;
+// mock-isolation: Health scenarios use deterministic RPC responses, not the operator Gateway.
 vi.mock("../gateway/call.js", () => rpc);
 
+// mock-isolation: Exercise credential-error reporting without resolving operator credentials.
 vi.mock("../gateway/credentials.js", () => ({
   isGatewaySecretRefUnavailableError: isGatewaySecretRefUnavailableErrorMock,
 }));
 
+// mock-isolation: Daemon probe outcomes are fixtures; never probe the host service.
 vi.mock("../cli/daemon-cli/probe.js", () => ({
   probeGatewayStatus: probeGatewayStatusMock,
 }));
 
+// mock-isolation: Use the scenario's plugin list rather than the host plugin registry.
 vi.mock("../channels/plugins/read-only.js", () => ({
   listReadOnlyChannelPluginsForConfig: listReadOnlyChannelPluginsForConfigMock,
 }));

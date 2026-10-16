@@ -29,6 +29,7 @@ vi.mock("../config/config.js", () => ({
   captureRuntimeConfigAsyncReader: () => async () => testConfig,
 }));
 
+// mock-isolation: Auto-enable only the synthetic config selected by each message scenario.
 vi.mock("../config/plugin-auto-enable.js", () => ({ applyPluginAutoEnable }));
 
 const resolveCommandConfigWithSecrets = vi.hoisted(() =>
@@ -38,9 +39,10 @@ const resolveCommandConfigWithSecrets = vi.hoisted(() =>
       opts.autoEnable === true
         ? applyPluginAutoEnable({ config: opts.config, env: opts.env ?? process.env }).config
         : opts.config,
-    diagnostics: [],
+    diagnostics: [] as string[],
   })),
 );
+// mock-isolation: Resolve fixture SecretRefs without reading operator credentials.
 vi.mock("../cli/command-config-resolution.js", () => ({
   resolveCommandConfigWithSecrets,
 }));
@@ -438,7 +440,7 @@ describe("messageCommand", () => {
       dryRun: false,
     });
 
-    await runMessageCommand({ action });
+    await runMessageCommand({ action: "poll" });
 
     const json = jsonOutput();
     expect(json).toMatchObject({

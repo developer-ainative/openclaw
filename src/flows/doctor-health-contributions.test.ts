@@ -211,61 +211,96 @@ const mocks = vi.hoisted(() => {
   };
 });
 
-vi.mock("../config/paths.js", (load) => mockOriginal(load, "isDefaultInstallIdentity"));
-
-function mockExports(...keys: (keyof typeof mocks)[]) {
-  return Object.fromEntries(keys.map((key) => [key, mocks[key]]));
-}
-
-async function mockOriginal<T>(load: () => Promise<T>, ...keys: (keyof typeof mocks)[]) {
-  return { ...(await load()), ...mockExports(...keys) };
-}
+vi.mock("../config/paths.js", async () => {
+  const actual = await vi.importActual<typeof import("../config/paths.js")>("../config/paths.js");
+  return { ...actual, isDefaultInstallIdentity: mocks.isDefaultInstallIdentity };
+});
 
 const DOCTOR_GATEWAY_HEALTH_ID = "doctor:gateway-health";
-vi.mock("../commands/doctor/shared/release-configured-plugin-installs.js", () =>
-  mockExports("maybeRunConfiguredPluginInstallReleaseStep"),
-);
-vi.mock("../commands/doctor/shared/plugin-runtime-symlinks.js", () =>
-  mockExports("collectStalePluginRuntimeSymlinkHealthFindings"),
-);
-vi.mock("./bundled-health-checks.js", () => mockExports("registerBundledHealthChecks"));
-vi.mock("./doctor-repair-flow.js", () => mockExports("runDoctorHealthRepairs"));
-vi.mock("../config/types.secrets.js", (load) => mockOriginal(load, "resolveSecretInputRef"));
-vi.mock("../gateway/auth.js", () => mockExports("resolveGatewayAuth"));
-vi.mock("../gateway/auth-token-resolution.js", () => mockExports("resolveGatewayAuthToken"));
-vi.mock("../secrets/exec-resolution-policy.js", () => mockExports("getSkippedExecRefStaticError"));
-vi.mock("../commands/doctor-gateway-services.js", () =>
-  mockExports(
-    "maybeRepairGatewayServiceConfig",
-    "maybeScanExtraGatewayServices",
-    "maybeResolveDuelingSystemdGatewayScopes",
-  ),
-);
+
+vi.mock("../commands/doctor/shared/release-configured-plugin-installs.js", () => ({
+  maybeRunConfiguredPluginInstallReleaseStep: mocks.maybeRunConfiguredPluginInstallReleaseStep,
+}));
+
+vi.mock("../commands/doctor/shared/plugin-runtime-symlinks.js", () => ({
+  collectStalePluginRuntimeSymlinkHealthFindings:
+    mocks.collectStalePluginRuntimeSymlinkHealthFindings,
+}));
+
+vi.mock("./bundled-health-checks.js", () => ({
+  registerBundledHealthChecks: mocks.registerBundledHealthChecks,
+}));
+
+vi.mock("./doctor-repair-flow.js", () => ({
+  runDoctorHealthRepairs: mocks.runDoctorHealthRepairs,
+}));
+
+vi.mock("../config/types.secrets.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../config/types.secrets.js")>();
+  return {
+    ...actual,
+    resolveSecretInputRef: mocks.resolveSecretInputRef,
+  };
+});
+
+vi.mock("../gateway/auth.js", () => ({
+  resolveGatewayAuth: mocks.resolveGatewayAuth,
+}));
+
+vi.mock("../gateway/auth-token-resolution.js", () => ({
+  resolveGatewayAuthToken: mocks.resolveGatewayAuthToken,
+}));
+
+vi.mock("../secrets/exec-resolution-policy.js", () => ({
+  getSkippedExecRefStaticError: mocks.getSkippedExecRefStaticError,
+}));
+
+vi.mock("../commands/doctor-gateway-services.js", () => ({
+  maybeRepairGatewayServiceConfig: mocks.maybeRepairGatewayServiceConfig,
+  maybeScanExtraGatewayServices: mocks.maybeScanExtraGatewayServices,
+  maybeResolveDuelingSystemdGatewayScopes: mocks.maybeResolveDuelingSystemdGatewayScopes,
+}));
+
 vi.mock("../commands/doctor-auth-flat-profiles.js", () => ({
   maybeRepairLegacyAuthProfileStores: ({
     profileIdMap,
   }: {
     profileIdMap: Map<string, string>;
-  }) => ({ changes: [], warnings: [], profileIdMap }),
+  }) => ({
+    changes: [],
+    warnings: [],
+    profileIdMap,
+  }),
   collectOpenAICodexAuthProfileStoreIdMap: mocks.collectOpenAICodexAuthProfileStoreIdMap,
   maybeMigrateAuthProfileJsonStoresToSqlite: mocks.maybeMigrateAuthProfileJsonStoresToSqlite,
   maybeRepairOpenAICodexAuthConfig: mocks.maybeRepairOpenAICodexAuthConfig,
 }));
-vi.mock("../commands/doctor-plugin-model-catalog.js", () =>
-  mockExports("maybeMigrateLegacyPluginModelCatalogs"),
-);
-vi.mock("../commands/doctor-model-catalog-credentials.js", () =>
-  mockExports("maybeMigrateModelCatalogCredentials"),
-);
-vi.mock("../commands/doctor-gateway-daemon-flow.js", () => mockExports("maybeRepairGatewayDaemon"));
-vi.mock("../infra/container-environment.js", () => mockExports("isContainerEnvironment"));
+
+vi.mock("../commands/doctor-plugin-model-catalog.js", () => ({
+  maybeMigrateLegacyPluginModelCatalogs: mocks.maybeMigrateLegacyPluginModelCatalogs,
+}));
+
+vi.mock("../commands/doctor-model-catalog-credentials.js", () => ({
+  maybeMigrateModelCatalogCredentials: mocks.maybeMigrateModelCatalogCredentials,
+}));
+
+vi.mock("../commands/doctor-gateway-daemon-flow.js", () => ({
+  maybeRepairGatewayDaemon: mocks.maybeRepairGatewayDaemon,
+}));
+
+vi.mock("../infra/container-environment.js", () => ({
+  isContainerEnvironment: mocks.isContainerEnvironment,
+}));
+
 vi.mock("../daemon/service.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../daemon/service.js")>();
   return {
     ...actual,
     readGatewayServiceState: async () => ({
       installed: true,
-      loadState: { status: (await mocks.gatewayServiceIsLoaded()) ? "loaded" : "not-loaded" },
+      loadState: {
+        status: (await mocks.gatewayServiceIsLoaded()) ? "loaded" : "not-loaded",
+      },
       running: false,
       env: {},
       command: null,
@@ -274,58 +309,81 @@ vi.mock("../daemon/service.js", async (importOriginal) => {
     resolveGatewayService: mocks.resolveGatewayService,
   };
 });
-vi.mock("../daemon/systemd.js", (load) =>
-  mockOriginal(
-    load,
-    "findInstalledSystemdGatewayScope",
-    "isSystemdUserServiceAvailable",
-    "readSystemdUserLingerStatus",
-    "resolveSystemdUserServiceAccount",
-  ),
-);
-vi.mock("../commands/doctor-auth-legacy-oauth.js", () =>
-  mockExports("maybeRepairLegacyOAuthProfileIds"),
-);
-vi.mock("../infra/state-migrations.doctor.js", () =>
-  mockExports("detectLegacyStateMigrations", "runLegacyStateMigrations"),
-);
-vi.mock("../infra/exec-approvals-generated-migration.js", () =>
-  mockExports("repairObsoleteGeneratedExecApprovals"),
-);
-vi.mock("../commands/doctor-plugin-manifests.js", () =>
-  mockExports(
-    "collectLegacyPluginManifestContractMigrations",
-    "legacyPluginManifestContractMigrationToHealthFinding",
-    "maybeRepairLegacyPluginManifestContracts",
-  ),
-);
-vi.mock("../agents/auth-profiles.js", (load) =>
-  mockOriginal(load, "removeAuthProfilesAcrossOwnerStores"),
-);
-vi.mock("../commands/doctor-auth.js", () =>
-  mockExports(
-    "collectAuthProfileHealthFindings",
-    "noteAuthProfileHealth",
-    "noteCopilotAmbientToken",
-    "noteLegacyCodexProviderOverride",
-    "noteSharedAuthStoreStatus",
-  ),
-);
+
+vi.mock("../daemon/systemd.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../daemon/systemd.js")>();
+  return {
+    ...actual,
+    findInstalledSystemdGatewayScope: mocks.findInstalledSystemdGatewayScope,
+    isSystemdUserServiceAvailable: mocks.isSystemdUserServiceAvailable,
+    readSystemdUserLingerStatus: mocks.readSystemdUserLingerStatus,
+    resolveSystemdUserServiceAccount: mocks.resolveSystemdUserServiceAccount,
+  };
+});
+
+vi.mock("../commands/doctor-auth-legacy-oauth.js", () => ({
+  maybeRepairLegacyOAuthProfileIds: mocks.maybeRepairLegacyOAuthProfileIds,
+}));
+
+vi.mock("../infra/state-migrations.doctor.js", () => ({
+  detectLegacyStateMigrations: mocks.detectLegacyStateMigrations,
+  runLegacyStateMigrations: mocks.runLegacyStateMigrations,
+}));
+
+vi.mock("../infra/exec-approvals-generated-migration.js", () => ({
+  repairObsoleteGeneratedExecApprovals: mocks.repairObsoleteGeneratedExecApprovals,
+}));
+
+vi.mock("../commands/doctor-plugin-manifests.js", () => ({
+  collectLegacyPluginManifestContractMigrations:
+    mocks.collectLegacyPluginManifestContractMigrations,
+  legacyPluginManifestContractMigrationToHealthFinding:
+    mocks.legacyPluginManifestContractMigrationToHealthFinding,
+  maybeRepairLegacyPluginManifestContracts: mocks.maybeRepairLegacyPluginManifestContracts,
+}));
+
+vi.mock("../agents/auth-profiles.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../agents/auth-profiles.js")>()),
+  removeAuthProfilesAcrossOwnerStores: mocks.removeAuthProfilesAcrossOwnerStores,
+}));
+
+vi.mock("../commands/doctor-auth.js", () => ({
+  collectAuthProfileHealthFindings: mocks.collectAuthProfileHealthFindings,
+  noteAuthProfileHealth: mocks.noteAuthProfileHealth,
+  noteCopilotAmbientToken: mocks.noteCopilotAmbientToken,
+  noteLegacyCodexProviderOverride: mocks.noteLegacyCodexProviderOverride,
+  noteSharedAuthStoreStatus: mocks.noteSharedAuthStoreStatus,
+}));
+
 vi.mock("../commands/doctor-memory-recall.js", () => ({
   maybeRepairMemoryRecallHealth: vi.fn().mockResolvedValue(undefined),
   noteMemoryRecallHealth: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("../commands/doctor-memory-search.js", () =>
-  mockExports("noteMemorySearchHealth", "collectMemorySearchHealthFindings"),
-);
-vi.mock("../commands/doctor-web-fetch-proxy.js", () => mockExports("noteWebFetchProxyDiagnostic"));
-vi.mock("../gateway/call.js", () => mockExports("buildGatewayConnectionDetails", "callGateway"));
-vi.mock("../commands/doctor-platform-notes.js", (load) =>
-  mockOriginal(load, "noteMacGatewayPlatformWarnings", "noteMacDisabledGatewayLaunchAgent"),
-);
+
+vi.mock("../commands/doctor-memory-search.js", () => ({
+  noteMemorySearchHealth: mocks.noteMemorySearchHealth,
+  collectMemorySearchHealthFindings: mocks.collectMemorySearchHealthFindings,
+}));
+
+vi.mock("../commands/doctor-web-fetch-proxy.js", () => ({
+  noteWebFetchProxyDiagnostic: mocks.noteWebFetchProxyDiagnostic,
+}));
+
+vi.mock("../gateway/call.js", () => ({
+  buildGatewayConnectionDetails: mocks.buildGatewayConnectionDetails,
+  callGateway: mocks.callGateway,
+}));
+
+vi.mock("../commands/doctor-platform-notes.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../commands/doctor-platform-notes.js")>()),
+  noteMacGatewayPlatformWarnings: mocks.noteMacGatewayPlatformWarnings,
+  noteMacDisabledGatewayLaunchAgent: mocks.noteMacDisabledGatewayLaunchAgent,
+}));
+
 vi.mock("../commands/doctor-foreign-launchd-jobs.js", () => ({
   noteMacForeignLaunchdJobs: vi.fn().mockResolvedValue(undefined),
 }));
+
 vi.mock("../gateway/credentials-secret-inputs.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../gateway/credentials-secret-inputs.js")>();
   return {
@@ -338,6 +396,7 @@ vi.mock("../gateway/credentials-secret-inputs.js", async (importOriginal) => {
         : actual.gatewaySecretInputPathCanWin(...args),
   };
 });
+
 vi.mock("../gateway/secret-input-paths.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../gateway/secret-input-paths.js")>();
   return {
@@ -350,48 +409,60 @@ vi.mock("../gateway/secret-input-paths.js", async (importOriginal) => {
         : actual.readGatewaySecretInputValue(...args),
   };
 });
-vi.mock("../commands/doctor-gateway-health.js", () =>
-  mockExports("checkGatewayHealth", "probeGatewayMemoryStatus"),
-);
-vi.mock("../commands/doctor-browser.js", () =>
-  mockExports("noteChromeMcpBrowserReadiness", "maybeRepairOwnedChromeExtensionNativeHosts"),
-);
-vi.mock("../agents/agent-scope.js", () =>
-  mockExports(
-    "listAgentIds",
-    "listAgentEntries",
-    "tryResolveSoleAgentId",
-    "resolveAgentWorkspaceDir",
-    "tryResolveConfiguredAgentWorkspaceDir",
-    "tryResolveSystemAgentWorkspaceDir",
-    "resolveDefaultAgentId",
-    "resolveAgentContextLimits",
-  ),
-);
-vi.mock("../../packages/terminal-core/src/note.js", () => mockExports("note"));
-vi.mock("../agents/model-catalog.js", () => mockExports("findModelCatalogEntry"));
+
+vi.mock("../commands/doctor-gateway-health.js", () => ({
+  checkGatewayHealth: mocks.checkGatewayHealth,
+  probeGatewayMemoryStatus: mocks.probeGatewayMemoryStatus,
+}));
+
+vi.mock("../commands/doctor-browser.js", () => ({
+  noteChromeMcpBrowserReadiness: mocks.noteChromeMcpBrowserReadiness,
+  maybeRepairOwnedChromeExtensionNativeHosts: mocks.maybeRepairOwnedChromeExtensionNativeHosts,
+}));
+
+vi.mock("../agents/agent-scope.js", () => ({
+  listAgentIds: mocks.listAgentIds,
+  listAgentEntries: mocks.listAgentEntries,
+  tryResolveSoleAgentId: mocks.tryResolveSoleAgentId,
+  resolveAgentWorkspaceDir: mocks.resolveAgentWorkspaceDir,
+  tryResolveConfiguredAgentWorkspaceDir: mocks.tryResolveConfiguredAgentWorkspaceDir,
+  tryResolveSystemAgentWorkspaceDir: mocks.tryResolveSystemAgentWorkspaceDir,
+  resolveDefaultAgentId: mocks.resolveDefaultAgentId,
+  resolveAgentContextLimits: mocks.resolveAgentContextLimits,
+}));
+
+vi.mock("../../packages/terminal-core/src/note.js", () => ({
+  note: mocks.note,
+}));
+
+vi.mock("../agents/model-catalog.js", () => ({
+  findModelCatalogEntry: mocks.findModelCatalogEntry,
+}));
+
 vi.mock("../agents/prepared-model-catalog.js", () => ({
   loadProviderScopedThinkingCatalog: vi.fn(async () => []),
   readPreparedModelCatalog: mocks.loadModelCatalog,
 }));
-vi.mock("../agents/model-selection.js", () =>
-  mockExports(
-    "getModelRefStatus",
-    "resolveConfiguredModelRef",
-    "resolveDefaultModelForAgent",
-    "resolveHooksGmailModel",
-    "modelKey",
-  ),
-);
+
+vi.mock("../agents/model-selection.js", () => ({
+  getModelRefStatus: mocks.getModelRefStatus,
+  resolveConfiguredModelRef: mocks.resolveConfiguredModelRef,
+  resolveDefaultModelForAgent: mocks.resolveDefaultModelForAgent,
+  resolveHooksGmailModel: mocks.resolveHooksGmailModel,
+  modelKey: mocks.modelKey,
+}));
+
 vi.mock("../version.js", async () => ({
   ...(await vi.importActual<typeof import("../version.js")>("../version.js")),
   VERSION: "2026.5.2-test",
   resolveCompatibilityHostVersion: vi.fn(() => "2026.5.2-test"),
   resolveIsNixMode: vi.fn(() => false),
 }));
+
 vi.mock("../commands/doctor/shared/config-flow-steps.js", () => ({
   restoreDoctorConfigEnvRefs: (cfg: OpenClawConfig) => cfg,
 }));
+
 vi.mock("../config/config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config/config.js")>()),
   CONFIG_PATH: "/tmp/fake-openclaw.json",
@@ -413,66 +484,100 @@ vi.mock("../config/config.js", async (importOriginal) => ({
   },
   readConfigFileSnapshot: mocks.readConfigFileSnapshot,
 }));
+
 vi.mock("../infra/update-check-package-target.js", () => ({
   fetchNpmPackageTargetStatus: vi.fn(),
 }));
-vi.mock("../cli/daemon-cli/status.gather.js", () => mockExports("gatherDaemonStatus"));
-vi.mock("../commands/doctor-workspace-status.js", () =>
-  mockExports("noteWorkspaceStatus", "collectWorkspaceStatusHealthFindings"),
-);
+
+vi.mock("../cli/daemon-cli/status.gather.js", () => ({
+  gatherDaemonStatus: mocks.gatherDaemonStatus,
+}));
+
+vi.mock("../commands/doctor-workspace-status.js", () => ({
+  noteWorkspaceStatus: mocks.noteWorkspaceStatus,
+  collectWorkspaceStatusHealthFindings: mocks.collectWorkspaceStatusHealthFindings,
+}));
+
 vi.mock("../commands/doctor-workspace.js", () => ({
   collectWorkspaceBackupTip: mocks.collectWorkspaceBackupTip,
   MEMORY_SYSTEM_PROMPT: "Enable memory system for better recall.",
   shouldSuggestMemorySystem: mocks.shouldSuggestMemorySystem,
 }));
+
 vi.mock("../commands/doctor-disk-space.js", () => ({
   noteDiskSpace: vi.fn(),
   collectDiskSpaceHealthFindings: mocks.collectDiskSpaceHealthFindings,
 }));
-vi.mock("../commands/doctor-heartbeat-cadence-migration.js", () =>
-  mockExports("collectHeartbeatCadenceMigrationFindings", "maybeMigrateHeartbeatCadenceToCron"),
-);
-vi.mock("../commands/doctor-heartbeat-scratch-migration.js", () =>
-  mockExports("collectHeartbeatScratchMigrationFindings", "maybeMigrateHeartbeatFilesToScratch"),
-);
-vi.mock("../commands/doctor-tools-md-migration.js", () =>
-  mockExports("collectToolsMdMigrationFindings", "maybeMigrateToolsMd"),
-);
-vi.mock("../commands/doctor-heartbeat-task-migration.js", () =>
-  mockExports("collectHeartbeatTaskMigrationFindings", "maybeMigrateHeartbeatTasksToCron"),
-);
-vi.mock("../commands/doctor-whatsapp-responsiveness.js", () =>
-  mockExports("collectWhatsappResponsivenessHealthFindings", "noteWhatsappResponsivenessHealth"),
-);
+
+vi.mock("../commands/doctor-heartbeat-cadence-migration.js", () => ({
+  collectHeartbeatCadenceMigrationFindings: mocks.collectHeartbeatCadenceMigrationFindings,
+  maybeMigrateHeartbeatCadenceToCron: mocks.maybeMigrateHeartbeatCadenceToCron,
+}));
+
+vi.mock("../commands/doctor-heartbeat-scratch-migration.js", () => ({
+  collectHeartbeatScratchMigrationFindings: mocks.collectHeartbeatScratchMigrationFindings,
+  maybeMigrateHeartbeatFilesToScratch: mocks.maybeMigrateHeartbeatFilesToScratch,
+}));
+
+vi.mock("../commands/doctor-tools-md-migration.js", () => ({
+  collectToolsMdMigrationFindings: mocks.collectToolsMdMigrationFindings,
+  maybeMigrateToolsMd: mocks.maybeMigrateToolsMd,
+}));
+
+vi.mock("../commands/doctor-heartbeat-task-migration.js", () => ({
+  collectHeartbeatTaskMigrationFindings: mocks.collectHeartbeatTaskMigrationFindings,
+  maybeMigrateHeartbeatTasksToCron: mocks.maybeMigrateHeartbeatTasksToCron,
+}));
+
+vi.mock("../commands/doctor-whatsapp-responsiveness.js", () => ({
+  collectWhatsappResponsivenessHealthFindings: mocks.collectWhatsappResponsivenessHealthFindings,
+  noteWhatsappResponsivenessHealth: mocks.noteWhatsappResponsivenessHealth,
+}));
+
 vi.mock("../commands/doctor-device-pairing.js", () => ({
   collectDevicePairingHealthFindings: mocks.collectDevicePairingHealthFindings,
   noteDevicePairingHealth: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("../commands/doctor/cron/index.js", () =>
-  mockExports(
-    "collectLegacyCronStoreHealthFindings",
-    "collectLegacyWhatsAppCrontabHealthWarning",
-    "maybeRepairLegacyCronStore",
-    "noteLegacyWhatsAppCrontabHealthCheck",
-  ),
-);
-vi.mock("../commands/doctor/cron/legacy-repair.js", () =>
-  mockExports("repairCronCodexModelRefsAfterConfigWrite"),
-);
-vi.mock("../commands/doctor/shared/channel-plugin-blockers.js", () =>
-  mockExports("scanConfiguredChannelPluginBlockers", "channelPluginBlockerHitToHealthFinding"),
-);
-vi.mock("../channels/plugins/package-state-probes.js", (load) =>
-  mockOriginal(load, "collectBundledChannelPackageStateLoadFailures"),
-);
-vi.mock("./doctor-startup-channel-maintenance.js", (load) =>
-  mockOriginal(load, "collectChannelPreviewWarningHealthFindings"),
-);
+
+vi.mock("../commands/doctor/cron/index.js", () => ({
+  collectLegacyCronStoreHealthFindings: mocks.collectLegacyCronStoreHealthFindings,
+  collectLegacyWhatsAppCrontabHealthWarning: mocks.collectLegacyWhatsAppCrontabHealthWarning,
+  maybeRepairLegacyCronStore: mocks.maybeRepairLegacyCronStore,
+  noteLegacyWhatsAppCrontabHealthCheck: mocks.noteLegacyWhatsAppCrontabHealthCheck,
+}));
+
+vi.mock("../commands/doctor/cron/legacy-repair.js", () => ({
+  repairCronCodexModelRefsAfterConfigWrite: mocks.repairCronCodexModelRefsAfterConfigWrite,
+}));
+
+vi.mock("../commands/doctor/shared/channel-plugin-blockers.js", () => ({
+  scanConfiguredChannelPluginBlockers: mocks.scanConfiguredChannelPluginBlockers,
+  channelPluginBlockerHitToHealthFinding: mocks.channelPluginBlockerHitToHealthFinding,
+}));
+
+vi.mock("../channels/plugins/package-state-probes.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../channels/plugins/package-state-probes.js")>()),
+  collectBundledChannelPackageStateLoadFailures:
+    mocks.collectBundledChannelPackageStateLoadFailures,
+}));
+
+vi.mock("./doctor-startup-channel-maintenance.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./doctor-startup-channel-maintenance.js")>();
+  return {
+    ...actual,
+    collectChannelPreviewWarningHealthFindings: mocks.collectChannelPreviewWarningHealthFindings,
+  };
+});
+
 vi.mock("../commands/onboard-helpers.js", () => ({
   applyWizardMetadata: mocks.applyWizardMetadata,
   randomToken: vi.fn(() => "generated-gateway-token"),
 }));
-vi.mock("../config/logging.js", () => mockExports("logConfigUpdated"));
+
+vi.mock("../config/logging.js", () => ({
+  logConfigUpdated: mocks.logConfigUpdated,
+}));
+
 vi.mock("../utils.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../utils.js")>();
   return {
@@ -483,7 +588,10 @@ vi.mock("../utils.js", async (importOriginal) => {
     shortenHomePath: mocks.shortenHomePath,
   };
 });
-vi.mock("../cli/command-format.js", () => mockExports("formatCliCommand"));
+
+vi.mock("../cli/command-format.js", () => ({
+  formatCliCommand: mocks.formatCliCommand,
+}));
 
 function expectNote(text: string, title: string) {
   expect(mocks.note).toHaveBeenCalledWith(expect.stringContaining(text), title);

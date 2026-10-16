@@ -24,6 +24,7 @@ const { resolveRunSession } = vi.hoisted(() => ({
   resolveRunSession: vi.fn(),
 }));
 
+// mock-isolation: Run selectors use the fixture scope, not the operator's live session catalog.
 vi.mock("../server-session-key.js", () => ({ resolveSessionForRun: resolveRunSession }));
 
 async function sessionFixture(

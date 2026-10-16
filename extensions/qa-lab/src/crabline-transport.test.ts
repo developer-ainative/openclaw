@@ -1,6 +1,7 @@
 // Qa Lab tests cover Crabline channel-driver integration with local provider servers.
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
 import { withTempDir } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it } from "vitest";
 import { createQaBusState } from "./bus-state.js";

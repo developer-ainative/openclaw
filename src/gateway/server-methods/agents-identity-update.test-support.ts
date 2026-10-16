@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
 import { registerAgentWorkspaceAccess } from "../../agents/workspace-access.js";
 import { FsSafeError, type ReadResult } from "../../infra/fs-safe.js";
 import {
@@ -10,9 +10,28 @@ import {
   expectUncalled,
   mockCallArg,
 } from "./agents-mutate.test-support.js";
-import type { AgentMutationHarness } from "./agents-mutate.test.js";
+type IdentityUpdateHarness = {
+  mocks: {
+    loadConfigReturn: Record<string, unknown>;
+    applyAgentConfig: Mock<(cfg: unknown, opts: unknown) => unknown>;
+    ensureAgentWorkspace: Mock<
+      (params?: { dir?: string }) => Promise<{ dir: string; identityPathCreated: boolean }>
+    >;
+    rootRead: Mock<(params: { rootDir: string; relativePath: string }) => Promise<ReadResult>>;
+    rootWrite: Mock<(params?: unknown) => Promise<void>>;
+    writeConfigFile: Mock<(nextConfig?: unknown, writeOptions?: unknown) => Promise<void>>;
+    fsMkdir: unknown;
+  };
+  makeCall: (
+    method: "agents.update",
+    params: Record<string, unknown>,
+  ) => { respond: Mock; promise: Promise<void> | void };
+  call: (method: "agents.update", params: Record<string, unknown>) => Promise<Mock>;
+  makeFileStat: () => import("node:fs").Stats;
+  createEnoentError: () => Error;
+};
 
-export function registerAgentIdentityUpdateTests(harness: AgentMutationHarness): void {
+export function registerAgentIdentityUpdateTests(harness: IdentityUpdateHarness): void {
   const { mocks, makeCall, call, makeFileStat, createEnoentError } = harness;
   const update = (params: Record<string, unknown>) =>
     call("agents.update", { agentId: "test-agent", ...params });

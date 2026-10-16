@@ -53,7 +53,6 @@ it.each([
       to: "ready",
       patch: {
         ...support.readyPatch(environmentId, { ...build, installKind: "bundle" }),
-        leaseId: "lease-fixture",
         nodeDeviceId: "node-fixture",
         sharedHost: false,
         sshEndpoint: null,

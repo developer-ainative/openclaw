@@ -22,9 +22,9 @@ const suite = createControlUiE2eSuite({
 
 const prompt = "tool search qa check target=openclaw openclaw_fixture=logging-level-info";
 type ProofWindow = Window & {
-  __OPENCLAW_APPROVAL_UI_SEQUENCE__: string[];
-  __OPENCLAW_APPROVAL_FALLBACK_OBSERVED__: boolean;
-  __OPENCLAW_NATIVE_CONTROL_AUTH__: { gatewayUrl: string; token: string };
+  __OPENCLAW_APPROVAL_UI_SEQUENCE__?: string[];
+  __OPENCLAW_APPROVAL_FALLBACK_OBSERVED__?: boolean;
+  __OPENCLAW_NATIVE_CONTROL_AUTH__?: { gatewayUrl: string; token: string };
 };
 const fallbackMarkers = [
   "OpenClaw change pending approval",
@@ -264,7 +264,11 @@ suite.define(() => {
           const observer = new MutationObserver(() => {
             if (!card.isConnected) {
               observer.disconnect();
-              proofWindow["__OPENCLAW_APPROVAL_UI_SEQUENCE__"].push("approval.card.removed");
+              const sequence = proofWindow["__OPENCLAW_APPROVAL_UI_SEQUENCE__"];
+              if (!sequence) {
+                throw new Error("Approval proof sequence was not initialized");
+              }
+              sequence.push("approval.card.removed");
             }
           });
           observer.observe(document.body, { childList: true, subtree: true });

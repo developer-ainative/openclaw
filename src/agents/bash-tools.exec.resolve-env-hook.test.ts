@@ -39,15 +39,19 @@ vi.mock("../plugins/hook-runner-global.js", () => ({
   getGlobalHookRunnerRegistry: () => null,
 }));
 
+// mock-isolation: Do not read the host login shell while assembling synthetic environments.
 vi.mock("../infra/shell-env.js", async () =>
   (await import("./bash-tools.exec-env.test-support.js")).shellEnvironmentMock(),
 );
+// mock-isolation: Capture Gateway execution parameters without running host commands.
 vi.mock("./bash-tools.exec-host-gateway.js", async () =>
   (await import("./bash-tools.exec-env.test-support.js")).gatewayEnvironmentMock(mocks),
 );
+// mock-isolation: Capture node execution parameters without contacting a node.
 vi.mock("./bash-tools.exec-host-node.js", async () =>
   (await import("./bash-tools.exec-env.test-support.js")).nodeEnvironmentMock(mocks),
 );
+// mock-isolation: Record spawn environments without launching real subprocesses.
 vi.mock("../process/supervisor/index.js", async () =>
   (await import("./bash-tools.exec-env.test-support.js")).supervisorEnvironmentMock(mocks),
 );

@@ -330,26 +330,21 @@ describe("resolveVapidKeys", () => {
   });
 
   it("treats blank environment values as unset", async () => {
-    const envSnapshot = captureEnv([
+    for (const name of [
       "OPENCLAW_VAPID_PUBLIC_KEY",
       "OPENCLAW_VAPID_PRIVATE_KEY",
       "OPENCLAW_VAPID_SUBJECT",
-    ]);
-    setTestEnvValue("OPENCLAW_VAPID_PUBLIC_KEY", "   ");
-    setTestEnvValue("OPENCLAW_VAPID_PRIVATE_KEY", "   ");
-    setTestEnvValue("OPENCLAW_VAPID_SUBJECT", "   ");
-    try {
-      const keys = await resolveVapidKeys(tmpDir);
-      expect(keys).toEqual({
-        publicKey: "test-public-key-base64url",
-        privateKey: "test-private-key-base64url",
-        subject: "https://openclaw.ai",
-      });
-      expect(await readPersistedVapidKeyPair(tmpDir)).toEqual(keys);
-      expect(vi.mocked(webPush.generateVAPIDKeys)).toHaveBeenCalledTimes(1);
-    } finally {
-      envSnapshot.restore();
+    ]) {
+      vi.stubEnv(name, "   ");
     }
+    const keys = await resolveVapidKeys(tmpDir);
+    expect(keys).toEqual({
+      publicKey: "test-public-key-base64url",
+      privateKey: "test-private-key-base64url",
+      subject: "https://openclaw.ai",
+    });
+    expect(await readPersistedVapidKeyPair(tmpDir)).toEqual(keys);
+    expect(vi.mocked(webPush.generateVAPIDKeys)).toHaveBeenCalledTimes(1);
   });
 
   it("applies the current subject to a persisted identity", async () => {

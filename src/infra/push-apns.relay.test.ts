@@ -274,7 +274,7 @@ describe("push-apns.relay", () => {
       const fetchMock = vi.fn().mockResolvedValue(new Response("not-json-at-all", { status: 202 }));
       vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
 
-      await expect(sendApnsRelayPush(createRelayPushParams())).resolves.toEqual({
+      await expect(sendPush()).resolves.toEqual({
         ok: true,
         status: 202,
         apnsId: undefined,
@@ -298,7 +298,7 @@ describe("push-apns.relay", () => {
       );
       vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
 
-      await expect(sendApnsRelayPush(createRelayPushParams())).resolves.toEqual({
+      await expect(sendPush()).resolves.toEqual({
         ok: false,
         status: 410,
         apnsId: "relay-apns-id",
@@ -316,7 +316,7 @@ describe("push-apns.relay", () => {
         );
       vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
 
-      await expect(sendApnsRelayPush(createRelayPushParams())).resolves.toEqual({
+      await expect(sendPush()).resolves.toEqual({
         ok: false,
         status: 410,
         apnsId: undefined,
@@ -363,7 +363,7 @@ describe("push-apns.relay", () => {
       );
       vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
 
-      await expect(sendApnsRelayPush(createRelayPushParams())).resolves.toEqual({
+      await expect(sendPush()).resolves.toEqual({
         ok: true,
         status: 200,
         apnsId: "big-but-valid",

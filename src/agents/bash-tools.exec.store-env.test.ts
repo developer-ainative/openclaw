@@ -41,6 +41,7 @@ vi.mock("../plugins/hook-runner-global.js", () => ({
   getGlobalHookRunnerRegistry: () => null,
 }));
 
+// mock-isolation: Record synthetic proxy bindings without starting a credential-bearing proxy.
 vi.mock("../secrets/egress-proxy/registry.js", () => ({
   isSecretEgressProxyActive: () => mocks.egressActive,
   registerSecretEgressProxyProcess: (bindings: unknown) => {
@@ -52,15 +53,19 @@ vi.mock("../secrets/egress-proxy/registry.js", () => ({
   },
 }));
 
+// mock-isolation: Keep the host login shell out of secret-store environment fixtures.
 vi.mock("../infra/shell-env.js", async () =>
   (await import("./bash-tools.exec-env.test-support.js")).shellEnvironmentMock(),
 );
+// mock-isolation: Capture Gateway execution parameters without running host commands.
 vi.mock("./bash-tools.exec-host-gateway.js", async () =>
   (await import("./bash-tools.exec-env.test-support.js")).gatewayEnvironmentMock(mocks),
 );
+// mock-isolation: Capture node execution parameters without contacting a node.
 vi.mock("./bash-tools.exec-host-node.js", async () =>
   (await import("./bash-tools.exec-env.test-support.js")).nodeEnvironmentMock(mocks),
 );
+// mock-isolation: Record secret-bearing spawn inputs without launching subprocesses.
 vi.mock("../process/supervisor/index.js", async () =>
   (await import("./bash-tools.exec-env.test-support.js")).supervisorEnvironmentMock(mocks),
 );
