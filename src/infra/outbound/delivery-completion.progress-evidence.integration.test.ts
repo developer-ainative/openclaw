@@ -1,5 +1,5 @@
 import path from "node:path";
-import { assert, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it, vi } from "vitest";
 import { persistPendingFinalDeliveryMarker } from "../../agents/pending-final-delivery-marker.js";
 import { capturePendingFinalRecoverySource } from "../../agents/pending-final-recovery-source.js";
 import { resolvePendingFinalDeliveryCompletion } from "../../auto-reply/reply/pending-final-delivery.js";
@@ -8,8 +8,7 @@ import type { ChannelMessageSendResult } from "../../channels/message/types.js";
 import type { ChannelOutboundContext } from "../../channels/plugins/outbound.types.js";
 import { getRestartRecoveryTerminalDeliveryEvidence } from "../../config/sessions/restart-recovery-state.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
-import { createEmptyPluginRegistry } from "../../plugins/registry.js";
-import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createOutboundTestPlugin, createTestRegistry } from "../../test-utils/channel-plugins.js";
 import type { OutboundDeliveryResult } from "./deliver-types.js";
 import { matrixOutboundForQueueTest } from "./deliver.queue-integration.test-support.js";
@@ -17,73 +16,63 @@ import { recoverPendingDeliveries } from "./delivery-queue-recovery.js";
 import { enqueueDeliveryOnce } from "./delivery-queue-storage.js";
 import {
   createRecoveryLog,
-  installDeliveryQueueTmpDirHooks,
+  installDeliveryCompletionHooks,
   loadPendingDeliveries,
 } from "./delivery-queue.test-helpers.js";
 
-let deliverOutboundPayloads: typeof import("./deliver.js").deliverOutboundPayloads;
-
-function receipt(): ChannelMessageSendResult & { messageId: string } {
+function receipt(
+  target?: string,
+  threadId?: string,
+): ChannelMessageSendResult & { messageId: string } {
   return {
     messageId: "m",
+    ...(target ? { target: { kind: "room", id: target } } : {}),
     receipt: {
       platformMessageIds: ["m"],
       parts: [{ platformMessageId: "m", kind: "text", index: 0 }],
       sentAt: 1,
+      ...(threadId ? { threadId } : {}),
     },
   };
 }
 
 describe("final receipt reported progress evidence", () => {
-  const fixtures = installDeliveryQueueTmpDirHooks();
-  let tmpDir: string;
-  beforeAll(async () => {
-    ({ deliverOutboundPayloads } = await import("./deliver.js"));
-  });
-  beforeEach(() => {
-    tmpDir = fixtures.tmpDir();
-    vi.stubEnv("OPENCLAW_STATE_DIR", tmpDir);
-  });
-  afterEach(() => {
-    resetPluginRuntimeStateForTest();
-    setActivePluginRegistry(createEmptyPluginRegistry());
-    vi.unstubAllEnvs();
-  });
+  const { tmpDir, deliver: deliverOutboundPayloads } = installDeliveryCompletionHooks();
 
   it.each(
     (["live", "recovery"] as const).flatMap((mode) =>
       (
         [
-          "omitted",
-          "enriched",
-          "normalized",
-          "target",
-          "receipt-thread",
-          "part-thread",
-          "nested-target",
-          "nested-thread",
-          "mutated-target",
-          "callback-mutation",
-          "aggregate-blank-first",
-          "aggregate-blank-last",
-          "aggregate-nested",
-          "aggregate-mutated-raw",
-          "aggregate-not-sent",
-          "aggregate-complete",
-          "aggregate-metadata",
-          "legacy-channel",
-          "legacy-expected",
-          "legacy-omitted",
+          ["omitted", true],
+          ["enriched", true],
+          ["normalized", true],
+          ["target", false],
+          ["receipt-thread", false],
+          ["part-thread", false],
+          ["nested-target", false],
+          ["nested-thread", false],
+          ["mutated-target", false],
+          ["callback-mutation", false],
+          ["aggregate-blank-first", false],
+          ["aggregate-blank-last", false],
+          ["aggregate-nested", false],
+          ["aggregate-mutated-raw", false],
+          ["aggregate-not-sent", false],
+          ["aggregate-complete", true],
+          ["aggregate-metadata", true],
+          ["legacy-channel", false],
+          ["legacy-expected", true],
+          ["legacy-omitted", true],
         ] as const
-      ).map((placement) => ({ mode, placement })),
+      ).map(([placement, eligible]) => ({ mode, placement, eligible })),
     ),
   )(
     "retains reported placement across same-ID final replacement ($mode, $placement)",
-    async ({ mode, placement }) => {
+    async ({ mode, placement, eligible }) => {
       const scope = {
         agentId: "main",
         sessionKey: "agent:main:dashboard:progress-evidence",
-        storePath: path.join(tmpDir, "sessions.json"),
+        storePath: path.join(tmpDir(), "sessions.json"),
       };
       const context = { channel: "matrix", to: "!original:example", threadId: "thread" };
       await replaceSessionEntry(scope, {
@@ -110,16 +99,14 @@ describe("final receipt reported progress evidence", () => {
       });
       const completion = resolvePendingFinalDeliveryCompletion(payloads);
       assert(completion, "missing final custody");
-      const progress = receipt();
-      if (["target", "mutated-target", "callback-mutation"].includes(placement)) {
-        progress.target = { kind: "room", id: "!other:example" };
-      }
-      if (placement === "normalized") {
-        progress.target = { kind: "room", id: "matrix:!original:example" };
-      }
-      if (placement === "receipt-thread") {
-        progress.receipt.threadId = "wrong";
-      }
+      const progress = receipt(
+        ["target", "mutated-target", "callback-mutation"].includes(placement)
+          ? "!other:example"
+          : placement === "normalized"
+            ? "matrix:!original:example"
+            : undefined,
+        placement === "receipt-thread" ? "wrong" : undefined,
+      );
       if (placement === "part-thread") {
         progress.receipt.parts[0]!.threadId = "wrong";
       }
@@ -127,11 +114,7 @@ describe("final receipt reported progress evidence", () => {
         progress.receipt.raw = [{ roomId: "!other:example" }];
       }
       if (placement === "nested-thread") {
-        const nested = {
-          messageId: "nested",
-          receipt: { ...receipt().receipt, threadId: "wrong" },
-        };
-        progress.receipt.parts[0]!.raw = nested;
+        progress.receipt.parts[0]!.raw = { ...receipt(undefined, "wrong"), messageId: "nested" };
       }
       const committed = vi.fn();
       const send = vi.fn(
@@ -142,39 +125,37 @@ describe("final receipt reported progress evidence", () => {
           if (placement === "mutated-target") {
             progress.target!.id = context.to;
           }
-          const final = receipt();
+          const final =
+            placement === "enriched" ? receipt(context.to, context.threadId) : receipt();
           if (placement.startsWith("aggregate-")) {
             const unconfirmed = { messageId: "" };
             const identified = { messageId: "m" };
             const nested = createMessageReceiptFromOutboundResults({
               results: [unconfirmed, identified],
             });
+            const variants: Record<
+              string,
+              Parameters<typeof createMessageReceiptFromOutboundResults>[0]["results"]
+            > = {
+              "aggregate-blank-first": [unconfirmed, identified],
+              "aggregate-blank-last": [identified, unconfirmed],
+              "aggregate-nested": [{ receipt: nested }, identified],
+              "aggregate-mutated-raw": [{ receipt: nested }, identified],
+              "aggregate-not-sent": [{ outcome: "not_sent" }, identified],
+              "aggregate-complete": [{ messageId: "first" }, identified],
+              "aggregate-metadata": [
+                {
+                  ...identified,
+                  receipt: { ...receipt().receipt, raw: [{ roomId: context.to }] },
+                },
+              ],
+            };
             final.receipt = createMessageReceiptFromOutboundResults({
-              results:
-                placement === "aggregate-blank-first"
-                  ? [unconfirmed, identified]
-                  : placement === "aggregate-blank-last"
-                    ? [identified, unconfirmed]
-                    : ["aggregate-nested", "aggregate-mutated-raw"].includes(placement)
-                      ? [{ receipt: nested }, identified]
-                      : placement === "aggregate-not-sent"
-                        ? [{ outcome: "not_sent" }, identified]
-                        : placement === "aggregate-complete"
-                          ? [{ messageId: "first" }, identified]
-                          : [
-                              {
-                                ...identified,
-                                receipt: { ...receipt().receipt, raw: [{ roomId: context.to }] },
-                              },
-                            ],
+              results: variants[placement]!,
             });
             if (placement === "aggregate-mutated-raw") {
               unconfirmed.messageId = "m";
             }
-          }
-          if (placement === "enriched") {
-            final.target = { kind: "room", id: context.to };
-            final.receipt.threadId = context.threadId;
           }
           return final;
         },
@@ -191,7 +172,6 @@ describe("final receipt reported progress evidence", () => {
           channel: placement === "legacy-channel" ? "discord" : "matrix",
         };
         if (placement === "legacy-omitted") {
-          // Legacy progress may omit the normalized receipt and optional placement.
           delete result.receipt;
         }
         await ctx.onDeliveryResult?.(result);
@@ -224,7 +204,7 @@ describe("final receipt reported progress evidence", () => {
       const recover = () =>
         recoverPendingDeliveries({
           cfg: {},
-          stateDir: tmpDir,
+          stateDir: tmpDir(),
           log: createRecoveryLog(),
           deliver: runDelivery,
         });
@@ -239,24 +219,14 @@ describe("final receipt reported progress evidence", () => {
       if (mode === "live") {
         await runDelivery(params);
       } else {
-        await enqueueDeliveryOnce(params, completion.deliveryId, tmpDir);
+        await enqueueDeliveryOnce(params, completion.deliveryId, tmpDir());
         await recover();
       }
       const evidence = getRestartRecoveryTerminalDeliveryEvidence(
         loadSessionEntry(scope),
         "source",
       );
-      if (
-        [
-          "omitted",
-          "normalized",
-          "enriched",
-          "aggregate-complete",
-          "aggregate-metadata",
-          "legacy-expected",
-          "legacy-omitted",
-        ].includes(placement)
-      ) {
+      if (eligible) {
         expect(evidence).toMatchObject({
           deliveryStatus: {
             status: "sent",
@@ -274,7 +244,7 @@ describe("final receipt reported progress evidence", () => {
       await recover();
       expect(send).toHaveBeenCalledTimes(legacy ? 0 : 1);
       expect(legacySend).toHaveBeenCalledTimes(legacy ? 1 : 0);
-      expect(await loadPendingDeliveries(tmpDir)).toEqual([]);
+      expect(await loadPendingDeliveries(tmpDir())).toEqual([]);
     },
   );
 });

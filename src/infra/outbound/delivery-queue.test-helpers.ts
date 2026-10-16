@@ -21,6 +21,7 @@ export async function prepareConversationDelivery(
   scope: ConversationDeliveryStoreScope,
   operationId: string,
   message: string,
+  routeFingerprint: string,
 ) {
   // Keep session/routing modules out of storage-only fixtures' module graphs.
   const { upsertSessionEntryCore } = await import("../../config/sessions/session-accessor.js");
@@ -52,10 +53,40 @@ export async function prepareConversationDelivery(
       peerId: "peer-agent",
     }),
   });
+  return {
+    channel: "reef",
+    to: "reef:peer-agent",
+    payloads: [{ text: message }],
+    deliveryCompletion: {
+      kind: "conversation" as const,
+      agentId: scope.agentId,
+      operationId,
+      storePath: scope.storePath,
+      routeFingerprint,
+    },
+  };
 }
 
 function queueDatabase(stateDir: string) {
   return openOpenClawStateDatabase({ env: { ...process.env, OPENCLAW_STATE_DIR: stateDir } });
+}
+
+export function readQueueStatus(stateDir: string, id: string): string | undefined {
+  const row = queueDatabase(stateDir)
+    .db.prepare("SELECT status FROM delivery_queue_entries WHERE queue_name = ? AND id = ?")
+    .get(OUTBOUND_DELIVERY_QUEUE_NAME, id) as { status?: string } | undefined;
+  return row?.status;
+}
+
+export async function createQueueMedia(stateDir: string, suffix: string, content: string) {
+  const artifact = path.join(
+    stateDir,
+    "delivery-queue-media",
+    `00000000-0000-4000-8000-${suffix}.ogg`,
+  );
+  await fs.promises.mkdir(path.dirname(artifact), { recursive: true });
+  await fs.promises.writeFile(artifact, content);
+  return artifact;
 }
 
 // Clock-controlled kernel cases stay in one realm; facade tests exercise real worker leases.
@@ -154,15 +185,10 @@ export function setQueuedEntryState(
   },
 ): void {
   const entry = readQueuedEntry(tmpDir, id);
-  entry.retryCount = state.retryCount;
-  for (const key of ["lastAttemptAt", "lastError"] as const) {
-    if (state[key] === undefined) {
-      delete entry[key];
-    } else {
-      entry[key] = state[key];
-    }
-  }
   for (const key of [
+    "retryCount",
+    "lastAttemptAt",
+    "lastError",
     "enqueuedAt",
     "platformSendStartedAt",
     "recoveryState",
@@ -171,6 +197,8 @@ export function setQueuedEntryState(
   ] as const) {
     if (state[key] !== undefined) {
       entry[key] = state[key];
+    } else if (key === "lastAttemptAt" || key === "lastError") {
+      delete entry[key];
     }
   }
   const { db } = queueDatabase(tmpDir);
@@ -218,3 +246,42 @@ export const RECOVERY_SUMMARY = {
   recovered: { recovered: 1, failed: 0, skippedMaxRetries: 0, deferredBackoff: 0 },
   recoveredWithDeferred: { recovered: 1, failed: 0, skippedMaxRetries: 0, deferredBackoff: 1 },
 } as const;
+
+export function installDeliveryCompletionHooks(registerMatrix = false) {
+  const fixtures = installDeliveryQueueTmpDirHooks();
+  let deliver: typeof import("./deliver.js").deliverOutboundPayloads;
+  beforeAll(async () => {
+    ({ deliverOutboundPayloads: deliver } = await import("./deliver.js"));
+  });
+  beforeEach(async () => {
+    vi.stubEnv("OPENCLAW_STATE_DIR", fixtures.tmpDir());
+    if (registerMatrix) {
+      const { setActivePluginRegistry } = await import("../../plugins/runtime.js");
+      const { createOutboundTestPlugin, createTestRegistry } =
+        await import("../../test-utils/channel-plugins.js");
+      const { matrixOutboundForQueueTest } =
+        await import("./deliver.queue-integration.test-support.js");
+      setActivePluginRegistry(
+        createTestRegistry([
+          {
+            pluginId: "matrix",
+            source: "test",
+            plugin: createOutboundTestPlugin({
+              id: "matrix",
+              outbound: matrixOutboundForQueueTest,
+            }),
+          },
+        ]),
+      );
+    }
+  });
+  afterEach(async () => {
+    const { resetPluginRuntimeStateForTest, setActivePluginRegistry } =
+      await import("../../plugins/runtime.js");
+    const { createEmptyPluginRegistry } = await import("../../plugins/registry.js");
+    resetPluginRuntimeStateForTest();
+    setActivePluginRegistry(createEmptyPluginRegistry());
+    vi.unstubAllEnvs();
+  });
+  return { ...fixtures, deliver: (...args: Parameters<typeof deliver>) => deliver(...args) };
+}
