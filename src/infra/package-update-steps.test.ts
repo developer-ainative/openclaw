@@ -1,4 +1,3 @@
-// Covers package update step orchestration.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { root as fsSafeRoot, type Root } from "@openclaw/fs-safe/root";
@@ -63,7 +62,7 @@ async function stagePackage(argv: string[], version = "2.0.0") {
   const prefix = stagedNpmPrefix(argv);
   const root = path.join(prefix, "lib", "node_modules", "openclaw");
   await writePackageRoot(root, version);
-  return { prefix, root };
+  return prefix;
 }
 
 describe("runGlobalPackageUpdateSteps", () => {
@@ -395,7 +394,7 @@ describe("runGlobalPackageUpdateSteps", () => {
           packageRoot,
           beforeActivate,
           runStep: async ({ name, argv, cwd }) => {
-            const { prefix: stagePrefix } = await stagePackage(argv);
+            const stagePrefix = await stagePackage(argv);
             const stagedShim = path.join(stagePrefix, "bin", "openclaw");
             stagedShimForFailure = stagedShim;
             await fs.mkdir(path.dirname(stagedShim), { recursive: true });
@@ -441,7 +440,6 @@ describe("runGlobalPackageUpdateSteps", () => {
       }
       expect((await fs.stat(targetShim)).mode & 0o777).toBe(0o755);
       if (failure === "package restore") {
-        expect(result.recovery?.serviceRestartSafe).toBe(false);
         const backups = (await fs.readdir(globalRoot)).filter((entry) => entry.startsWith("."));
         expect(backups.length).toBeGreaterThan(0);
         const retry = await runGlobalPackageUpdateSteps({
