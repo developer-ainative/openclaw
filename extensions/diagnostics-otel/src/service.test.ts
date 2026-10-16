@@ -562,24 +562,6 @@ function buildEventFixture(
   return event as TrustedEvent;
 }
 
-function eventFixture<T extends FixtureEventType>(
-  type: T,
-  overrides?: Partial<EventFields<T>>,
-  omitted?: readonly (keyof EventFields<T>)[],
-): TrustedEventOf<T>;
-function eventFixture<T extends TrustedEvent["type"]>(
-  type: T,
-  event: EventFields<T>,
-  omitted?: readonly (keyof EventFields<T>)[],
-): TrustedEventOf<T>;
-function eventFixture(
-  type: TrustedEvent["type"],
-  overrides: Record<string, unknown> = {},
-  omitted: readonly string[] = [],
-): TrustedEvent {
-  return buildEventFixture(type, overrides, omitted);
-}
-
 type FixtureEmitter<TResult> = {
   <T extends FixtureEventType>(
     type: T,
@@ -691,44 +673,22 @@ function project<T, K extends keyof T>(records: readonly T[], keys: readonly K[]
   return records.map((record) => keys.map((key) => record[key]));
 }
 
-function emitTrustedModelCallCompletedWithContent(
-  modelContent: NonNullable<DiagnosticEventPrivateData["modelContent"]>,
-  overrides: Partial<EventFields<"model.call.completed">> = {},
+function emitCompletedContent<T extends "model.call.completed" | "tool.execution.completed">(
+  type: T,
+  content: DiagnosticEventPrivateData,
+  overrides: Partial<EventFields<T>> = {},
 ) {
-  emitTrustedDiagnosticEventWithPrivateData(
-    {
-      type: "model.call.completed",
-      ...MODEL_CALL_FIXTURE,
-      durationMs: 80,
-      ...overrides,
-    },
-    { modelContent },
-  );
+  emitTrustedDiagnosticEventWithPrivateData(buildEventFixture(type, overrides, ["trace"]), content);
 }
 
 async function captureModelContent(
-  ...args: Parameters<typeof emitTrustedModelCallCompletedWithContent>
+  modelContent: NonNullable<DiagnosticEventPrivateData["modelContent"]>,
+  overrides: Partial<EventFields<"model.call.completed">> = {},
 ) {
   await startServiceFixture(["traces"], { captureContent: true });
-  emitTrustedModelCallCompletedWithContent(...args);
+  emitCompletedContent("model.call.completed", { modelContent }, overrides);
   await flushDiagnosticEvents();
   return firstSpanAttributes("openclaw.model.call");
-}
-
-function emitTrustedToolExecutionCompletedWithContent(
-  toolContent: NonNullable<DiagnosticEventPrivateData["toolContent"]>,
-  overrides: Partial<EventFields<"tool.execution.completed">> = {},
-) {
-  emitTrustedDiagnosticEventWithPrivateData(
-    {
-      type: "tool.execution.completed",
-      runId: "run-1",
-      toolName: "read",
-      durationMs: 20,
-      ...overrides,
-    },
-    { toolContent },
-  );
 }
 
 afterAll(() => {
@@ -1428,6 +1388,7 @@ describe("diagnostics-otel service", () => {
     "openclaw.talk.provider": "openai",
     "openclaw.talk.transport": "gateway-relay",
   };
+  const livenessAttributes = { "openclaw.liveness.reason": "event_loop_delay:cpu" };
 
   test.each<RecorderCase>([
     {
@@ -1448,20 +1409,14 @@ describe("diagnostics-otel service", () => {
         queued: 4,
       },
       metrics: [
-        counter("openclaw.liveness.warning", 1, {
-          "openclaw.liveness.reason": "event_loop_delay:cpu",
-        }),
-        histogram("openclaw.liveness.event_loop_delay_p99_ms", 250, {
-          "openclaw.liveness.reason": "event_loop_delay:cpu",
-        }),
-        histogram("openclaw.liveness.cpu_core_ratio", 1.4, {
-          "openclaw.liveness.reason": "event_loop_delay:cpu",
-        }),
+        counter("openclaw.liveness.warning", 1, livenessAttributes),
+        histogram("openclaw.liveness.event_loop_delay_p99_ms", 250, livenessAttributes),
+        histogram("openclaw.liveness.cpu_core_ratio", 1.4, livenessAttributes),
       ],
       span: {
         name: "openclaw.liveness.warning",
         attributes: {
-          "openclaw.liveness.reason": "event_loop_delay:cpu",
+          ...livenessAttributes,
           "openclaw.liveness.active": 2,
           "openclaw.liveness.queued": 4,
         },
@@ -1622,20 +1577,12 @@ describe("diagnostics-otel service", () => {
         maxQueueLength: 10_000,
         drainBatchSize: 100,
       },
-      metrics: [
-        counter("openclaw.diagnostic.async_queue.dropped", 4, {
-          "openclaw.diagnostic.async_queue.drop_class": "total",
-        }),
-        counter("openclaw.diagnostic.async_queue.dropped", 1, {
-          "openclaw.diagnostic.async_queue.drop_class": "trusted",
-        }),
-        counter("openclaw.diagnostic.async_queue.dropped", 2, {
-          "openclaw.diagnostic.async_queue.drop_class": "untrusted",
-        }),
-        counter("openclaw.diagnostic.async_queue.dropped", 1, {
-          "openclaw.diagnostic.async_queue.drop_class": "priority",
-        }),
-      ],
+      metrics: Object.entries({ total: 4, trusted: 1, untrusted: 2, priority: 1 }).map(
+        ([dropClass, count]) =>
+          counter("openclaw.diagnostic.async_queue.dropped", count, {
+            "openclaw.diagnostic.async_queue.drop_class": dropClass,
+          }),
+      ),
     },
     {
       name: "session recovery and talk",
@@ -1718,11 +1665,8 @@ describe("diagnostics-otel service", () => {
         ]),
         histogram("openclaw.talk.audio.bytes", 320, audioAttributes),
         histogram("openclaw.talk.event.duration_ms", 45, {
-          "openclaw.talk.brain": "agent-consult",
+          ...audioAttributes,
           "openclaw.talk.event_type": "latency.metrics",
-          "openclaw.talk.mode": "realtime",
-          "openclaw.talk.provider": "openai",
-          "openclaw.talk.transport": "gateway-relay",
         }),
       ],
     },
@@ -2002,11 +1946,14 @@ describe("diagnostics-otel service", () => {
               errorCategory: "Error",
               durationMs: 100,
             }
-          : eventFixture(
-              "harness.run.completed",
-              { runId: "run-1", provider: "openai", model: "gpt-5.4", outcome: "error" },
-              ["trace"],
-            ),
+          : {
+              type: "harness.run.completed",
+              ...RUN_FIXTURE,
+              harnessId: "openclaw",
+              outcome: "error",
+              durationMs: 90,
+              itemLifecycle: { startedCount: 1, completedCount: 1, activeCount: 0 },
+            },
         {
           errorMessage:
             owner === "run" ? `OPENAI_API_KEY=${secret} ${"x".repeat(8 * 1024)}` : message,
@@ -2416,6 +2363,7 @@ describe("diagnostics-otel service", () => {
       sourceTimestampMs: 7_000,
       trace: createTestTrace(GRANDCHILD_SPAN_ID, CHILD_SPAN_ID),
     });
+    expect(telemetryState.spans).toHaveLength(4);
 
     const runOptions = startedSpanOptions("openclaw.run");
     expect(runOptions?.attributes).toMatchObject({
@@ -3032,39 +2980,18 @@ describe("diagnostics-otel service", () => {
   test("does not create live started spans for untrusted lifecycle diagnostics", async () => {
     await startServiceFixture(["traces", "metrics"]);
 
-    for (const type of [
-      "run.started",
-      "run.completed",
-      "model.call.started",
-      "model.call.completed",
-      "tool.execution.started",
-      "tool.execution.error",
-    ] as const) {
+    for (const type of ["run.started", "model.call.started", "tool.execution.started"] as const) {
       emitEvent(type, {}, ["trace"]);
     }
-    const harness = {
+    emitDiagnosticEvent({
+      type: "harness.run.started",
       ...RUN_FIXTURE,
       provider: "codex",
       harnessId: "codex",
       pluginId: "codex-plugin",
-    };
-    emitDiagnosticEvent({ type: "harness.run.started", ...harness });
-    await emitAndFlush({
-      type: "harness.run.completed",
-      ...harness,
-      outcome: "completed",
-      durationMs: 90,
     });
-    for (const name of [
-      "openclaw.run",
-      "openclaw.model.call",
-      "openclaw.tool.execution",
-      "openclaw.harness.run",
-    ]) {
-      expect(
-        telemetryState.tracer.startSpan.mock.calls.filter((call) => call[0] === name),
-      ).toHaveLength(1);
-    }
+    await waitForDiagnosticEventsDrained();
+    expect(telemetryState.tracer.startSpan).not.toHaveBeenCalled();
   });
 
   // Exec spans used to always be roots, which stranded every shell command in its
@@ -3231,19 +3158,24 @@ describe("diagnostics-otel service", () => {
     "exports model/tool content only with capture=%s",
     async (captureContent) => {
       await startServiceFixture(["traces", "metrics"], { captureContent });
-      emitTrustedModelCallCompletedWithContent({
-        inputMessages: [
-          captureContent ? "use key sk-1234567890abcdef1234567890abcdef" : "private user prompt",
-        ], // pragma: allowlist secret
-        outputMessages: [captureContent ? "model reply" : "private model reply"],
-        systemPrompt: captureContent ? "system prompt" : "private system prompt",
+      emitCompletedContent("model.call.completed", {
+        modelContent: {
+          inputMessages: [
+            captureContent ? "use key sk-1234567890abcdef1234567890abcdef" : "private user prompt",
+          ], // pragma: allowlist secret
+          outputMessages: [captureContent ? "model reply" : "private model reply"],
+          systemPrompt: captureContent ? "system prompt" : "private system prompt",
+        },
       });
-      emitTrustedToolExecutionCompletedWithContent(
+      emitCompletedContent(
+        "tool.execution.completed",
         {
-          toolInput: captureContent ? "tool input" : "private tool input",
-          toolOutput: captureContent
-            ? `${"x".repeat(4077)} Bearer ${"a".repeat(80)}`
-            : "private tool output", // pragma: allowlist secret
+          toolContent: {
+            toolInput: captureContent ? "tool input" : "private tool input",
+            toolOutput: captureContent
+              ? `${"x".repeat(4077)} Bearer ${"a".repeat(80)}`
+              : "private tool output", // pragma: allowlist secret
+          },
         },
         { toolCallId: "tool-1" },
       );
