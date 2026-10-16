@@ -394,6 +394,12 @@ asset revision, and immutable JavaScript/CSS generation. A Settings-only entry
 is excluded from runtime UI activation; existing `defineControlUiPlugin` entries
 keep their required `activate(host)` contract.
 
+Source-checkout `pnpm ui:build` and `pnpm ui:dev` prepare declared Settings
+presentations through the same plugin builder before reading that distribution.
+The dev server serves the validated generated JavaScript and CSS without runtime
+plugin activation. Restart the dev server after editing plugin presentation
+sources to rebuild their immutable generation.
+
 ### Bundle boundaries
 
 The build emits a JavaScript entry, optional CSS, and JavaScript chunks for lazy
