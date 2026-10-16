@@ -57,6 +57,28 @@ function age(directory: string): void {
   fs.utimesSync(directory, timestamp, timestamp);
 }
 
+function expectBytes(file: string, bytes = capturedSource) {
+  expect(fs.readFileSync(file, "utf8")).toBe(bytes);
+}
+
+function expectArtifactBytes(
+  artifact: ReturnType<typeof capturePluginGenerationArtifact>,
+  source: string,
+) {
+  expectBytes(artifact.resolve(path.join(source, "index.cjs")));
+}
+
+function runChild(stateDir: string, script: string, args: string[] = [], exitCode = 0) {
+  const result = spawnSync(
+    process.execPath,
+    [...runtimeArgs, "--input-type=module", "-e", script, ...args],
+    { env: { ...process.env, OPENCLAW_STATE_DIR: stateDir }, encoding: "utf8", timeout: 15_000 },
+  );
+  expect(result.error).toBeUndefined();
+  expect(result.status, result.stderr).toBe(exitCode);
+  return result;
+}
+
 function capturePaths(
   stateDir: string,
   boundaryRoot: string,
@@ -112,19 +134,15 @@ const legacyChildCapture = `
 async function abandonCapture(stateDir: string, source: string) {
   const captured = await startCliCapture(stateDir, source, false);
   await captured.stop();
-  expect(fs.readFileSync(captured.capturedFile, "utf8")).toBe(capturedSource);
+  expectBytes(captured.capturedFile);
   return captured;
 }
 
 it("retains mapped addons once through disposal and exit, then reclaims them at startup", async () => {
   const stateDir = temp.make("plugin-capture-loaded-");
-  const result = spawnSync(
-    process.execPath,
-    [
-      ...runtimeArgs,
-      "--input-type=module",
-      "-e",
-      `
+  const result = runChild(
+    stateDir,
+    `
       import assert from "node:assert/strict";
       import fs from "node:fs";
       import fsp from "node:fs/promises";
@@ -195,11 +213,7 @@ it("retains mapped addons once through disposal and exit, then reclaims them at 
         directories: captures.map(capture => capture.directory), warnings, attempts,
       })));
       `,
-    ],
-    { env: { ...process.env, OPENCLAW_STATE_DIR: stateDir }, encoding: "utf8", timeout: 15_000 },
   );
-  expect(result.error).toBeUndefined();
-  expect(result.status, result.stderr).toBe(0);
   const observed: { directories: string[]; warnings: string[]; attempts: number } = JSON.parse(
     result.stdout,
   );
@@ -221,13 +235,9 @@ it("retains mapped addons once through disposal and exit, then reclaims them at 
 
 it("disposes captures while sibling workers remain active", () => {
   const stateDir = temp.make("plugin-capture-active-workers-");
-  const result = spawnSync(
-    process.execPath,
-    [
-      ...runtimeArgs,
-      "--input-type=module",
-      "-e",
-      `
+  const result = runChild(
+    stateDir,
+    `
       import { once } from "node:events";
       import { Worker } from "node:worker_threads";
       import { createPluginSourceCapture } from ${JSON.stringify(resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.metadataCapture).href)};
@@ -248,11 +258,7 @@ it("disposes captures while sibling workers remain active", () => {
       }
       process.stdout.write("captures disposed with workers alive");
       `,
-    ],
-    { env: { ...process.env, OPENCLAW_STATE_DIR: stateDir }, encoding: "utf8", timeout: 15_000 },
   );
-  expect(result.error).toBeUndefined();
-  expect(result.status, result.stderr).toBe(0);
   expect(result.stdout).toBe("captures disposed with workers alive");
   expect(fs.readdirSync(path.join(stateDir, "tmp", "plugin-captures"))).toEqual([]);
 });
@@ -263,13 +269,9 @@ it.each(["natural", "failure", "explicit", "signal"])(
     const stateDir = temp.make("plugin-capture-exit-");
     const source = createSource();
     const signalModule = resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.signalExit).href;
-    const result = spawnSync(
-      process.execPath,
-      [
-        ...runtimeArgs,
-        "--input-type=module",
-        "-e",
-        `${childCapture}
+    const result = runChild(
+      stateDir,
+      `${childCapture}
       import { installCliSignalExitHandlers } from ${JSON.stringify(signalModule)};
       import { createPluginNativeCaptureRoot } from ${JSON.stringify(resolveRuntimeWorkerUrl(pluginProcessRuntimeEntrypoints.captureDirectory).href)};
       const retained = createPluginNativeCaptureRoot();
@@ -285,24 +287,14 @@ it.each(["natural", "failure", "explicit", "signal"])(
         installCliSignalExitHandlers();
         process.emit("SIGTERM");
       }`,
-        source,
-        mode,
-      ],
-      {
-        env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
-        encoding: "utf8",
-        timeout: 15_000,
-      },
-    );
-    expect(result.error).toBeUndefined();
-    expect(result.status, result.stderr).toBe(
+      [source, mode],
       mode === "natural" ? 0 : mode === "failure" ? 1 : mode === "explicit" ? 2 : 143,
     );
     const [directory, , nativeRoots] = result.stdout.trim().split("\n");
     expect(directory).toContain(path.join(stateDir, "tmp", "plugin-captures"));
     expect(fs.existsSync(directory!)).toBe(false);
     const [retained, pending] = JSON.parse(nativeRoots!) as [string, string];
-    expect(fs.readFileSync(path.join(retained, "native"), "utf8")).toBe("published native bytes");
+    expectBytes(path.join(retained, "native"), "published native bytes");
     expect(fs.existsSync(pending)).toBe(false);
     expect(fs.existsSync(path.join(path.dirname(path.dirname(retained)), "owner.sqlite"))).toBe(
       true,
@@ -444,13 +436,9 @@ it("metadata boot preserves recent captures and legacy files with another produc
     expect(readDirectories).toHaveBeenCalled();
     await sweepPluginSourceCapturesForTest(stateDir);
     expect(fs.existsSync(old.instanceRoot)).toBe(false);
-    expect(fs.readFileSync(active.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
-      capturedSource,
-    );
-    expect(fs.readFileSync(recent.capturedFile, "utf8")).toBe(capturedSource);
-    expect(fs.readFileSync(path.join(legacy, "sentinel"), "utf8")).toBe(
-      "legacy files have no custody token",
-    );
+    expectArtifactBytes(active, source);
+    expectBytes(recent.capturedFile);
+    expectBytes(path.join(legacy, "sentinel"), "legacy files have no custody token");
     readDirectories.mockClear();
     const later = capturePluginGenerationArtifact(source);
     try {
@@ -484,14 +472,14 @@ it.each([
         await sweepPluginSourceCapturesForTest(stateDir);
         expect(await child.read()).toBe(capturedSource.trim());
         expect(fs.existsSync(child.captureRoot)).toBe(true);
-        expect(fs.readFileSync(child.capturedFile, "utf8")).toBe(capturedSource);
+        expectBytes(child.capturedFile);
         await child.stop();
-        expect(fs.readFileSync(child.capturedFile, "utf8")).toBe(capturedSource);
+        expectBytes(child.capturedFile);
         if (legacy) {
           const recent = new Date();
           fs.utimesSync(child.instanceRoot, recent, recent);
           await sweepPluginSourceCapturesForTest(stateDir);
-          expect(fs.readFileSync(child.capturedFile, "utf8")).toBe(capturedSource);
+          expectBytes(child.capturedFile);
           age(child.instanceRoot);
         }
         await sweepPluginSourceCapturesForTest(stateDir);
@@ -534,7 +522,7 @@ it.each(["payload", "instance"])(
           }
         });
         expect(refused.warnings).toContain("Fixture cleanup authority expired");
-        expect(fs.readFileSync(orphan.capturedFile, "utf8")).toBe(capturedSource);
+        expectBytes(orphan.capturedFile);
       } finally {
         inspected.mockRestore();
       }
@@ -551,7 +539,7 @@ it.each(["payload", "instance"])(
       await sweepPluginSourceCapturesForTest(stateDir);
       expect(fs.existsSync(path.join(orphan.instanceRoot, "owner.sqlite"))).toBe(true);
       if (stage === "payload") {
-        expect(fs.readFileSync(orphan.capturedFile, "utf8")).toBe(capturedSource);
+        expectBytes(orphan.capturedFile);
       } else {
         expect(fs.existsSync(captures)).toBe(false);
       }
@@ -702,15 +690,11 @@ it("retains live capture bytes until the metadata owner and artifact are release
     );
     age(instanceRoot);
     await sweepPluginSourceCapturesForTest(stateDir);
-    expect(fs.readFileSync(artifact.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
-      capturedSource,
-    );
+    expectArtifactBytes(artifact, source);
     await first.close();
     await first.close();
     await sweepPluginSourceCapturesForTest(stateDir);
-    expect(fs.readFileSync(artifact.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
-      capturedSource,
-    );
+    expectArtifactBytes(artifact, source);
     await artifact.disposeAsync();
     expect(fs.existsSync(instanceRoot)).toBe(false);
   } finally {
@@ -767,7 +751,7 @@ it.skipIf(process.platform === "win32").each([
       if (removed === "directory") {
         expect(fs.existsSync(root)).toBe(false);
       } else {
-        expect(fs.readFileSync(payload, "utf8")).toBe(capturedSource);
+        expectBytes(payload);
         expect(fs.existsSync(path.join(root, "owner.sqlite"))).toBe(false);
       }
       const successor = retainPluginSourceCaptureInstance(stateDir);
@@ -804,10 +788,10 @@ it.skipIf(process.platform === "win32").each(["directory", "token"] as const)(
       await expect(instance.releaseAsync()).rejects.toThrow(
         "SQLite staging ownership changed before retirement",
       );
-      expect(fs.readFileSync(replacement, "utf8")).toBe("replacement bytes");
+      expectBytes(replacement, "replacement bytes");
       const originalCapture =
         replaced === "directory" ? path.join(parked, path.relative(root, capture)) : capture;
-      expect(fs.readFileSync(path.join(originalCapture, "index.cjs"), "utf8")).toBe(capturedSource);
+      expectBytes(path.join(originalCapture, "index.cjs"));
     } finally {
       fs.rmSync(target, { recursive: true, force: true });
       fs.renameSync(parked, target);
@@ -832,9 +816,7 @@ it("leaves explicit worker capture directories under their caller's custody", as
     try {
       await sweepPluginSourceCapturesForTest(stateDir);
       expect(path.dirname(artifact.boundaryRoot)).toBe(workerRoot);
-      expect(fs.readFileSync(artifact.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
-        capturedSource,
-      );
+      expectArtifactBytes(artifact, source);
     } finally {
       await metadata.close();
     }
@@ -842,9 +824,7 @@ it("leaves explicit worker capture directories under their caller's custody", as
     await artifact.disposeAsync();
   }
   expect(fs.existsSync(artifact.boundaryRoot)).toBe(false);
-  expect(fs.readFileSync(path.join(workerRoot, "sentinel"), "utf8")).toBe(
-    "worker owns this directory",
-  );
+  expectBytes(path.join(workerRoot, "sentinel"), "worker owns this directory");
 });
 
 it("excludes managed worker output when the state directory is also plugin source", async () => {
@@ -857,9 +837,7 @@ it("excludes managed worker output when the state directory is also plugin sourc
       () => capturePluginGenerationArtifact(source),
       root.managedRoot,
     );
-    expect(fs.readFileSync(artifact.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
-      capturedSource,
-    );
+    expectArtifactBytes(artifact, source);
     expect(fs.existsSync(path.join(artifact.rootDir, "tmp", "plugin-captures"))).toBe(false);
   } finally {
     await artifact?.disposeAsync();
@@ -881,10 +859,8 @@ it("keeps metadata boot and source capture usable when the state directory canno
     await sweepPluginSourceCapturesForTest(stateDir);
     artifact = capturePluginGenerationArtifact(source);
     instanceRoot = path.dirname(path.dirname(artifact.boundaryRoot));
-    expect(fs.readFileSync(artifact.resolve(path.join(source, "index.cjs")), "utf8")).toBe(
-      capturedSource,
-    );
-    expect(fs.readFileSync(stateDir, "utf8")).toBe("not a directory");
+    expectArtifactBytes(artifact, source);
+    expectBytes(stateDir, "not a directory");
   } finally {
     try {
       await artifact?.disposeAsync();
@@ -930,12 +906,12 @@ it.each(["malformed", "symlink", "hardlink", "sidecar-symlink", "captures-symlin
     await sweepPluginSourceCapturesForTest(stateDir);
 
     expect(fs.readdirSync(instance).toSorted()).toEqual(before);
-    expect(fs.readFileSync(outsideFile, "utf8")).toBe("unrelated source");
+    expectBytes(outsideFile, "unrelated source");
     if (kind !== "captures-symlink") {
-      expect(fs.readFileSync(path.join(captures, "index.cjs"), "utf8")).toBe(capturedSource);
+      expectBytes(path.join(captures, "index.cjs"));
     }
     if (kind === "malformed") {
-      expect(fs.readFileSync(owner, "utf8")).toBe("not a SQLite owner");
+      expectBytes(owner, "not a SQLite owner");
     }
   },
 );

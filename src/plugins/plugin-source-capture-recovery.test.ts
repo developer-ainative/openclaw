@@ -37,6 +37,49 @@ const temp = useAutoCleanupTempDirTracker((cleanup) =>
 const hour = 60 * 60 * 1_000;
 const locked = Object.assign(new Error("Fixture Windows sharing violation"), { code: "EPERM" });
 
+function expectBytes(file: string, expected: string) {
+  expect(fs.readFileSync(file, "utf8")).toBe(expected);
+}
+
+function write(root: string, filename: string, contents: string) {
+  const file = path.join(root, filename);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, contents);
+  return file;
+}
+
+function expectPairedFailure(failure: unknown, primary: Error, cleanup: Error) {
+  if (!(failure instanceof AggregateError)) {
+    throw new Error("Expected the original failure and cleanup refusal", { cause: failure });
+  }
+  expect(failure.cause).toBe(primary);
+  expect(failure.errors).toHaveLength(2);
+  expect(failure.errors[0]).toBe(primary);
+  expect(failure.errors[1]).toBe(cleanup);
+}
+
+async function duringMaintenance<T>(
+  stateDir: string,
+  run: (scope: ReturnType<typeof createOpenClawDatabaseMaintenanceScope>) => Promise<T>,
+) {
+  const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+  const lease = acquireGatewayStateOwner({ databasePath: resolveOpenClawStateSqlitePath(env) });
+  const scope = createOpenClawDatabaseMaintenanceScope({
+    schemaMaintenance: true,
+    assertOwnerCurrent: lease.assertCurrent,
+    assertDatabaseAccess: lease.assertDatabaseAccess,
+  });
+  try {
+    return await scope.run(() => run(scope));
+  } finally {
+    try {
+      await scope.close();
+    } finally {
+      lease.release();
+    }
+  }
+}
+
 beforeEach(() => {
   const temporary = temp.make("capture-recovery-temp-");
   for (const key of ["TMPDIR", "TMP", "TEMP"]) {
@@ -107,27 +150,14 @@ it.each(["failed removal", "maintenance failed removal", "identity-change return
         await sweepPluginSourceCapturesForTest(stateDir);
         return warning.mock.calls.map(([message]) => String(message));
       }
-      const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
-      const lease = acquireGatewayStateOwner({ databasePath: resolveOpenClawStateSqlitePath(env) });
-      const scope = createOpenClawDatabaseMaintenanceScope({
-        schemaMaintenance: true,
-        assertOwnerCurrent: lease.assertCurrent,
-        assertDatabaseAccess: lease.assertDatabaseAccess,
-      });
-      try {
-        const result = await scope.run(() =>
-          captureDirectory.prunePluginNativeCaptureDirectories(stateDir, new Set(), () =>
-            scope.assertAdmission(),
-          ),
+      return duringMaintenance(stateDir, async (scope) => {
+        const result = await captureDirectory.prunePluginNativeCaptureDirectories(
+          stateDir,
+          new Set(),
+          () => scope.assertAdmission(),
         );
         return result.warnings;
-      } finally {
-        try {
-          await scope.close();
-        } finally {
-          lease.release();
-        }
-      }
+      });
     };
     try {
       const messages = await collectWarnings();
@@ -139,18 +169,12 @@ it.each(["failed removal", "maintenance failed removal", "identity-change return
         const failure = classification.mock.calls.find(
           ([error]) => error instanceof AggregateError && error.cause === primary,
         )?.[0];
-        if (!(failure instanceof AggregateError)) {
-          throw new Error("Expected the original reclamation and cleanup failures");
-        }
-        expect(failure.cause === primary).toBe(true);
-        expect(failure.errors.length).toBe(2);
-        expect(failure.errors[0] === primary).toBe(true);
-        expect(failure.errors[1] === cleanup).toBe(true);
+        expectPairedFailure(failure, primary, cleanup);
       } else {
         expect(classification.mock.calls.some(([error]) => error === cleanup)).toBe(true);
         expect(fs.lstatSync(tokenPath).nlink).toBe(2);
       }
-      expect(fs.readFileSync(payload, "utf8")).toBe("retained source bytes");
+      expectBytes(payload, "retained source bytes");
       expect(fs.existsSync(tokenPath)).toBe(true);
     } finally {
       removal.mockRestore();
@@ -200,13 +224,7 @@ it("preserves the preparation cause when synchronous token cleanup also fails", 
     } catch (error) {
       failure = error;
     }
-    if (!(failure instanceof AggregateError)) {
-      throw new Error("Expected the paired preparation and cleanup refusal", { cause: failure });
-    }
-    expect(failure.cause).toBe(primary);
-    expect(failure.errors.length).toBe(2);
-    expect(failure.errors[0]).toBe(primary);
-    expect(failure.errors[1]).toBe(cleanup);
+    expectPairedFailure(failure, primary, cleanup);
     expect(refuseCleanup).toBe(false);
   } finally {
     vi.restoreAllMocks();
@@ -230,9 +248,7 @@ it("recovers a removed captures directory without releasing a live instance", as
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.now() + 2 * hour);
     await sweepPluginSourceCapturesForTest(stateDir);
-    expect(fs.readFileSync(path.join(worker.directory, "source.js"), "utf8")).toBe(
-      "recovered capture",
-    );
+    expectBytes(path.join(worker.directory, "source.js"), "recovered capture");
     await worker.release();
     expect(fs.existsSync(root)).toBe(true);
     const next = instance.createDirectory();
@@ -271,7 +287,7 @@ it.each(["sync", "async"])(
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.now() + 2 * hour);
     await sweepPluginSourceCapturesForTest(stateDir);
-    expect(fs.readFileSync(payload, "utf8")).toBe("retained native bytes");
+    expectBytes(payload, "retained native bytes");
     expect(fs.existsSync(path.join(instance, "owner.sqlite"))).toBe(true);
   },
 );
@@ -304,9 +320,7 @@ it("preserves native bytes published after an unlocked missing-directory observa
   try {
     await sweepPluginSourceCapturesForTest(stateDir);
     expect(published).toBe(true);
-    expect(fs.readFileSync(payload, "utf8")).toBe(
-      "published while the producer still held its token",
-    );
+    expectBytes(payload, "published while the producer still held its token");
   } finally {
     observe.mockRestore();
     producer();
@@ -351,7 +365,7 @@ it.each(["sync", "async"])("preserves custody after partial %s disposal", async 
     } else {
       await worker!.release();
     }
-    expect(fs.readFileSync(payload, "utf8")).toBe("export default 1");
+    expectBytes(payload, "export default 1");
     const tokenless = fs
       .readdirSync(path.dirname(root))
       .filter((name) => !fs.existsSync(path.join(path.dirname(root), name, "owner.sqlite")));
@@ -561,28 +575,6 @@ it.each(["managed", "fallback"] as const)(
       await noteLegacyPluginSourceCaptures(env, true);
       return note.mock.calls.map(([message]) => String(message)).join("\n");
     };
-    const duringMaintenance = async () => {
-      const lease = acquireGatewayStateOwner({
-        databasePath: resolveOpenClawStateSqlitePath(env),
-      });
-      const scope = createOpenClawDatabaseMaintenanceScope({
-        schemaMaintenance: true,
-        assertOwnerCurrent: lease.assertCurrent,
-        assertDatabaseAccess: lease.assertDatabaseAccess,
-      });
-      try {
-        return await scope.run(runCaptureReport);
-      } finally {
-        await scope.close();
-        lease.release();
-      }
-    };
-    const write = (root: string, filename: string, contents: string) => {
-      const file = path.join(root, filename);
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, contents);
-      return file;
-    };
     const referenced = createPluginNativeCaptureRoot(stateDir);
     const captured = write(referenced.directory, "content/bin/native", "published native bytes");
     referenced.commit();
@@ -678,22 +670,22 @@ it.each(["managed", "fallback"] as const)(
     vi.setSystemTime(Date.now() + 2 * 60 * 60 * 1_000);
     try {
       inspectProcesses.mockReturnValue({ error: "fixture unreadable host argv" });
-      const output = await duringMaintenance();
+      const output = await duringMaintenance(stateDir, runCaptureReport);
       expect(output).toContain("Removed 1 unreferenced native plugin capture root(s).");
       expect(fs.existsSync(orphan.directory)).toBe(false);
-      expect(fs.readFileSync(captured, "utf8")).toBe("published native bytes");
-      expect(fs.readFileSync(warmFile, "utf8")).toBe("warm generation bytes");
-      expect(fs.readFileSync(liveFile, "utf8")).toBe("currently in use");
-      expect(fs.readFileSync(otherFile, "utf8")).toBe("another state's payload");
-      expect(fs.readFileSync(legacyFile, "utf8")).toBe("unqualified legacy payload");
-      expect(fs.readFileSync(tokenlessFile, "utf8")).toBe("unknown custody");
+      expectBytes(captured, "published native bytes");
+      expectBytes(warmFile, "warm generation bytes");
+      expectBytes(liveFile, "currently in use");
+      expectBytes(otherFile, "another state's payload");
+      expectBytes(legacyFile, "unqualified legacy payload");
+      expectBytes(tokenlessFile, "unknown custody");
       expect(inspectProcesses).not.toHaveBeenCalled();
       releaseWarm();
-      await duringMaintenance();
+      await duringMaintenance(stateDir, runCaptureReport);
       expect(fs.existsSync(warm.directory)).toBe(false);
-      expect(fs.readFileSync(otherFile, "utf8")).toBe("another state's payload");
-      expect(fs.readFileSync(legacyFile, "utf8")).toBe("unqualified legacy payload");
-      expect(fs.readFileSync(tokenlessFile, "utf8")).toBe("unknown custody");
+      expectBytes(otherFile, "another state's payload");
+      expectBytes(legacyFile, "unqualified legacy payload");
+      expectBytes(tokenlessFile, "unknown custody");
     } finally {
       releaseWarm();
       live.dispose();
@@ -741,13 +733,7 @@ it("preserves artifact setup failure and borrowed custody when partial removal f
     } catch (error) {
       failure = error;
     }
-    if (!(failure instanceof AggregateError)) {
-      throw new Error("Expected the artifact setup and removal failures", { cause: failure });
-    }
-    expect(failure.cause).toBe(primary);
-    expect(failure.errors.length).toBe(2);
-    expect(failure.errors[0]).toBe(primary);
-    expect(failure.errors[1]).toBe(cleanup);
+    expectPairedFailure(failure, primary, cleanup);
     if (!borrowed) {
       throw new Error("Expected the artifact to borrow its capture instance");
     }
