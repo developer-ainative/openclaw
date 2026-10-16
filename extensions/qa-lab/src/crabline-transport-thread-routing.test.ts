@@ -1,43 +1,24 @@
 // Crabline runner tests preserve provider-native thread ownership at the Gateway boundary.
-import type { OpenClawCrablineChannelDriverSelection } from "@openclaw/crabline";
 import { mattermostPlugin } from "@openclaw/mattermost/channel-plugin-api.js";
 import { setMattermostRuntime } from "@openclaw/mattermost/runtime-api.js";
 import { createPluginRuntimeMock } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
-import { withTempDir } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it, vi } from "vitest";
-import { createQaBusState } from "./bus-state.js";
-import { createQaCrablineTransportAdapter } from "./crabline-transport.js";
+import {
+  type CrablineTransport,
+  requireString,
+  withTransport,
+} from "./crabline-transport.test-support.js";
 import { startAgentRun } from "./suite-runtime-agent-process.js";
 
-async function withTransport(
-  channel: OpenClawCrablineChannelDriverSelection["channel"],
-  run: (transport: Awaited<ReturnType<typeof createQaCrablineTransportAdapter>>) => Promise<void>,
+function waitForReply(
+  transport: CrablineTransport,
+  conversation: Parameters<CrablineTransport["waitForOutbound"]>[0]["conversation"],
+  threadId: string,
+  textIncludes: string,
+  timeoutMs = 1_000,
 ) {
-  await withTempDir("qa-crabline-transport-", async (outputDir) => {
-    const transport = await createQaCrablineTransportAdapter({
-      outputDir,
-      selection: {
-        capabilityMatrixPath: "crabline-channel-driver-capabilities.json",
-        channel,
-        channelDriver: "crabline",
-        providerReadinessArtifactPath: "crabline-provider-readiness.json",
-      },
-      state: createQaBusState(),
-    });
-    try {
-      await run(transport);
-    } finally {
-      await transport.cleanupAfterGatewayStop();
-    }
-  });
-}
-
-function requireString(value: unknown, label: string): string {
-  if (typeof value !== "string" || !value) {
-    throw new Error(`${label} is required`);
-  }
-  return value;
+  return transport.waitForOutbound({ conversation, threadId, textIncludes, timeoutMs });
 }
 
 async function postJson<T>(params: {
@@ -95,34 +76,29 @@ describe("Crabline provider thread routing", () => {
           auditContext: "qa-lab-crabline-matrix-thread-correlation-test",
         });
 
-      const waitForReply = (expectedThreadId: string, textIncludes: string, timeoutMs: number) =>
-        transport.waitForOutbound({
-          conversation: { id: conversationId, kind: "direct" },
-          threadId: expectedThreadId,
-          textIncludes,
-          timeoutMs,
-        });
+      const wait = (thread: string, text: string, timeout: number) =>
+        waitForReply(transport, { id: conversationId, kind: "direct" }, thread, text, timeout);
 
       await send("qa-root-send", { body: "matrix root reply", msgtype: "m.text" });
-      await expect(waitForReply(threadId, "matrix root reply", 50)).rejects.toThrow();
-      await expect(waitForReply(secondThreadId, "matrix root reply", 50)).rejects.toThrow();
+      await expect(wait(threadId, "matrix root reply", 50)).rejects.toThrow();
+      await expect(wait(secondThreadId, "matrix root reply", 50)).rejects.toThrow();
       await send("qa-thread-send", {
         body: "matrix threaded reply",
         msgtype: "m.text",
         "m.relates_to": { rel_type: "m.thread", event_id: threadId },
       });
-      await expect(waitForReply(threadId, "matrix threaded reply", 1_000)).resolves.toMatchObject({
+      await expect(wait(threadId, "matrix threaded reply", 1_000)).resolves.toMatchObject({
         threadId,
         text: "matrix threaded reply",
       });
-      await expect(waitForReply(secondThreadId, "matrix threaded reply", 50)).rejects.toThrow();
+      await expect(wait(secondThreadId, "matrix threaded reply", 50)).rejects.toThrow();
       await send("qa-second-thread-send", {
         body: "matrix second threaded reply",
         msgtype: "m.text",
         "m.relates_to": { rel_type: "m.thread", event_id: secondThreadId },
       });
       await expect(
-        waitForReply(secondThreadId, "matrix second threaded reply", 1_000),
+        wait(secondThreadId, "matrix second threaded reply", 1_000),
       ).resolves.toMatchObject({
         threadId: secondThreadId,
         text: "matrix second threaded reply",
@@ -153,24 +129,15 @@ describe("Crabline provider thread routing", () => {
         });
 
       const root = await send("mattermost seed root");
+      const conversation = { id: conversationId, kind: "group" } as const;
       transport.buildAgentDelivery({ target: `group:${conversationId}`, threadId: root.id });
       await send("mattermost unrelated root");
       await expect(
-        transport.waitForOutbound({
-          conversation: { id: conversationId, kind: "group" },
-          threadId: root.id,
-          textIncludes: "mattermost unrelated root",
-          timeoutMs: 50,
-        }),
+        waitForReply(transport, conversation, root.id, "mattermost unrelated root", 50),
       ).rejects.toThrow();
       await send("mattermost threaded reply", root.id);
       await expect(
-        transport.waitForOutbound({
-          conversation: { id: conversationId, kind: "group" },
-          threadId: root.id,
-          textIncludes: "mattermost threaded reply",
-          timeoutMs: 1_000,
-        }),
+        waitForReply(transport, conversation, root.id, "mattermost threaded reply"),
       ).resolves.toMatchObject({ threadId: root.id, text: "mattermost threaded reply" });
     });
   });
@@ -210,12 +177,12 @@ describe("Crabline provider thread routing", () => {
       });
 
       await expect(
-        transport.waitForOutbound({
-          conversation: { id: conversationId, kind: "group" },
+        waitForReply(
+          transport,
+          { id: conversationId, kind: "group" },
           threadId,
-          textIncludes: "mattermost symbolic threaded reply",
-          timeoutMs: 1_000,
-        }),
+          "mattermost symbolic threaded reply",
+        ),
       ).resolves.toMatchObject({ threadId, text: "mattermost symbolic threaded reply" });
     });
   });
