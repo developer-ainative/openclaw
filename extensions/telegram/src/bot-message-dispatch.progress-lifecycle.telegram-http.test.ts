@@ -57,37 +57,55 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
     visibleMarkup,
     acceptedCalls,
     emitToolStart,
-    dispatchProgressTurn: dispatch,
+    dispatchProgressTurn,
     waitForBotApiCall: waitForCall,
   } = http;
   afterEach(() => vi.restoreAllMocks());
 
   const callsFor = (method: string) => calls.filter((call) => call.method === method);
+  const texts = () => [...visibleMessages.values()];
+  const dispatch = (
+    events: Parameters<typeof dispatchProgressTurn>[0],
+    scenario: Partial<NonNullable<Parameters<typeof dispatchProgressTurn>[1]>>,
+  ) => dispatchProgressTurn(events, { mode: "progress", toolProgress: true, ...scenario });
+  const reject = (description: string, error_code = 400) => ({ error_code, description });
+  const tool = (options: ReplyResolverOptions, toolCallId: string, name = "exec") =>
+    emitToolStart(options, { name, phase: "start", toolCallId });
   const deletedIds = () => callsFor("deleteMessage").map((call) => Number(call.fields.message_id));
   const eventually = <T>(read: () => T) => expect.poll(read, { timeout: 5_000 });
   async function startTool(options: ReplyResolverOptions, toolCallId: string) {
-    await emitToolStart(options, { name: "exec", phase: "start", toolCallId });
+    await tool(options, toolCallId);
     await waitForCall((call) => call.method === "sendMessage");
   }
-  async function retainProgress() {
+  async function retainProgress({
+    accept = true,
+    toolProgress = true,
+    prepare = async (_options: ReplyResolverOptions) => {},
+  } = {}) {
     let draft: ProgressDraft | undefined;
+    let progressMessageId: number | undefined;
     let parentCallbacks: ReplyResolverOptions;
     await dispatch(
       async (options) => {
         parentCallbacks = options;
+        await prepare(options);
         await startTool(options, "delegate");
+        progressMessageId = [...visibleMessages.keys()][0];
       },
       {
-        mode: "progress",
-        toolProgress: true,
+        toolProgress,
         finalReply: continuation({ text: waitingText }, (candidate) => {
           draft = candidate;
-          return true;
+          return accept;
         }),
       },
     );
     assert(draft);
-    return { draft, parentCallbacks: parentCallbacks! };
+    return {
+      draft,
+      parentCallbacks: parentCallbacks!,
+      progressMessageId,
+    };
   }
 
   it("reports an owner rejection silently without claiming a network failure", async () => {
@@ -113,7 +131,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
     } finally {
       db.close();
     }
-    expect([...visibleMessages.values()]).toEqual([DELIVERY_WARNING]);
+    expect(texts()).toEqual([DELIVERY_WARNING]);
     const notice = calls.find((call) => call.fields.text === DELIVERY_WARNING);
     expect([notice?.fields.reply_markup, notice?.fields.disable_notification]).toEqual([
       undefined,
@@ -133,7 +151,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
           call.method === "sendMessage" && String(call.fields.text).includes("Pending delegation")
             ? outcome === "no-message-id"
               ? outcome
-              : { error_code: 400, description: "Bad Request: progress rejected" }
+              : reject("Bad Request: progress rejected")
             : undefined;
       } else if (outcome === "media") {
         reply.mediaUrl = "https://example.test/report.pdf";
@@ -147,7 +165,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         // The user deleted the card, so its preview stops editing before the parent yields.
         http.respondToCall = (call) =>
           call.method === "editMessageText"
-            ? { error_code: 400, description: "Bad Request: message to edit not found" }
+            ? reject("Bad Request: message to edit not found")
             : undefined;
       } else {
         reply.interactive = {
@@ -161,14 +179,12 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
           } else {
             await startTool(options, "delegate");
             if (outcome === "stopped") {
-              await emitToolStart(options, { name: "read", phase: "start", toolCallId: "inspect" });
+              await tool(options, "inspect", "read");
               await waitForCall((call) => call.method === "editMessageText");
             }
           }
         },
         {
-          mode: "progress",
-          toolProgress: true,
           finalReply: continuation(reply, () => {
             adopted = true;
             return true;
@@ -177,12 +193,12 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
       );
       expect(adopted).toBe(false);
       if (missingReceipt) {
-        expect([...visibleMessages.values()]).toEqual([waitingText]);
+        expect(texts()).toEqual([waitingText]);
         expect(calls.some((call) => String(call.fields.text).includes("Pending delegation"))).toBe(
           true,
         );
       } else if (outcome === "stopped") {
-        expect([...visibleMessages.values()]).toContain(waitingText);
+        expect(texts()).toContain(waitingText);
       } else if (outcome === "media") {
         const document = acceptedCalls.find((call) => call.method === "sendDocument");
         const upload = resolveTelegramTestUpload(document!.fields, "document");
@@ -214,12 +230,11 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         http.respondToCall = (call) =>
           call.method === "sendMessage" &&
           (call.fields.text === text || DELIVERY_WARNING.includes(String(call.fields.text)))
-            ? { error_code: 400, description: "Bad Request: fixture delivery rejected" }
+            ? reject("Bad Request: fixture delivery rejected")
             : undefined;
       }
       await dispatch(async () => undefined, {
         mode: "off",
-        toolProgress: true,
         textLimit: 80,
         producer: async ({ dispatcher }) => {
           dispatcher.sendFinalReply({ text });
@@ -241,7 +256,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
           calls.some((call) => call.method === "sendMessage" && call.fields.text === text),
         ).toBe(true);
       }
-      expect([...visibleMessages.values()]).toEqual([]);
+      expect(texts()).toEqual([]);
     },
   );
 
@@ -264,12 +279,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         parameters: { retry_after: 5 },
       };
     };
-    const turn = dispatch(
-      async (options) => {
-        await startTool(options, "flood");
-      },
-      { mode: "progress", toolProgress: true, allowErrors: true },
-    );
+    const turn = dispatch((options) => startTool(options, "flood"), { allowErrors: true });
     for (let flood = 0; flood < 3; flood += 1) {
       await flooded.promise;
       flooded = Promise.withResolvers<void>();
@@ -279,29 +289,22 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
 
     expect(floodedAt).toHaveLength(3);
     expect(floodedAt[2]! - floodedAt[0]!).toBeGreaterThanOrEqual(10_000);
-    expect([...visibleMessages.values()]).toEqual(["The command failed."]);
+    expect(texts()).toEqual(["The command failed."]);
     expect(calls.some((call) => String(call.fields.text).startsWith(DELIVERY_WARNING))).toBe(false);
   });
 
   it("preserves a post-progress error final when Telegram rejects cleanup", async () => {
     http.respondToCall = (call) =>
       call.method === "deleteMessage"
-        ? { error_code: 400, description: "Bad Request: progress cleanup rejected" }
+        ? reject("Bad Request: progress cleanup rejected")
         : undefined;
-    await dispatch(
-      async (options) => {
-        await startTool(options, "cleanup");
-      },
-      {
-        mode: "progress",
-        toolProgress: true,
-        textLimit: 80,
-        finalReply: { text: "A".repeat(80) + "B".repeat(40), isError: true },
-      },
-    );
+    await dispatch((options) => startTool(options, "cleanup"), {
+      textLimit: 80,
+      finalReply: { text: "A".repeat(80) + "B".repeat(40), isError: true },
+    });
     await vi.advanceTimersByTimeAsync(4_100);
     await waitForCall((call) => call.method === "deleteMessage");
-    expect([...visibleMessages.values()].slice(1)).toEqual(["A".repeat(80), "B".repeat(40)]);
+    expect(texts().slice(1)).toEqual(["A".repeat(80), "B".repeat(40)]);
     expect(
       calls.filter((call) => call.fields.text === "No response generated. Please try again."),
     ).toEqual([]);
@@ -315,33 +318,21 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
     "keeps the same card after accepted custody ($accept, tool log $toolProgress)",
     async ({ accept, toolProgress }) => {
       const commentary = "Parent commentary remains visible.";
-      const plan = [
-        { step: "Inspect the request", status: "completed" as const },
-        { step: "Finish delegated work", status: "in_progress" as const },
-      ];
-      let draft: ProgressDraft | undefined;
-      let progressMessageId: number | undefined;
-      let parentCallbacks: ReplyResolverOptions | undefined;
-      const waitingPayload = continuation({ text: waitingText }, (candidate) => {
-        draft = candidate;
-        return accept;
-      });
-      await dispatch(
-        async (options) => {
-          parentCallbacks = options;
+      const { draft, parentCallbacks, progressMessageId } = await retainProgress({
+        accept,
+        toolProgress,
+        prepare: async (options) => {
           await options?.onPlanUpdate?.({
             phase: "update",
             explanation: "Delegating the remaining work",
-            steps: plan,
+            steps: [
+              { step: "Inspect the request", status: "completed" },
+              { step: "Finish delegated work", status: "in_progress" },
+            ],
           });
           await preamble(options, "parent-commentary", commentary);
-          await startTool(options, "delegate");
-          progressMessageId = [...visibleMessages.keys()][0];
         },
-        { mode: "progress", toolProgress, finalReply: waitingPayload },
-      );
-
-      expect(draft).toBeDefined();
+      });
       if (accept) {
         await preamble(
           parentCallbacks,
@@ -351,22 +342,21 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         await parentCallbacks?.onPlanUpdate?.({ phase: "update", steps: [] });
         await parentCallbacks?.onQueuedFollowupSettled?.();
       }
-      // Advance detached preview cleanup beyond its four-second dwell.
       await vi.advanceTimersByTimeAsync(4_100);
       if (!accept) {
-        await eventually(() => [...visibleMessages.values()]).toEqual([waitingText]);
+        await eventually(texts).toEqual([waitingText]);
         expect(deletedIds()).toEqual([progressMessageId]);
         return;
       }
       expect([...visibleMessages.entries()]).toEqual([
         [progressMessageId, expect.stringContaining(commentary)],
       ]);
-      expect([...visibleMessages.values()][0]).toContain("Finish delegated work");
+      expect(texts()[0]).toContain("Finish delegated work");
       expect(callsFor("deleteMessage")).toEqual([]);
       expect(calls.some((call) => call.fields.text === waitingText)).toBe(false);
 
       draft?.push(childEvent("Delegated verification", "child"));
-      await eventually(() => [...visibleMessages.values()][0]).toContain("Delegated verification");
+      await eventually(() => texts()[0]).toContain("Delegated verification");
       draft?.retire();
       await eventually(() => [...visibleMessages.keys()]).toEqual([]);
       expect(deletedIds()).toEqual([progressMessageId]);
@@ -381,11 +371,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
     const [retainedId, retainedText] = retained;
 
     await parentCallbacks?.onQueuedFollowupAdmitted?.();
-    await emitToolStart(parentCallbacks, {
-      name: "web_search",
-      phase: "start",
-      toolCallId: "queued",
-    });
+    await tool(parentCallbacks, "queued", "web_search");
     await eventually(() =>
       [...visibleMessages.entries()].filter(([id]) => id !== retainedId),
     ).toEqual([[expect.any(Number), expect.stringContaining("Web Search")]]);
@@ -412,7 +398,6 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         (title: string) => (call: { method: string; fields: Record<string, unknown> }) =>
           call.method === "editMessageText" && String(call.fields.text).includes(title);
       const pushChild = (title: string) => draft.push(childEvent(title));
-      // Requests entering the account scheduler, before any queue wait.
       const entered: string[] = [];
       http.bot.api.config.use((previous, method, payload, signal) => {
         entered.push(`${method}:${JSON.stringify(payload)}`);
@@ -427,11 +412,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
       http.holdNextCall = held;
       const startQueuedTurn = async () => {
         await parentCallbacks?.onQueuedFollowupAdmitted?.();
-        return emitToolStart(parentCallbacks, {
-          name: "web_search",
-          phase: "start",
-          toolCallId: "queued",
-        });
+        return tool(parentCallbacks, "queued", "web_search");
       };
       let queuedTool: Promise<unknown>;
       if (retried) {
@@ -453,7 +434,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
           secondFailed = true;
           second.arrived.resolve();
           await second.release.promise;
-          return { error_code: 500, description: "Internal Server Error: fixture" };
+          return reject("Internal Server Error: fixture", 500);
         };
         pushChild("Late child first");
         await first.arrived.promise;
@@ -492,7 +473,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
       async (options) => {
         await preamble(options, "compaction", "Incomplete preamble", "update");
         await vi.advanceTimersByTimeAsync(1_500);
-        expect([...visibleMessages.values()]).toEqual([]);
+        expect(texts()).toEqual([]);
         await preamble(options, "compaction", "Checking the retained context.");
         await options?.onPlanUpdate?.({
           phase: "update",
@@ -515,14 +496,14 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         await waitForCall((call) => String(call.fields.text).includes("Compaction complete"));
         snapshots.push(visibleMessages.get(progressId!)!);
       },
-      { mode: "progress", toolProgress: true, finalReply: { text: "Compaction finished." } },
+      { finalReply: { text: "Compaction finished." } },
     );
     expect(snapshots).toEqual([
       expect.stringContaining("Compacting context"),
       expect.stringContaining("Compaction incomplete"),
       expect.stringContaining("Compaction complete"),
     ]);
-    expect([...visibleMessages.values()]).toEqual(["Compaction finished."]);
+    expect(texts()).toEqual(["Compaction finished."]);
     expect(JSON.stringify(acceptedCalls)).not.toContain("Incomplete preamble");
     const finalAt = acceptedCalls.findIndex(
       (call) => call.method === "sendMessage" && call.fields.text === "Compaction finished.",
@@ -539,7 +520,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
       async (options) => {
         await options?.onBlockReply?.({ text: "< / internal", isReasoning: true });
         await vi.advanceTimersByTimeAsync(1_500);
-        expect([...visibleMessages.values()]).toEqual([]);
+        expect(texts()).toEqual([]);
         await options?.onReasoningStream?.({
           text: "<think>Checking independent evidence before answering.</think>",
           isReasoningSnapshot: true,
@@ -547,7 +528,6 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
       },
       {
         mode: "partial",
-        toolProgress: true,
         cfg: { agents: { defaults: { reasoningDefault: "off" } } },
         finalReply: [
           { text: "A durable conclusion from the evidence.", isReasoning: true },
@@ -555,7 +535,7 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
         ],
       },
     );
-    expect([...visibleMessages.values()]).toEqual(["Before &lt;think&gt;literal tag text after"]);
+    expect(texts()).toEqual(["Before &lt;think&gt;literal tag text after"]);
     expect(JSON.stringify(acceptedCalls)).not.toContain("internal");
     expect(JSON.stringify(acceptedCalls)).not.toContain("A durable conclusion");
   });
@@ -592,19 +572,19 @@ describe("Telegram progress custody and delivery outcomes through HTTP", () => {
       expect(media).toHaveLength(1);
       const [call] = media;
       assert(call, "Expected an accepted Telegram audio upload");
-      expect(call.method).toBe(source === "raw" ? "sendVoice" : "sendAudio");
-      expect(call.fields.message_thread_id).toBe("777");
-      expect(call.fields.caption).toBe(
-        source === "raw" ? "Example" : "[[reply_to:999]] [[audio_as_voice]] Example",
-      );
-      expect(call.fields.reply_to_message_id).toBe(source === "raw" ? "999" : undefined);
-      expect(call.fields.reply_parameters).toBeUndefined();
+      const caption = source === "raw" ? "Example" : "[[reply_to:999]] [[audio_as_voice]] Example";
+      expect(call).toMatchObject({
+        method: source === "raw" ? "sendVoice" : "sendAudio",
+        fields: { message_thread_id: "777", caption },
+      });
+      expect([call.fields.reply_to_message_id, call.fields.reply_parameters]).toEqual([
+        source === "raw" ? "999" : undefined,
+        undefined,
+      ]);
       expect(
         await resolveTelegramTestUpload(call.fields, source === "raw" ? "voice" : "audio").text(),
       ).toBe("independent audio bytes");
-      expect([...visibleMessages.values()]).toEqual([
-        source === "raw" ? "Example" : "[[reply_to:999]] [[audio_as_voice]] Example",
-      ]);
+      expect(texts()).toEqual([caption]);
     },
   );
 });

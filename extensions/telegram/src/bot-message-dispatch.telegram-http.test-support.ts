@@ -1,5 +1,7 @@
+import { once } from "node:events";
 import { createServer, type Server, type ServerResponse } from "node:http";
-import type { AddressInfo, Socket } from "node:net";
+import type { AddressInfo } from "node:net";
+import { buffer } from "node:stream/consumers";
 import { AbortController as TelegramAbortController } from "abort-controller";
 import { Bot } from "grammy";
 import { projectAgentToolActivity } from "openclaw/plugin-sdk/agent-harness-runtime";
@@ -9,6 +11,7 @@ import {
   unregisterSessionBindingAdapter,
   type SessionBindingAdapter,
 } from "openclaw/plugin-sdk/conversation-runtime";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import {
   createTestRegistry,
@@ -65,8 +68,11 @@ const MESSAGE_METHODS = new Set([
   "sendVoice",
   "sendVideo",
 ]);
-function respondJson(response: ServerResponse, body: unknown, status = 200) {
-  response.writeHead(status).end(JSON.stringify(body));
+function respondJson(response: ServerResponse, result: unknown = true) {
+  response.end(JSON.stringify({ ok: true, result }));
+}
+function rejectJson(response: ServerResponse, error: { error_code: number; description: string }) {
+  response.writeHead(error.error_code).end(JSON.stringify({ ok: false, ...error }));
 }
 
 export function createTelegramDispatchHttpFixture() {
@@ -76,18 +82,17 @@ export function createTelegramDispatchHttpFixture() {
   let bot: Bot;
   let nextMessageId = 0;
   let inboundSequence = 0;
-  const sockets = new Set<Socket>();
   const calls: RecordedBotApiCall[] = [];
   const endpoints: string[] = [];
   const visibleMessages = new Map<number, string>();
   const visibleMarkup = new Map<number, unknown>();
   const acceptedCalls: RecordedBotApiCall[] = [];
-  const botApiCallWaiters = new Set<(call: RecordedBotApiCall) => void>();
+  const botApiCalls = new EventTarget();
+  const completedCalls = new WeakSet<RecordedBotApiCall>();
   const pendingDeletes: Promise<unknown>[] = [];
   let typingSend: Promise<void> = Promise.resolve();
   let lifetime: AbortController;
-  let stopped: Promise<never>;
-  let stop: (error: Error) => void;
+  let stopped: ReturnType<typeof createDeferred<never>>;
   const pendingDispatches = new Set<Promise<unknown>>();
   const pendingTranscriptMirrors: Promise<unknown>[] = [];
   let restoreTranscriptMirror: () => void;
@@ -109,12 +114,8 @@ export function createTelegramDispatchHttpFixture() {
 
   beforeAll(async () => {
     server = createServer((request, response) => {
-      const chunks: Buffer[] = [];
-      request.on("data", (chunk: Buffer) => {
-        chunks.push(chunk);
-      });
       const respond = async () => {
-        const body = Buffer.concat(chunks);
+        const body = await buffer(request);
         const contentType = request.headers["content-type"] ?? "application/json";
         const fields: Record<string, unknown> = contentType.includes("multipart/form-data")
           ? Object.fromEntries(
@@ -133,25 +134,27 @@ export function createTelegramDispatchHttpFixture() {
         endpoints.push(request.url ?? "");
         calls.push(call);
         response.once("finish", () => {
-          for (const waiter of botApiCallWaiters) {
-            waiter(call);
-          }
+          completedCalls.add(call);
+          botApiCalls.dispatchEvent(new Event("call"));
         });
         const held = holdNextCall;
         if (held?.predicate(call)) {
           holdNextCall = undefined;
           held.arrived.resolve();
-          await Promise.race([held.release.promise, stopped]);
+          await Promise.race([held.release.promise, stopped.promise]);
         }
         response.setHeader("content-type", "application/json");
         // Idle keep-alive expiry must not race later fixture requests under load.
         response.setHeader("connection", "close");
-        const rejection = await Promise.race([Promise.resolve(respondToCall?.(call)), stopped]);
+        const rejection = await Promise.race([
+          Promise.resolve(respondToCall?.(call)),
+          stopped.promise,
+        ]);
         if (rejection) {
           if (rejection === "no-message-id") {
-            respondJson(response, { ok: true, result: true });
+            respondJson(response);
           } else {
-            respondJson(response, { ok: false, ...rejection }, rejection.error_code);
+            rejectJson(response, rejection);
           }
           return;
         }
@@ -163,15 +166,7 @@ export function createTelegramDispatchHttpFixture() {
           "quote" in fields.reply_parameters
         ) {
           rejectNextQuote = false;
-          respondJson(
-            response,
-            {
-              ok: false,
-              error_code: 400,
-              description: "Bad Request: quote not found",
-            },
-            400,
-          );
+          rejectJson(response, { error_code: 400, description: "Bad Request: quote not found" });
           return;
         }
         acceptedCalls.push(call);
@@ -186,7 +181,7 @@ export function createTelegramDispatchHttpFixture() {
               }
             : { id: chatId, type: "private", first_name: "Fixture" };
         if (method === "getChat") {
-          respondJson(response, { ok: true, result: chat });
+          respondJson(response, chat);
           return;
         }
         if (MESSAGE_METHODS.has(method)) {
@@ -207,17 +202,14 @@ export function createTelegramDispatchHttpFixture() {
             visibleMarkup.set(messageId, fields.reply_markup);
           }
           respondJson(response, {
-            ok: true,
-            result: {
-              message_id: messageId,
-              date: 1_700_000_000,
-              chat,
-              text,
-              ...(caption === undefined ? {} : { caption }),
-              ...(fields.message_thread_id
-                ? { message_thread_id: Number(fields.message_thread_id) }
-                : {}),
-            },
+            message_id: messageId,
+            date: 1_700_000_000,
+            chat,
+            text,
+            ...(caption === undefined ? {} : { caption }),
+            ...(fields.message_thread_id
+              ? { message_thread_id: Number(fields.message_thread_id) }
+              : {}),
           });
           return;
         }
@@ -228,21 +220,14 @@ export function createTelegramDispatchHttpFixture() {
           visibleMessages.delete(Number(fields.message_id));
           visibleMarkup.delete(Number(fields.message_id));
         }
-        respondJson(response, { ok: true, result: true });
+        respondJson(response);
       };
-      request.on("end", () => {
-        void respond().catch((error: unknown) =>
-          response.destroy(error instanceof Error ? error : new Error(String(error))),
-        );
-      });
+      void respond().catch((error: unknown) =>
+        response.destroy(error instanceof Error ? error : new Error(String(error))),
+      );
     });
-    server.on("connection", (socket) => {
-      sockets.add(socket);
-      socket.on("close", () => sockets.delete(socket));
-    });
-    await new Promise<void>((resolve) => {
-      server.listen(0, "127.0.0.1", resolve);
-    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
     apiRoot = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   });
 
@@ -261,10 +246,8 @@ export function createTelegramDispatchHttpFixture() {
       });
     restoreTranscriptMirror = () => observer.mockRestore();
     lifetime = new AbortController();
-    stopped = new Promise<never>((_resolve, reject) => {
-      stop = reject;
-    });
-    void stopped.catch(() => undefined);
+    stopped = createDeferred<never>();
+    void stopped.promise.catch(() => undefined);
     resetTelegramAccountThrottlersForTest();
     bot = new Bot(BOT_TOKEN, { client: { apiRoot } });
     const requestLifetime = lifetime.signal;
@@ -282,13 +265,11 @@ export function createTelegramDispatchHttpFixture() {
       if (method === "deleteMessage") {
         pendingDeletes.push(request);
       }
-      try {
-        return await request;
-      } finally {
+      return request.finally(() => {
         pendingRequests.delete(request);
         requestLifetime.removeEventListener("abort", abort);
         signal?.removeEventListener("abort", abort);
-      }
+      });
     });
     holdNextCall = undefined;
     // SQLite workers share native hrtime deadlines with the dispatching thread.
@@ -323,7 +304,7 @@ export function createTelegramDispatchHttpFixture() {
   afterEach(async () => {
     const ended = new Error("Telegram HTTP fixture ended");
     lifetime.abort(ended);
-    stop(ended);
+    stopped.reject(ended);
     await Promise.allSettled(pendingDispatches);
     await Promise.allSettled([...pendingRequests, typingSend]);
     await settleDetachedDeletes();
@@ -339,7 +320,6 @@ export function createTelegramDispatchHttpFixture() {
     vi.useRealTimers();
     resetPluginRuntimeStateForTest();
     resetGlobalHookRunner();
-    botApiCallWaiters.clear();
     clearTelegramRuntimeForTest();
     resetPluginStateStoreForTests();
     vi.unstubAllEnvs();
@@ -351,29 +331,15 @@ export function createTelegramDispatchHttpFixture() {
     if (calls.some(predicate)) {
       return;
     }
-    let waiter: (call: RecordedBotApiCall) => void;
-    const observed = new Promise<void>((resolve) => {
-      waiter = (call) => {
-        if (predicate(call)) {
-          resolve();
-        }
-      };
-      botApiCallWaiters.add(waiter);
-    });
-    try {
-      await Promise.race([observed, stopped]);
-    } finally {
-      botApiCallWaiters.delete(waiter!);
+    // A wakeup may race another recorded request whose response is still held.
+    while (!calls.some((call) => completedCalls.has(call) && predicate(call))) {
+      await once(botApiCalls, "call", { signal: lifetime.signal });
     }
   }
 
   afterAll(async () => {
-    for (const socket of sockets) {
-      socket.destroy();
-    }
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve());
-    });
+    server.closeAllConnections();
+    await once(server.close(), "close");
   });
 
   function createContext(): TelegramMessageContext {
@@ -481,10 +447,8 @@ export function createTelegramDispatchHttpFixture() {
                 defaultAccount: scenario.accountId,
                 accounts: {
                   [scenario.accountId]: {
-                    ...telegramCfg,
                     richMessages: false,
-                    ...scenario?.telegramCfg,
-                    replyToMode,
+                    ...telegramCfg,
                     streaming: { ...telegramCfg.streaming, block: { enabled: false } },
                   },
                 },
@@ -571,11 +535,7 @@ export function createTelegramDispatchHttpFixture() {
         .map((call) => [call.method, call.fields.message_id ?? null, call.fields.text] as const);
     })();
     pendingDispatches.add(work);
-    try {
-      return await work;
-    } finally {
-      pendingDispatches.delete(work);
-    }
+    return work.finally(() => pendingDispatches.delete(work));
   }
 
   return {

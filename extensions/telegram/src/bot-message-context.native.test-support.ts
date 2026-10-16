@@ -4,6 +4,12 @@ import type { Bot } from "grammy";
 import type { Message } from "grammy/types";
 import type { OpenClawConfig, TelegramGroupConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
+  registerSessionBindingAdapter,
+  unregisterSessionBindingAdapter,
+  type SessionBindingRecord,
+} from "openclaw/plugin-sdk/conversation-runtime";
+import { upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
+import {
   deliverTelegramUpdate,
   groupChat,
   harness,
@@ -43,4 +49,42 @@ export function topicService(name: string, from?: Message["from"], message_id = 
 
 export async function receiveContextMessage(bot: Bot, message: Message) {
   await deliverTelegramUpdate(bot, { update_id: ++updateId, message });
+}
+
+export function bindContext(
+  conversationId: string,
+  targetSessionKey: string,
+  options: {
+    accountId?: string;
+    bindingId?: string;
+    metadata?: SessionBindingRecord["metadata"];
+  } = {},
+) {
+  const { accountId = "default", bindingId = "context-binding", metadata } = options;
+  const record: SessionBindingRecord = {
+    bindingId,
+    targetSessionKey,
+    targetKind: "session",
+    status: "active",
+    boundAt: 1,
+    metadata,
+    conversation: { channel: "telegram", accountId, conversationId },
+  };
+  const adapter = {
+    channel: "telegram",
+    accountId,
+    listBySession: () => [record],
+    resolveByConversation: (conversation: SessionBindingRecord["conversation"]) =>
+      conversation.conversationId === conversationId ? record : null,
+  };
+  registerSessionBindingAdapter(adapter);
+  return () => unregisterSessionBindingAdapter({ channel: "telegram", accountId, adapter });
+}
+
+export function seedContextSession(
+  storePath: string,
+  sessionKey: string,
+  entry: Parameters<typeof upsertSessionEntry>[0]["entry"],
+) {
+  return upsertSessionEntry({ storePath, sessionKey, entry });
 }
