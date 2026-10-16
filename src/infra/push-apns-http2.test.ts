@@ -216,12 +216,7 @@ describe("connectApnsHttp2Session", () => {
     );
     const proxyUrl = lastTunnelCall().proxyUrl;
     expect(proxyUrl).toBeInstanceOf(URL);
-    if (!(proxyUrl instanceof URL)) {
-      throw new Error("expected normalized proxy URL");
-    }
-    expect(proxyUrl.pathname).toBe("/");
-    expect(proxyUrl.search).toBe("");
-    expect(proxyUrl.hash).toBe("");
+    expect(proxyUrl).toMatchObject({ pathname: "/", search: "", hash: "" });
     expect(String(await result.catch((error: unknown) => error))).not.toMatch(
       /private|opaque|fragment/,
     );
@@ -290,10 +285,7 @@ describe("connectApnsHttp2Session", () => {
     const tunnelCall = lastTunnelCall();
     const proxyUrl = tunnelCall.proxyUrl;
     expect(proxyUrl).toBeInstanceOf(URL);
-    if (!(proxyUrl instanceof URL)) {
-      throw new Error("expected explicit proxy URL");
-    }
-    expect(proxyUrl.href).toBe("http://proxy.example:8080/");
+    expect(proxyUrl).toMatchObject({ href: "http://proxy.example:8080/" });
     expect(tunnelCall).toMatchObject({
       targetHost: "api.sandbox.push.apple.com",
       targetPort: 443,

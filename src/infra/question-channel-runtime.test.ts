@@ -104,10 +104,8 @@ describe("question channel runtime", () => {
         expect(nextFinalize).toHaveBeenCalledExactlyOnceWith("Expired");
       } finally {
         release.resolve();
-        // The baseline clear does not own this promise; join the original finalizer on red too.
         await finalizerWork;
         await clearing;
-        await runtime.clear();
       }
     },
   );
@@ -196,7 +194,6 @@ describe("question channel runtime", () => {
     } finally {
       release.resolve();
       await clearing;
-      await runtime.clear();
     }
   });
 
@@ -259,7 +256,6 @@ describe("question channel runtime", () => {
       await Promise.all([gateway.drain(), otherGateway.drain()]);
       runtime.retireGateway(gateway.signal);
       runtime.retireGateway(otherGateway.signal);
-      await runtime.clear();
     }
   });
 
@@ -291,7 +287,6 @@ describe("question channel runtime", () => {
       } finally {
         release.resolve();
         admission?.release();
-        await runtime.clear();
       }
     },
   );
@@ -349,20 +344,22 @@ describe("question channel runtime", () => {
     }
   });
 
-  it("does not echo free-text answers", async () => {
+  it.each([
+    [undefined, "@everyone secret-ish text", "Answered", undefined],
+    [record.questions[0]!.options, "Staging", "Answered: Staging", answer(record.id, "Staging")],
+  ] as const)("only echoes declared choices (%j)", async (options, value, expected, initial) => {
     const finalize = vi.fn();
-
     runtime.handleRequested(
       {
         ...record,
-        questions: [{ ...record.questions[0]!, options: [], isOther: true }],
+        ...initial,
+        questions: [{ ...record.questions[0]!, options: options ?? [], isOther: true }],
       },
       scheduler,
     );
     deliver("telegram:text", finalize);
-    runtime.handleResolved(answer(record.id, "@everyone secret-ish text"));
-
-    await vi.waitFor(() => expect(finalize).toHaveBeenCalledWith("Answered"));
+    runtime.handleResolved(answer(record.id, value));
+    await vi.waitFor(() => expect(finalize).toHaveBeenCalledWith(expected));
   });
 
   it("retains terminal state beyond the gateway grace for late delivery capture", async () => {
@@ -472,24 +469,5 @@ describe("question channel runtime", () => {
 
     await vi.waitFor(() => expect(onFinalizeError).toHaveBeenCalledOnce());
     expect(onFinalizeError).toHaveBeenCalledWith(error, record.id, "discord:1");
-    await runtime.clear();
-  });
-});
-
-describe("terminal status labels", () => {
-  it("echoes declared option answers even when free-text input was allowed", async () => {
-    const recordWithOther: QuestionRecord = {
-      ...record,
-      questions: [{ ...record.questions[0]!, isOther: true }],
-      ...answer(record.id, "Staging"),
-    };
-    const finalize = vi.fn();
-
-    runtime.handleRequested(recordWithOther, scheduler);
-    deliver("test:1", finalize, recordWithOther.id);
-    runtime.handleResolved(answer(recordWithOther.id, "Staging"));
-
-    await vi.waitFor(() => expect(finalize).toHaveBeenCalledWith("Answered: Staging"));
-    await runtime.clear();
   });
 });
