@@ -271,9 +271,9 @@ export function handleChatScrollTakeover(host: ChatScrollHost, towardEnd?: boole
   if (towardEnd === false) {
     // Upward intent owns the viewport before the browser moves it.
     lockChatScroll(host);
-    return;
+  } else {
+    cancelChatScroll(host);
   }
-  cancelChatScroll(host);
   const container = host.chatScrollElement?.();
   if (container) {
     // Intent can stop a smooth scroll without moving a pixel. Retire queued
@@ -327,7 +327,7 @@ function updateChatScrollPosition(
     host.chatReadingHistory = true;
   } else if (
     distanceFromBottom <= CHAT_TRANSCRIPT_END_THRESHOLD_PX &&
-    (delta > 0 || takeover === "toward-end")
+    ((delta > 0 && takeover === false) || takeover === "toward-end")
   ) {
     // A shrinking dock can clamp scrollTop backwards to the new end. Only
     // reader movement toward the end or fresh input resumes following.
