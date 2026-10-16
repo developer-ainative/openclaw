@@ -39,24 +39,20 @@ beforeAll(async () => {
         res.writeHead(200, { "content-type": "text/event-stream" });
         return;
       }
-      if (mode === "provider-timeout") {
-        res.writeHead(408, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "upstream request timed out" } }));
-        return;
-      }
       if (mode === "bare-408") {
         res.writeHead(408);
         res.end();
         return;
       }
-      if (mode === "server-error") {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "Internal Server Error" } }));
-        return;
-      }
-      if (mode === "error") {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "summary model rejected the request" } }));
+      const errors = {
+        "provider-timeout": [408, "upstream request timed out"],
+        "server-error": [500, "Internal Server Error"],
+        error: [400, "summary model rejected the request"],
+      } as const;
+      if (mode !== "ok") {
+        const [statusCode, message] = errors[mode];
+        res.writeHead(statusCode, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message } }));
         return;
       }
       const chunk = (delta: object, finishReason: string | null) =>
@@ -220,6 +216,18 @@ function openSession(fixture: Fixture) {
   return SessionManager.open(fixture.target, fixture.state.workspaceDir);
 }
 
+function getCompactions(fixture: Fixture) {
+  return openSession(fixture)
+    .getBranch()
+    .filter((entry) => entry.type === "compaction");
+}
+
+function expectFallbackSummary(fixture: Fixture) {
+  expect(getCompactions(fixture).map((entry) => entry.summary)).toEqual([
+    expect.stringContaining("removed without a summary"),
+  ]);
+}
+
 describe("automatic compaction summary failure", () => {
   it("commits a deterministic reduction after a bodyless 408 summary timeout", async () => {
     await withSession(async (fixture) => {
@@ -251,11 +259,7 @@ describe("automatic compaction summary failure", () => {
       summaryRequests = [];
       expect(await compactSession(fixture)).toMatchObject({ ok: true, compacted: true });
       expect(summaryRequests.join("\n")).toContain("removed without a summary");
-      expect(
-        openSession(fixture)
-          .getBranch()
-          .findLast((entry) => entry.type === "compaction")?.summary,
-      ).toContain("Model summary after recovery.");
+      expect(getCompactions(fixture).at(-1)?.summary).toContain("Model summary after recovery.");
     });
   });
 
@@ -270,12 +274,7 @@ describe("automatic compaction summary failure", () => {
         expect(summaryRequests.some((body) => body.includes('"model":"fallback-model"'))).toBe(
           false,
         );
-        expect(
-          openSession(fixture)
-            .getBranch()
-            .filter((entry) => entry.type === "compaction")
-            .map((entry) => entry.summary),
-        ).toEqual([expect.stringContaining("removed without a summary")]);
+        expectFallbackSummary(fixture);
       },
       { modelFallback: true },
     );
@@ -289,12 +288,7 @@ describe("automatic compaction summary failure", () => {
 
         expect(await compactSession(fixture)).toMatchObject({ ok: true, compacted: true });
         expect(summaryRequests.length).toBeGreaterThan(0);
-        expect(
-          openSession(fixture)
-            .getBranch()
-            .filter((entry) => entry.type === "compaction")
-            .map((entry) => entry.summary),
-        ).toEqual([expect.stringContaining("removed without a summary")]);
+        expectFallbackSummary(fixture);
       },
       { safeguard: true },
     );
@@ -318,11 +312,7 @@ describe("automatic compaction summary failure", () => {
 
       expect(await pending).toMatchObject({ ok: false, compacted: false });
       expect(summaryRequests.length).toBeGreaterThan(0);
-      expect(
-        openSession(fixture)
-          .getBranch()
-          .some((entry) => entry.type === "compaction"),
-      ).toBe(false);
+      expect(getCompactions(fixture)).toHaveLength(0);
     });
   });
 });

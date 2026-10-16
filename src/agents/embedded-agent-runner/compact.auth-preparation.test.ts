@@ -35,6 +35,7 @@ const [
   import("../../config/runtime-snapshot.js"),
 ]);
 const tempDirs = useSessionStoreTempDirs(afterAll, "openclaw-compaction-auth-");
+const primaryModel = { provider: "openai", model: "gpt-primary" };
 
 async function prepareCompactionParams() {
   const workspaceDir = tempDirs.make();
@@ -45,17 +46,21 @@ async function prepareCompactionParams() {
     sessionKey: "agent:main:compaction-auth",
     storePath: join(workspaceDir, "sessions.sqlite"),
   };
-  await upsertSessionEntryCore(sessionTarget, {
-    sessionId: sessionTarget.sessionId,
-    updatedAt: 1,
-  });
+  await upsertSessionEntryCore(sessionTarget, { sessionId: sessionTarget.sessionId, updatedAt: 1 });
   return { ...sessionTarget, sessionTarget, sessionFile: sessionTarget.sessionKey, workspaceDir };
 }
 
-async function runOwnedCompaction(run: () => ReturnType<typeof compactEmbeddedAgentSessionDirect>) {
+async function runOwnedCompaction(
+  params: Parameters<typeof compactEmbeddedAgentSession>[0],
+  mode: "direct" | "queued" = "direct",
+) {
   const parent = new AsyncWorkScope();
   try {
-    return await parent.run(run);
+    return await parent.run(() =>
+      mode === "direct"
+        ? compactEmbeddedAgentSessionDirect(params)
+        : compactEmbeddedAgentSession(params),
+    );
   } finally {
     await AsyncWorkScope.runWhenAllIdle(
       () => [parent],
@@ -96,16 +101,13 @@ it.each(["lookup", "hook", "allowed"] as const)(
       }
       return { apiKey: "prepared-fixture-key" };
     });
-    const result = await runOwnedCompaction(() =>
-      compactEmbeddedAgentSessionDirect({
-        ...baseParams,
-        provider: "openai",
-        model: "gpt-primary",
-        trigger: "budget",
-        abortSignal: controller.signal,
-        config: { agents: { defaults: { compaction: { model: "openai/gpt-primary" } } } },
-      }),
-    );
+    const result = await runOwnedCompaction({
+      ...baseParams,
+      ...primaryModel,
+      trigger: "budget",
+      abortSignal: controller.signal,
+      config: { agents: { defaults: { compaction: { model: "openai/gpt-primary" } } } },
+    });
     expect(getApiKeyForModelMock).toHaveBeenCalled();
     expect(prepareAuth).toHaveBeenCalledTimes(stage === "lookup" ? 0 : 1);
     expect(result.ok).toBe(stage === "allowed");
@@ -129,7 +131,7 @@ it.each([false, true])(
     const baseParams = await prepareCompactionParams();
     let revoked = false;
     const dispose = vi.fn();
-    const provider = {
+    const uninstall = installSessionPlacementAdmissionProvider({
       async prepareSandbox() {
         return {
           sandbox: null,
@@ -141,9 +143,6 @@ it.each([false, true])(
           [Symbol.dispose]: dispose,
         };
       },
-    };
-    const uninstall = installSessionPlacementAdmissionProvider({
-      ...provider,
       assertCompactionSuccessorAllowed() {},
       executeLocalTurn: async (_claim, run) => await run(),
       executeTurn: async (_claim, _params, run) => await run(),
@@ -154,14 +153,14 @@ it.each([false, true])(
     });
     setRuntimeConfigSnapshot({});
     try {
-      const operation = runOwnedCompaction(() =>
-        compactEmbeddedAgentSession({
+      const operation = runOwnedCompaction(
+        {
           ...baseParams,
-          provider: "openai",
-          model: "gpt-primary",
+          ...primaryModel,
           trigger: "manual",
           enqueue: async (task) => await task(),
-        }),
+        },
+        "queued",
       );
       if (revoke) {
         await expect(operation).rejects.toThrow("placement revoked during engine preparation");
@@ -195,8 +194,7 @@ it.each(["direct", "queued"] as const)(
     vi.mocked(ensureAuthProfileStoreWithoutExternalProfiles).mockReturnValue(authStore);
     const params = {
       ...baseParams,
-      provider: "openai",
-      model: "gpt-primary",
+      ...primaryModel,
       trigger: "budget" as const,
       forcePreflight: true,
       preflightRequired: true,
@@ -211,11 +209,7 @@ it.each(["direct", "queued"] as const)(
       enqueue: async <T>(task: () => Promise<T> | T) => await task(),
     };
 
-    const result = await runOwnedCompaction(() =>
-      mode === "direct"
-        ? compactEmbeddedAgentSessionDirect(params)
-        : compactEmbeddedAgentSession(params),
-    );
+    const result = await runOwnedCompaction(params, mode);
 
     expect(result).toMatchObject({
       ok: false,
@@ -259,8 +253,8 @@ it("compacts through the configured fallback when the primary profile is cooling
     compact: vi.fn(delegateCompactionToRuntime),
   });
 
-  const result = await runOwnedCompaction(() =>
-    compactEmbeddedAgentSession({
+  const result = await runOwnedCompaction(
+    {
       ...baseParams,
       agentDir,
       provider: "primary",
@@ -274,7 +268,8 @@ it("compacts through the configured fallback when the primary profile is cooling
           defaults: { model: { primary: "primary/model", fallbacks: ["backup/model"] } },
         },
       },
-    }),
+    },
+    "queued",
   );
 
   expect(result, JSON.stringify(result)).toMatchObject({ ok: true, compacted: true });

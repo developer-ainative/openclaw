@@ -37,6 +37,13 @@ export function registerCompactionSafeguardTests({
   wrappedCompactionArgs: (overrides?: Record<string, unknown>) => Parameters<Compact>[0];
   getWorkspaceDir: () => string;
 }) {
+  const compact = (overrides?: Record<string, unknown>) =>
+    compactEmbeddedAgentSessionDirect(wrappedCompactionArgs(overrides));
+  const settings = () =>
+    SettingsManager.inMemory({
+      compaction: { enabled: false, reserveTokens: 1_024, keepRecentTokens: 1 },
+      retry: { enabled: false },
+    });
   it.each([
     { modelCallUrgency: undefined, expectedUrgency: "background" },
     { modelCallUrgency: "foreground", expectedUrgency: "foreground" },
@@ -97,9 +104,30 @@ export function registerCompactionSafeguardTests({
       limitHistoryTurnsMock.mockImplementation(originalHistoryLimit);
     });
 
-    it("keeps workspace rules in explicit compaction when the Gateway cwd differs", async () => {
+    const loadSafeguard = () =>
+      loadExtensionFromFactory(
+        safeguard,
+        getWorkspaceDir(),
+        createEventBus(),
+        createExtensionRuntime(),
+      );
+
+    async function bindSession(sessionManager: SessionManager, stream?: StreamFn) {
       const { createAgentSession } = await import("../sessions/sdk.js");
       const { guardSessionManager } = await import("../session-tool-result-guard-wrapper.js");
+      vi.mocked(guardSessionManager).mockReturnValue(sessionManager);
+      limitHistoryTurnsMock.mockImplementation((messages) => messages);
+      if (stream) {
+        const { resolveEmbeddedAgentStream } = await import("./stream-resolution.js");
+        vi.mocked(resolveEmbeddedAgentStream).mockReturnValue({
+          streamFn: stream,
+          strategy: "session-custom",
+        });
+      }
+      return vi.mocked(createAgentSession);
+    }
+
+    it("keeps workspace rules in explicit compaction when the Gateway cwd differs", async () => {
       const { buildEmbeddedExtensionFactories } = await import("./extensions.js");
       const actualExtensions =
         await vi.importActual<typeof import("./extensions.js")>("./extensions.js");
@@ -115,45 +143,33 @@ export function registerCompactionSafeguardTests({
       ]) {
         await sessionManager.appendMessageAsync({ role: "user", content, timestamp: 1 });
       }
-      const extension = await loadExtensionFromFactory(
-        safeguard,
-        getWorkspaceDir(),
-        createEventBus(),
-        createExtensionRuntime(),
-      );
+      const extension = await loadSafeguard();
       vi.mocked(buildEmbeddedExtensionFactories).mockImplementation(
         actualExtensions.buildEmbeddedExtensionFactories,
       );
-      vi.mocked(guardSessionManager).mockReturnValue(sessionManager);
-      limitHistoryTurnsMock.mockImplementation((messages) => messages);
       resolveEffectiveCompactionModeMock.mockReturnValue("safeguard");
-      vi.mocked(createAgentSession).mockImplementation(async () =>
+      (await bindSession(sessionManager)).mockImplementation(async () =>
         createTestSession({
           model: testModel,
           sessionManager,
-          settingsManager: SettingsManager.inMemory({
-            compaction: { enabled: false, reserveTokens: 1_024, keepRecentTokens: 1 },
-            retry: { enabled: false },
-          }),
+          settingsManager: settings(),
           resourceLoader: createResourceLoader(extension.handlers),
         }),
       );
-      const result = await compactEmbeddedAgentSessionDirect(
-        wrappedCompactionArgs({
-          config: {
-            agents: {
-              defaults: {
-                compaction: {
-                  mode: "safeguard",
-                  postCompactionSections: ["Compaction fixture"],
-                  recentTurnsPreserve: 0,
-                  qualityGuard: { enabled: false },
-                },
+      const result = await compact({
+        config: {
+          agents: {
+            defaults: {
+              compaction: {
+                mode: "safeguard",
+                postCompactionSections: ["Compaction fixture"],
+                recentTurnsPreserve: 0,
+                qualityGuard: { enabled: false },
               },
             },
           },
-        }),
-      );
+        },
+      });
       expect(result, result.reason).toMatchObject({ ok: true, compacted: true });
       expect(result.result?.summary).toContain(
         "<workspace-critical-rules>\n## Compaction fixture\nWORKSPACE_RULE_MARKER\n</workspace-critical-rules>",
@@ -162,9 +178,6 @@ export function registerCompactionSafeguardTests({
 
     it("returns a structured automatic retention skip without reporting compaction failure", async () => {
       const { isBenignCompactionSkipResult } = await import("./compact-reasons.js");
-      const { createAgentSession } = await import("../sessions/sdk.js");
-      const { guardSessionManager } = await import("../session-tool-result-guard-wrapper.js");
-      const { resolveEmbeddedAgentStream } = await import("./stream-resolution.js");
       const { attachCompactionAccountingRecorder } =
         await import("./run/compaction-accounting-bridge.js");
       const sessionManager = SessionManager.inMemory(getWorkspaceDir());
@@ -185,16 +198,8 @@ export function registerCompactionSafeguardTests({
         sessionManager.getBranch().filter((entry) => entry.type === "message");
       const before = structuredClone(conversation());
       const stream = vi.fn<StreamFn>();
-      vi.mocked(guardSessionManager).mockReturnValue(sessionManager);
-      limitHistoryTurnsMock.mockImplementation((messages) => messages);
-      vi.mocked(resolveEmbeddedAgentStream).mockReturnValue({
-        streamFn: stream,
-        strategy: "session-custom",
-      });
-      vi.mocked(createAgentSession).mockImplementation(async ({ model }) => {
-        if (!model) {
-          throw new Error("Expected prepared compaction model");
-        }
+      (await bindSession(sessionManager, stream)).mockImplementation(async ({ model }) => {
+        expectDefined(model, "prepared compaction model");
         return await createTestSession({
           model: { ...testModel, ...model },
           sessionManager,
@@ -205,9 +210,7 @@ export function registerCompactionSafeguardTests({
           resourceLoader: createResourceLoader(),
         });
       });
-      const result = await compactEmbeddedAgentSessionDirect(
-        wrappedCompactionArgs({ trigger: "budget", contextEngineRuntimeContext }),
-      );
+      const result = await compact({ trigger: "budget", contextEngineRuntimeContext });
       expect(result).toMatchObject({
         ok: true,
         compacted: false,
@@ -236,17 +239,7 @@ export function registerCompactionSafeguardTests({
     ] as const)(
       "keeps model fallback boundaries for %s",
       async (scenario, errorMessage, outcome) => {
-        const [
-          { createAgentSession },
-          { guardSessionManager },
-          { resolveEmbeddedAgentStream },
-          { buildEmbeddedExtensionFactories },
-        ] = await Promise.all([
-          import("../sessions/sdk.js"),
-          import("../session-tool-result-guard-wrapper.js"),
-          import("./stream-resolution.js"),
-          import("./extensions.js"),
-        ]);
+        const { buildEmbeddedExtensionFactories } = await import("./extensions.js");
         const fallback = outcome === "fallback";
         const primary = "summary-primary";
         const backup = "summary-backup";
@@ -273,16 +266,8 @@ export function registerCompactionSafeguardTests({
           sessionManager.appendMessage({ role: "user", content, timestamp: 1 });
         }
         const originalMessages = sessionManager.buildSessionContext().messages;
-        const settingsManager = SettingsManager.inMemory({
-          compaction: { enabled: false, reserveTokens: 1_024, keepRecentTokens: 1 },
-          retry: { enabled: false },
-        });
-        const extension = await loadExtensionFromFactory(
-          safeguard,
-          getWorkspaceDir(),
-          createEventBus(),
-          createExtensionRuntime(),
-        );
+        const settingsManager = settings();
+        const extension = await loadSafeguard();
         const requestedModels: string[] = [];
         const requestedThinking: Array<string | undefined> = [];
         const stream = vi.fn<StreamFn>((activeModel, _context, options) => {
@@ -309,13 +294,7 @@ export function registerCompactionSafeguardTests({
           );
         });
         vi.mocked(summaryBridge).mockImplementation(generateRealSummary);
-        vi.mocked(guardSessionManager).mockReturnValue(sessionManager);
-        limitHistoryTurnsMock.mockImplementation((messages) => messages);
         resolveEffectiveCompactionModeMock.mockReturnValue("safeguard");
-        vi.mocked(resolveEmbeddedAgentStream).mockReturnValue({
-          streamFn: stream,
-          strategy: "session-custom",
-        });
         vi.mocked(buildEmbeddedExtensionFactories).mockImplementation(({ model }) => {
           setSafeguardRuntime(sessionManager, {
             model,
@@ -325,24 +304,24 @@ export function registerCompactionSafeguardTests({
           });
           return [];
         });
-        vi.mocked(createAgentSession).mockImplementation(async ({ model, thinkingLevel }) => {
-          if (!model) {
-            throw new Error("Expected the prepared compaction model");
-          }
-          const created = await createTestSession({
-            model: {
-              ...testModel,
-              ...model,
-              reasoning: outcome === "thinking",
-              maxTokens: 1_024,
-            },
-            sessionManager,
-            settingsManager,
-            resourceLoader: createResourceLoader(extension.handlers),
-          });
-          await created.session.setThinkingLevel(thinkingLevel ?? "off");
-          return created;
-        });
+        (await bindSession(sessionManager, stream)).mockImplementation(
+          async ({ model, thinkingLevel }) => {
+            expectDefined(model, "prepared compaction model");
+            const created = await createTestSession({
+              model: {
+                ...testModel,
+                ...model,
+                reasoning: outcome === "thinking",
+                maxTokens: 1_024,
+              },
+              sessionManager,
+              settingsManager,
+              resourceLoader: createResourceLoader(extension.handlers),
+            });
+            await created.session.setThinkingLevel(thinkingLevel ?? "off");
+            return created;
+          },
+        );
         const config = {
           agents: {
             defaults: {
@@ -359,14 +338,12 @@ export function registerCompactionSafeguardTests({
         };
         const configBefore = structuredClone(config);
 
-        const result = await compactEmbeddedAgentSessionDirect(
-          wrappedCompactionArgs({
-            provider: "openai",
-            model: primary,
-            trigger: "overflow",
-            config,
-          }),
-        );
+        const result = await compact({
+          provider: "openai",
+          model: primary,
+          trigger: "overflow",
+          config,
+        });
 
         expect([...new Set(requestedModels)], JSON.stringify(result)).toEqual(
           fallback ? [primary, backup] : [primary],

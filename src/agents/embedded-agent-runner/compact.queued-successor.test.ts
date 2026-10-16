@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { realpath } from "node:fs/promises";
 import { join } from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
@@ -61,17 +62,32 @@ let workspaceDir: string;
 const sessionId = "predecessor";
 const sessionKey = "agent:main:queued-successor";
 const owner = { sessionId, lifecycleRevision: "lifecycle", activeWriterRunId: "writer" };
-const maintain = vi.fn<NonNullable<ContextEngine["maintain"]>>(async () => ({
-  changed: false,
-  bytesFreed: 0,
-  rewrittenEntries: 0,
-}));
+const successor = { ...owner, sessionId: "successor", previousSessionId: sessionId };
+const hostCommit = { entry: successor, tokensAfter: 40, compactionKind: "context-engine" };
+const unchangedMaintenance = () => ({ changed: false, bytesFreed: 0, rewrittenEntries: 0 });
+const maintain = vi.fn<NonNullable<ContextEngine["maintain"]>>(async () => unchangedMaintenance());
 const target = () => ({
   agentId: "main",
   sessionId,
   sessionKey,
   storePath: join(workspaceDir, "sessions.sqlite"),
 });
+const latestEntry = () => loadSessionEntry({ ...target(), readConsistency: "latest" });
+
+function expectNoPostCompaction() {
+  expect(maintain).not.toHaveBeenCalled();
+  expect(hookRunner.runAfterCompaction).not.toHaveBeenCalled();
+  expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+}
+
+async function waitForCheckpoint(checkpoint: Promise<unknown>, pending: Promise<unknown>) {
+  await Promise.race([
+    checkpoint,
+    pending.then(() => {
+      throw new Error("Queued compaction settled before the checkpoint");
+    }),
+  ]);
+}
 const compactParams = (abortSignal?: AbortSignal) => ({
   ...target(),
   sessionTarget: target(),
@@ -122,10 +138,10 @@ async function withPersistentTranscriptFixture(
 ) {
   const { SessionManager } = await import("../sessions/index.js");
   const openAsync = vi.spyOn(SessionManager, "openAsync");
-  const originalOpenAsync = openAsync.getMockImplementation();
-  if (!originalOpenAsync) {
-    throw new Error("expected the queued fixture's session-manager bridge");
-  }
+  const originalOpenAsync = expectDefined(
+    openAsync.getMockImplementation(),
+    "session-manager bridge",
+  );
   const hooks: { beforeBranchRead?: () => void } = {};
   openAsync.mockImplementation(async (...args) => {
     const manager = await PersistentSessionManager.openAsync(...args);
@@ -223,7 +239,7 @@ describe("queued compaction successor ownership", () => {
           if (rewrite) {
             return await runtimeContext!.rewriteTranscriptEntries!(request);
           }
-          return { changed: false, bytesFreed: 0, rewrittenEntries: 0 };
+          return unchangedMaintenance();
         });
         try {
           await expect(compact(compactParams())).resolves.toMatchObject({
@@ -397,16 +413,8 @@ describe("queued compaction successor ownership", () => {
       const releaseHostCommit = createDeferred();
       let observerReturned = false;
       const onCommitted = vi.fn((accepted: AcceptedCompactionSuccessor) => {
-        expect(loadSessionEntry(target())).toMatchObject({
-          ...owner,
-          sessionId: "successor",
-          previousSessionId: owner.sessionId,
-        });
-        expect(accepted.entry).toMatchObject({
-          ...owner,
-          sessionId: "successor",
-          previousSessionId: owner.sessionId,
-        });
+        expect(loadSessionEntry(target())).toMatchObject(successor);
+        expect(accepted.entry).toMatchObject(successor);
         if (abortAfterCommit) {
           controller.abort(new Error("caller closed after commit"));
         }
@@ -416,30 +424,14 @@ describe("queued compaction successor ownership", () => {
         NonNullable<QueuedCompactionHostOptions["onHostCompactionCommitted"]>
       >(async (commit) => {
         expect(observerReturned).toBe(true);
-        expect(commit).toMatchObject({
-          entry: {
-            ...owner,
-            sessionId: "successor",
-            previousSessionId: owner.sessionId,
-          },
-          tokensAfter: 40,
-          compactionKind: "context-engine",
-        });
+        expect(commit).toMatchObject(hostCommit);
         hostCommitHeld.resolve();
         await releaseHostCommit.promise;
       });
       const onHostCompactionTranscriptSettled = vi.fn<
         NonNullable<QueuedCompactionHostOptions["onHostCompactionTranscriptSettled"]>
       >(async (commit) => {
-        expect(commit).toMatchObject({
-          entry: {
-            ...owner,
-            sessionId: "successor",
-            previousSessionId: owner.sessionId,
-          },
-          tokensAfter: 40,
-          compactionKind: "context-engine",
-        });
+        expect(commit).toMatchObject(hostCommit);
         expect(maintain).toHaveBeenCalledOnce();
         expect(hookRunner.runAfterCompaction).not.toHaveBeenCalled();
         expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
@@ -450,17 +442,10 @@ describe("queued compaction successor ownership", () => {
         onHostCompactionTranscriptSettled,
       });
       try {
-        await Promise.race([
-          hostCommitHeld.promise,
-          pending.then(() => {
-            throw new Error("Queued compaction settled before host accounting");
-          }),
-        ]);
+        await waitForCheckpoint(hostCommitHeld.promise, pending);
         expect(onHostCompactionCommitted).toHaveBeenCalledOnce();
         expect(onHostCompactionTranscriptSettled).not.toHaveBeenCalled();
-        expect(maintain).not.toHaveBeenCalled();
-        expect(hookRunner.runAfterCompaction).not.toHaveBeenCalled();
-        expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+        expectNoPostCompaction();
         releaseHostCommit.resolve();
 
         const result = await pending;
@@ -472,11 +457,7 @@ describe("queued compaction successor ownership", () => {
         expect(onCommitted).toHaveBeenCalledOnce();
         expect(onHostCompactionCommitted).toHaveBeenCalledOnce();
         expect(onHostCompactionTranscriptSettled).toHaveBeenCalledTimes(abortAfterCommit ? 0 : 1);
-        expect(loadSessionEntry(target())).toMatchObject({
-          ...owner,
-          sessionId: "successor",
-          previousSessionId: owner.sessionId,
-        });
+        expect(loadSessionEntry(target())).toMatchObject(successor);
         expect(maintain).toHaveBeenCalledTimes(abortAfterCommit ? 0 : 1);
         expect(hookRunner.runAfterCompaction).toHaveBeenCalledTimes(abortAfterCommit ? 0 : 1);
         if (!abortAfterCommit) {
@@ -505,16 +486,7 @@ describe("queued compaction successor ownership", () => {
     let backendCompleted = false;
     contextEngineCompactMock.mockImplementationOnce(async () => {
       backendCompleted = true;
-      return {
-        ok: true,
-        compacted: true,
-        result: {
-          sessionId: scenario.successorId,
-          summary: "summary",
-          tokensBefore: 120,
-          tokensAfter: 40,
-        },
-      };
+      return completed(scenario.successorId);
     });
     const onCommitted = vi.fn();
     const pending = compact(compactParams(controller.signal), {
@@ -535,9 +507,7 @@ describe("queued compaction successor ownership", () => {
     expect(result.result?.tokensAfter).toBe(scenario.tokensAfter);
     expect(onCommitted).not.toHaveBeenCalled();
     expect(loadSessionEntry(target())).toMatchObject(owner);
-    expect(maintain).not.toHaveBeenCalled();
-    expect(hookRunner.runAfterCompaction).not.toHaveBeenCalled();
-    expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+    expectNoPostCompaction();
 
     // The ordinary caller counter can retain completion, but cannot attach an
     // unaccepted successor's context snapshot to the predecessor's identity.
@@ -570,9 +540,7 @@ describe("queued compaction successor ownership", () => {
 
       expect(loadSessionEntry(target())).toMatchObject({ ...owner, ...replacement });
       expect(onCommitted).not.toHaveBeenCalled();
-      expect(maintain).not.toHaveBeenCalled();
-      expect(hookRunner.runAfterCompaction).not.toHaveBeenCalled();
-      expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+      expectNoPostCompaction();
     },
   );
 
@@ -604,12 +572,7 @@ describe("queued compaction successor ownership", () => {
           sessionEntry: capturedEntry,
         }).catch((error: unknown) => error);
         try {
-          await Promise.race([
-            entered.promise,
-            pending.then(() => {
-              throw new Error("Queued compaction settled before the backend checkpoint");
-            }),
-          ]);
+          await waitForCheckpoint(entered.promise, pending);
           if (takeover) {
             replaceSessionEntrySync(target(), {
               ...capturedEntry,
@@ -619,15 +582,13 @@ describe("queued compaction successor ownership", () => {
           } else {
             await patchSessionEntryCore(target(), () => ({ label: "renamed while compacting" }));
           }
-          const entryBeforeAppend = structuredClone(
-            loadSessionEntry({ ...target(), readConsistency: "latest" }),
-          );
+          const entryBeforeAppend = structuredClone(latestEntry());
           expect(entryBeforeAppend).toBeDefined();
           release.resolve();
           const result = await pending;
           const outcome = await observed.promise;
           const transcriptAfter = loadTranscriptEventsSync(target());
-          const after = loadSessionEntry({ ...target(), readConsistency: "latest" });
+          const after = latestEntry();
 
           if (takeover) {
             expect(transcriptAfter).toEqual(transcriptBefore);
@@ -643,10 +604,11 @@ describe("queued compaction successor ownership", () => {
               firstKeptEntryId: entryId,
               tokensBefore: 120,
             });
-            expect(after?.sessionId).toBe(sessionId);
-            expect(after?.lifecycleRevision).toBe(owner.lifecycleRevision);
-            expect(after?.activeWriterRunId).toBe(capturedWriter);
-            expect(after?.label).toBe("renamed while compacting");
+            expect(after).toMatchObject({
+              ...owner,
+              activeWriterRunId: capturedWriter,
+              label: "renamed while compacting",
+            });
             expect(outcome).toEqual({ written: true });
             expect(result).toMatchObject({ ok: true, compacted: true });
           }
@@ -677,18 +639,14 @@ describe("queued compaction successor ownership", () => {
       const pending = compact(backendCompactParams());
       try {
         await expect(pending).resolves.toMatchObject({ ok: true, compacted: false });
-        if (!continuation) {
-          throw new Error("Expected the backend's retained async continuation");
-        }
-        const closedEntry = structuredClone(
-          loadSessionEntry({ ...target(), readConsistency: "latest" }),
-        );
+        const retained = expectDefined(continuation, "backend continuation");
+        const closedEntry = structuredClone(latestEntry());
         expect(closedEntry).toBeDefined();
         release.resolve();
-        const outcome = await continuation;
+        const outcome = await retained;
 
         expect(loadTranscriptEventsSync(target())).toEqual(transcriptBefore);
-        expect(loadSessionEntry({ ...target(), readConsistency: "latest" })).toEqual(closedEntry);
+        expect(latestEntry()).toEqual(closedEntry);
         expect(outcome).toMatchObject({ written: false, error: expect.any(Error) });
         expect(contextEngineCompactMock).toHaveBeenCalledOnce();
       } finally {
@@ -702,10 +660,10 @@ describe("queued compaction successor ownership", () => {
   it("fences a synchronous timeout-listener append while the caller remains active", async () => {
     await withPersistentTranscriptFixture(async ({ entryId, transcriptBefore }) => {
       const boundedCompact = vi.mocked(safetyTimeout.compactContextEngineWithSafetyTimeout);
-      const previousImplementation = boundedCompact.getMockImplementation();
-      if (!previousImplementation) {
-        throw new Error("Expected the suite's replaceable safety-timeout mock");
-      }
+      const previousImplementation = expectDefined(
+        boundedCompact.getMockImplementation(),
+        "safety-timeout mock",
+      );
       const caller = new AbortController();
       const backendEntered = createDeferred();
       const releaseBackend = createDeferred();
@@ -728,10 +686,7 @@ describe("queued compaction successor ownership", () => {
       };
       resolveContextEngineMock.mockResolvedValueOnce(engine);
       contextEngineCompactMock.mockImplementationOnce((backendParams) => {
-        const signal = backendParams.abortSignal;
-        if (!signal) {
-          throw new Error("Expected the real safety wrapper's composed backend signal");
-        }
+        const signal = expectDefined(backendParams.abortSignal, "composed backend signal");
         backendSignal = signal;
         const append = createBackendAppend(entryId);
         // Timer dispatch owns a different async context. Retain the backend's
@@ -755,9 +710,7 @@ describe("queued compaction successor ownership", () => {
         backendEntered.resolve();
         return backendWork;
       });
-      const entryBefore = structuredClone(
-        loadSessionEntry({ ...target(), readConsistency: "latest" }),
-      );
+      const entryBefore = structuredClone(latestEntry());
       expect(entryBefore).toBeDefined();
       // Override the existing mocked function, not the shared harness or module
       // epoch. The real helper owns composition, timer abortion, and the race.
@@ -769,23 +722,17 @@ describe("queued compaction successor ownership", () => {
         queuedSettled = true;
       });
       try {
-        await Promise.race([
-          backendEntered.promise,
-          pending.then(() => {
-            throw new Error("Queued compaction settled before the backend checkpoint");
-          }),
-        ]);
+        await waitForCheckpoint(backendEntered.promise, pending);
         await vi.advanceTimersByTimeAsync(1);
         await expect(pending).resolves.toMatchObject({ ok: false, compacted: false });
         expect(backendSignal).not.toBe(caller.signal);
         expect(backendSignal?.aborted).toBe(true);
         const observation = await observed.promise;
 
-        expect(observation.callerAborted).toBe(false);
-        expect(observation.queuedSettled).toBe(false);
+        expect(observation).toMatchObject({ callerAborted: false, queuedSettled: false });
         expect(caller.signal.aborted).toBe(false);
         expect(loadTranscriptEventsSync(target())).toEqual(transcriptBefore);
-        expect(loadSessionEntry({ ...target(), readConsistency: "latest" })).toEqual(entryBefore);
+        expect(latestEntry()).toEqual(entryBefore);
         expect(observation.outcome).toMatchObject({ written: false, error: expect.any(Error) });
         expect(contextEngineCompactMock).toHaveBeenCalledOnce();
         expect(maintain).not.toHaveBeenCalled();
@@ -826,14 +773,11 @@ describe("queued compaction successor ownership", () => {
       contextEngineCompactMock.mockResolvedValueOnce(completed(sessionId));
       maintain.mockImplementationOnce(async ({ runtimeContext }) => {
         retained.rewrite = runtimeContext?.rewriteTranscriptEntries;
-        return { changed: false, bytesFreed: 0, rewrittenEntries: 0 };
+        return unchangedMaintenance();
       });
 
       await expect(compact(compactParams())).resolves.toMatchObject({ ok: true, compacted: true });
-      if (!retained.rewrite) {
-        throw new Error("expected a retained maintenance rewrite capability");
-      }
-      await expect(retained.rewrite(request)).rejects.toThrow();
+      await expect(expectDefined(retained.rewrite, "retained rewrite")(request)).rejects.toThrow();
 
       expect(loadTranscriptEventsSync(target())).toEqual(transcriptBefore);
       expect(loadSessionEntry(target())).toMatchObject(owner);
@@ -852,10 +796,7 @@ describe("queued compaction successor ownership", () => {
         const observed: { rewriteRejected?: boolean } = {};
         contextEngineCompactMock.mockResolvedValueOnce(completed(sessionId));
         maintain.mockImplementationOnce(async ({ runtimeContext }) => {
-          const rewrite = runtimeContext?.rewriteTranscriptEntries;
-          if (!rewrite) {
-            throw new Error("expected an active maintenance rewrite capability");
-          }
+          const rewrite = expectDefined(runtimeContext?.rewriteTranscriptEntries, "active rewrite");
           const replaceWriter = () => {
             replaceSessionEntrySync(target(), {
               ...owner,
@@ -875,7 +816,7 @@ describe("queued compaction successor ownership", () => {
             () => false,
             () => true,
           );
-          return { changed: false, bytesFreed: 0, rewrittenEntries: 0 };
+          return unchangedMaintenance();
         });
 
         // The caller can validate its logical session without knowing the queued
@@ -911,10 +852,7 @@ describe("queued compaction successor ownership", () => {
       const onHostCompactionTranscriptSettled = vi.fn();
       contextEngineCompactMock.mockResolvedValueOnce(completed(sessionId));
       maintain.mockImplementationOnce(async ({ runtimeContext }) => {
-        const rewrite = runtimeContext?.rewriteTranscriptEntries;
-        if (!rewrite) {
-          throw new Error("expected an active maintenance rewrite capability");
-        }
+        const rewrite = expectDefined(runtimeContext?.rewriteTranscriptEntries, "active rewrite");
         const result = await rewrite(request);
         controller.abort(new Error("cancel after maintenance rewrite"));
         return result;
