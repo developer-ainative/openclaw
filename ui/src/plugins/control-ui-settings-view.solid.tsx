@@ -71,7 +71,7 @@ export function ControlUiSettingsPresentation(props: {
       return;
     }
     retire();
-    const next = { abort: new AbortController(), identity } as NonNullable<typeof owner>;
+    const next: NonNullable<typeof owner> = { abort: new AbortController(), identity };
     let lifetime = next.abort.signal;
     owner = next;
     const current = () => {

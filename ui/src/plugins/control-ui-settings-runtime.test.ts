@@ -4,9 +4,13 @@ import type { ControlUiPluginDistribution } from "./control-ui-distribution.ts";
 import { loadControlUiPluginAssets } from "./control-ui-loader.ts";
 import { ControlUiPluginRuntime } from "./control-ui-runtime.ts";
 
+// mock-isolation: synthetic packaged modules replace the real loader's DOM/network acquisition and host rendering imports.
 vi.mock("./control-ui-loader.ts", () => ({ loadControlUiPluginAssets: vi.fn() }));
 const packaged = vi.hoisted(() => [] as ControlUiPluginDistribution[]);
-vi.mock("./control-ui-distribution.ts", () => ({ controlUiPluginDistributions: packaged }));
+vi.mock("./control-ui-distribution.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./control-ui-distribution.ts")>()),
+  controlUiPluginDistributions: packaged,
+}));
 afterEach(() => {
   packaged.length = 0;
   vi.resetAllMocks();

@@ -140,7 +140,7 @@ describe("native Control UI browser assets", () => {
       settingsViews: [{ section: "memory", panel: "overview" }],
     };
     expect((await listControlUiPluginCatalog()).plugins).toEqual([]);
-    expect(listControlUiPluginActivations()).toEqual([]);
+    expect(listControlUiPluginActivations({})).toEqual([]);
   });
 
   it("hot-applies Custom plugin UI admission without replacing the backend plugin", async () => {

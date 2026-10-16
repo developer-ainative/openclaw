@@ -105,12 +105,16 @@ function MemoryOverview(props: MemoryOverviewProps) {
     routeIntent: "overview",
     locale: "en",
   }));
-  const context = {
+  const context: ControlUiSettingsContext = {
     props: snapshot,
     signal,
     components: createTestComponents(),
     formatRelativeTimestamp,
-  } as ControlUiSettingsContext;
+    request: vi.fn(),
+    navigate: vi.fn(),
+    refreshAgents: vi.fn(),
+    formatError: String,
+  };
   const View = createMemoryOverview(context, () => snapshot);
   return <View {...props} engineSelection={snapshot.engine} />;
 }

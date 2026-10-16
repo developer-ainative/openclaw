@@ -170,17 +170,18 @@ export class ControlUiPluginRuntime implements ControlUiPluginCapability {
               item.section === view.placement.section && item.panel === view.placement.panel,
           ),
       );
-      const views = module.settingsViews.filter(
+      const views: readonly ControlUiSettingsView[] = module.settingsViews.filter(
         (view) =>
           view.placement.section === placement.section && view.placement.panel === placement.panel,
       );
-      if (!declared || views.length !== 1) {
+      const view = views[0];
+      if (!declared || views.length !== 1 || !view) {
         throw new Error("Invalid or duplicate Settings presentation.");
       }
       for (const style of styles) {
         style.media = "all";
       }
-      return { view: views[0] as ControlUiSettingsView, signal: lifetime, dispose };
+      return { view, signal: lifetime, dispose };
     } catch (error) {
       dispose();
       throw error;
