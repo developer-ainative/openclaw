@@ -6,7 +6,8 @@ import { enrichWhatsAppInboundMessage } from "./message-enrichment.js";
 const downloadMediaMessage = vi.hoisted(() => vi.fn());
 const warn = vi.hoisted(() => vi.fn());
 
-vi.mock("openclaw/plugin-sdk/logging-core", () => ({
+vi.mock("openclaw/plugin-sdk/logging-core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/logging-core")>()),
   createSubsystemLogger: () => ({ child: () => ({ warn }) }),
 }));
 

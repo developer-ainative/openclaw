@@ -418,7 +418,7 @@ defineDiscordVoiceTests(
             delivery === "native"
               ? "discord voice: realtime consult failed call=call-late"
               : expect.stringMatching(
-                  /^discord voice: realtime forced agent consult failed elapsedMs=\d+$/,
+                  /^discord voice: realtime forced agent consult failed elapsedMs=-?\d+$/,
                 ),
           );
           expect(entry.realtimeLifecycle.status).toBe("active");

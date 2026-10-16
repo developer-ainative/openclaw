@@ -134,7 +134,7 @@ describe("createSubsystemLogger().isEnabled", () => {
       .split("\n")
       .map((line) => JSON.parse(line));
     expect(records.map((record) => record["1"])).toEqual(
-      failures.map(({ expected }) => ({ ...context, ...expected })),
+      failures.map(({ expected }) => Object.assign({}, context, expected)),
     );
   });
   it.each([
