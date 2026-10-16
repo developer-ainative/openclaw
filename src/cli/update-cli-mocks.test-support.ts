@@ -385,28 +385,27 @@ vi.mock("node:child_process", async () => {
     const prefix = /\.[cm]?ts$/u.test(entry) ? hostSourcePrefix : hostCompiledPrefix;
     return [...prefix, ...argv.slice(entryIndex)];
   };
+  const remapSqliteChild = (args: { 0: string; 1?: unknown }) => {
+    if (
+      args[0] !== process.execPath ||
+      !Array.isArray(args[1]) ||
+      !args[1].includes(SQLITE_READONLY_CHILD_ARG)
+    ) {
+      return false;
+    }
+    args[0] = hostExecPath;
+    args[1] = sqliteHostArgv(args[1]);
+    return true;
+  };
   return {
     ...actual,
     // SQLite snapshots and their native broker need real IPC; updater/service children stay simulated.
     spawnSync: (...args: Parameters<typeof actual.spawnSync>) => {
-      if (
-        args[0] === process.execPath &&
-        Array.isArray(args[1]) &&
-        args[1].includes(SQLITE_READONLY_CHILD_ARG)
-      ) {
-        args[0] = hostExecPath;
-        args[1] = sqliteHostArgv(args[1]);
-      }
+      remapSqliteChild(args);
       return actual.spawnSync(...args);
     },
     execFile: (...args: Parameters<typeof actual.execFile>) => {
-      if (
-        args[0] === process.execPath &&
-        Array.isArray(args[1]) &&
-        args[1].includes(SQLITE_READONLY_CHILD_ARG)
-      ) {
-        args[0] = hostExecPath;
-        args[1] = sqliteHostArgv(args[1]);
+      if (remapSqliteChild(args)) {
         return actual.execFile(...args);
       }
       return execFile(...args);
@@ -423,12 +422,8 @@ vi.mock("node:child_process", async () => {
         // Simulated Node selection must not mix runtimes on the real broker's advanced IPC.
         return actual.spawn(hostExecPath, hostBrokerArgv, args[2]);
       }
-      if (
-        args[0] === process.execPath &&
-        Array.isArray(childArgs) &&
-        childArgs.includes(SQLITE_READONLY_CHILD_ARG)
-      ) {
-        return actual.spawn(hostExecPath, sqliteHostArgv(childArgs), args[2]);
+      if (remapSqliteChild(args)) {
+        return actual.spawn(...args);
       }
       return Array.isArray(childArgs) &&
         (isMacosAclInspection(args[0], childArgs) || isPlistStdinConversion(args[0], childArgs))
@@ -500,35 +495,27 @@ vi.mock("../plugins/official-external-install-records.js", async (importOriginal
   resolveTrustedSourceLinkedOfficialNpmInstall: vi.fn(() => undefined),
 }));
 
-vi.mock("../plugins/update.js", async (importOriginal) => {
-  return {
-    ...(await importOriginal<typeof import("../plugins/update.js")>()),
-    syncPluginsForUpdateChannel: (...args: unknown[]) => syncPluginsForUpdateChannel(...args),
-    updateNpmInstalledPlugins: (...args: unknown[]) => updateNpmInstalledPlugins(...args),
-  };
-});
+vi.mock("../plugins/update.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/update.js")>()),
+  syncPluginsForUpdateChannel: (...args: unknown[]) => syncPluginsForUpdateChannel(...args),
+  updateNpmInstalledPlugins: (...args: unknown[]) => updateNpmInstalledPlugins(...args),
+}));
 
-vi.mock("../plugins/installed-plugin-index-records.js", async (importOriginal) => {
-  return {
-    ...(await importOriginal<typeof import("../plugins/installed-plugin-index-records.js")>()),
-    loadInstalledPluginIndexInstallRecords,
-    writePersistedInstalledPluginIndexInstallRecordsWithLease,
-  };
-});
+vi.mock("../plugins/installed-plugin-index-records.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/installed-plugin-index-records.js")>()),
+  loadInstalledPluginIndexInstallRecords,
+  writePersistedInstalledPluginIndexInstallRecordsWithLease,
+}));
 
-vi.mock("../plugins/installed-plugin-index-store.js", async (importOriginal) => {
-  return {
-    ...(await importOriginal<typeof import("../plugins/installed-plugin-index-store.js")>()),
-    readPersistedInstalledPluginIndex,
-  };
-});
+vi.mock("../plugins/installed-plugin-index-store.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/installed-plugin-index-store.js")>()),
+  readPersistedInstalledPluginIndex,
+}));
 
-vi.mock("../plugins/installed-plugin-index-store-write.js", async (importOriginal) => {
-  return {
-    ...(await importOriginal<typeof import("../plugins/installed-plugin-index-store-write.js")>()),
-    restorePersistedInstalledPluginIndexIfCurrent,
-  };
-});
+vi.mock("../plugins/installed-plugin-index-store-write.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/installed-plugin-index-store-write.js")>()),
+  restorePersistedInstalledPluginIndexIfCurrent,
+}));
 
 vi.mock("../commands/doctor/shared/post-core-plugin-convergence.js", () => ({
   runPostCorePluginConvergence: vi.fn(
@@ -660,12 +647,10 @@ vi.mock("../commands/doctor/legacy-config-repair.js", async (importOriginal) => 
   ...(await importOriginal<typeof import("../commands/doctor/legacy-config-repair.js")>()),
   repairLegacyConfigForUpdateChannel: legacyConfigRepairMocks.repairLegacyConfigForUpdateChannel,
 }));
-vi.mock("./completion-runtime.js", async (importOriginal) => {
-  return {
-    ...(await importOriginal<typeof import("./completion-runtime.js")>()),
-    installCompletion: (...args: unknown[]) => installCompletion(...args),
-  };
-});
+vi.mock("./completion-runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./completion-runtime.js")>()),
+  installCompletion: (...args: unknown[]) => installCompletion(...args),
+}));
 // Mock the daemon-cli module
 vi.mock("./daemon-cli.js", () => ({
   runDaemonInstall: mockedRunDaemonInstall,

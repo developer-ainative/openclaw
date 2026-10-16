@@ -175,39 +175,17 @@ export const resolvePreferredOpenClawTmpDir = (options = {}) => resolveOriginal(
 });`,
 );
 // Compiled import.meta.url may name a shared chunk; workers need explicit entrypoints.
-stub(
-  "../infra/runtime-process-entrypoints.ts",
-  `export const runtimeProcessEntrypoints = ${runtimeProcessEntrypointsJson};
+for (const [relative, source] of Object.entries({
+  "../infra/runtime-process-entrypoints.ts": `export const runtimeProcessEntrypoints = ${runtimeProcessEntrypointsJson};
 export const SQLITE_READONLY_CHILD_ARG = ${JSON.stringify(SQLITE_READONLY_CHILD_ARG)};`,
-);
-stub("../commands/doctor.ts", doctorSource);
-stub("../config/config.ts", snapshotSource);
-stub(
-  "../plugins/installed-plugin-index-records.ts",
-  "export const loadInstalledPluginIndexInstallRecords = async () => ({});",
-);
-stub(
-  "../plugins/plugin-lifecycle-lease.ts",
-  "export const withPluginLifecycleLease = async (_options, run) => await run();",
-);
-// Replace snapshot creation only; keep real readers available to Doctor imports.
-override(
-  "./update-cli/update-command-config-snapshot.ts",
-  scenario === "phase-hang"
-    ? `import { spawnCommand } from ${JSON.stringify(sourceUrl("../process/exec-spawn.ts"))};
-export const createUpdateConfigSnapshot = async () => {
-  const child = spawnCommand([process.execPath, '-e', ${JSON.stringify(blockedChildSource)}, '--', 'fixture-private-argument'], {stdin:'pipe', stdout:'ignore', stderr:'ignore'});
-  console.error('fixture configSnapshot entered');
-  await child;
-};`
-    : scenario === "borrowed-phase"
-      ? `import { advanceFinalizationFixtureClock } from ${JSON.stringify(fixtureClockUrl)};
-export const createUpdateConfigSnapshot = async () => { advanceFinalizationFixtureClock(1_200); };`
-      : "export const createUpdateConfigSnapshot = async () => {};",
-);
-stub(
-  "./update-cli/update-command-config.ts",
-  `
+  "../commands/doctor.ts": doctorSource,
+  "../config/config.ts": snapshotSource,
+  "../plugins/installed-plugin-index-records.ts":
+    "export const loadInstalledPluginIndexInstallRecords = async () => ({});",
+  "../plugins/plugin-lifecycle-lease.ts":
+    "export const withPluginLifecycleLease = async (_options, run) => await run();",
+  "./update-cli/update-command-plugins.ts": `export const updatePluginsAfterCoreUpdate = async () => ({status: ${JSON.stringify(scenario?.endsWith("plugin-error") ? "error" : scenario?.endsWith("plugin-warning") ? "warning" : "ok")}, changed: false, warnings: [], sync: {changed: false, switchedToBundled: [], switchedToNpm: [], warnings: [], errors: []}, npm: {changed: false, outcomes: []}, integrityDrifts: []});`,
+  "./update-cli/update-command-config.ts": `
 import { readConfigFileSnapshot } from ${JSON.stringify(sourceUrl("../config/config.ts"))};
 export const readUpdateConfigFileSnapshot = readConfigFileSnapshot;
 export const capturePreUpdateSourceConfig = ({sourceConfig, parsed}) => ({ sourceConfig, authoredConfig: parsed });
@@ -222,12 +200,24 @@ export const preparePostCorePluginConfig = async () => ({
   configWriteOptions: {},
   configChanged: false,
   restoredAuthoredChannels: undefined,
-});
-`,
-);
-stub(
-  "./update-cli/update-command-plugins.ts",
-  `export const updatePluginsAfterCoreUpdate = async () => ({status: ${JSON.stringify(scenario?.endsWith("plugin-error") ? "error" : scenario?.endsWith("plugin-warning") ? "warning" : "ok")}, changed: false, warnings: [], sync: {changed: false, switchedToBundled: [], switchedToNpm: [], warnings: [], errors: []}, npm: {changed: false, outcomes: []}, integrityDrifts: []});`,
+});`,
+})) {
+  stub(relative, source);
+}
+// Replace snapshot creation only; keep real readers available to Doctor imports.
+override(
+  "./update-cli/update-command-config-snapshot.ts",
+  scenario === "phase-hang"
+    ? `import { spawnCommand } from ${JSON.stringify(sourceUrl("../process/exec-spawn.ts"))};
+export const createUpdateConfigSnapshot = async () => {
+  const child = spawnCommand([process.execPath, '-e', ${JSON.stringify(blockedChildSource)}, '--', 'fixture-private-argument'], {stdin:'pipe', stdout:'ignore', stderr:'ignore'});
+  console.error('fixture configSnapshot entered');
+  await child;
+};`
+    : scenario === "borrowed-phase"
+      ? `import { advanceFinalizationFixtureClock } from ${JSON.stringify(fixtureClockUrl)};
+export const createUpdateConfigSnapshot = async () => { advanceFinalizationFixtureClock(1_200); };`
+      : "export const createUpdateConfigSnapshot = async () => {};",
 );
 override(
   "../daemon/gateway-entrypoint.ts",

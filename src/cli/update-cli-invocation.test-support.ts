@@ -140,20 +140,16 @@ export async function invokeUpdateCli(opts: UpdateCommandOptions) {
   const { registerUpdateCli } = await import("./update-cli.js");
   const program = new Command();
   registerUpdateCli(program);
-  const args = ["update"];
-  for (const key of ["yes", "json", "dryRun", "acceptCapabilities"] as const) {
-    if (opts[key]) {
-      args.push(`--${key.replace(/[A-Z]/gu, (letter) => `-${letter.toLowerCase()}`)}`);
-    }
-  }
-  if (opts.restart === false) {
-    args.push("--no-restart");
-  }
-  for (const key of ["channel", "tag", "timeout", "admission"] as const) {
-    if (opts[key] !== undefined) {
-      args.push(`--${key}`, opts[key]);
-    }
-  }
+  const args = [
+    "update",
+    ...(["yes", "json", "dryRun", "acceptCapabilities"] as const).flatMap((key) =>
+      opts[key] ? [`--${key.replace(/[A-Z]/gu, (letter) => `-${letter.toLowerCase()}`)}`] : [],
+    ),
+    ...(opts.restart === false ? ["--no-restart"] : []),
+    ...(["channel", "tag", "timeout", "admission"] as const).flatMap((key) =>
+      opts[key] === undefined ? [] : [`--${key}`, opts[key]],
+    ),
+  ];
   await program.parseAsync(args, { from: "user" });
 }
 
@@ -181,13 +177,11 @@ export const mockGitUpdateAfterMutation = (
   const mutationAdmitted = vi.fn();
   vi.mocked(updateGitCheckout).mockImplementationOnce(async ({ opts }) => {
     await opts.inspectGitTarget({});
-    if (opts.prepareGitExposure) {
-      await opts.prepareGitExposure(
-        expectDefined(result.root, "candidate checkout"),
-        expectDefined(result.after?.sha ?? undefined, "candidate commit"),
-        undefined,
-      );
-    }
+    await opts.prepareGitExposure?.(
+      expectDefined(result.root, "candidate checkout"),
+      expectDefined(result.after?.sha ?? undefined, "candidate commit"),
+      undefined,
+    );
     if (result.root) {
       await opts.validateCandidate(result.root);
     }
