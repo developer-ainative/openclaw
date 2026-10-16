@@ -2,9 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, vi } from "vitest";
 import type { ConversationDeliveryStoreScope } from "../../config/sessions/conversation-delivery-store.js";
-import { closeOpenClawAgentDatabasesAsync } from "../../state/openclaw-agent-db.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
+import { useSessionStoreTempDirs } from "../../test-utils/session-state-cleanup.js";
+import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 import { deriveDeliveryQueueRetentionColumns } from "../delivery-queue-retention-columns.js";
 import {
   claimDeliveryQueueEntryPlatformSendInDatabase,
@@ -12,10 +13,32 @@ import {
 } from "../delivery-queue-sqlite-claim.kernel.js";
 import { loadDeliveryQueueEntries } from "../delivery-queue-sqlite.js";
 import { isPostgresSqlConnection } from "../sql-connection.js";
-import { resolvePreferredOpenClawTmpDir } from "../tmp-openclaw-dir.js";
 import { OUTBOUND_DELIVERY_QUEUE_NAME } from "./delivery-queue-media-staging.js";
 import type { DeliverFn, RecoveryLogger } from "./delivery-queue-recovery.js";
 import type { QueuedDelivery } from "./delivery-queue-types.js";
+
+export function createPendingFinalFixture(
+  storePath: string,
+  deliveryId: string,
+  sessionKey: string,
+  options: {
+    text?: string;
+    now?: number;
+    state?: "prepared" | "queued";
+    context?: DeliveryContext;
+    stale?: boolean;
+  } = {},
+) {
+  const { text = "pending final", now = 1, state = "prepared", context, stale = false } = options;
+  const intentId = `${deliveryId}-intent`,
+    sessionId = `${deliveryId}-session`;
+  const kind = "pending-final" as const;
+  const completion = { kind, deliveryId, intentId, sessionId, sessionKey, storePath };
+  const deliveries = stale ? [] : [{ id: deliveryId, state }];
+  const replayable = "replayable" as const;
+  const pending = { kind: replayable, text, context, createdAt: now, intentId, deliveries };
+  return { completion, entry: { sessionId, updatedAt: now, pendingFinalDelivery: pending } };
+}
 
 export async function prepareConversationDelivery(
   scope: ConversationDeliveryStoreScope,
@@ -29,6 +52,10 @@ export async function prepareConversationDelivery(
     await import("../../config/sessions/conversation-delivery-store.js");
   const { buildConversationRef } = await import("../../routing/conversation-ref.js");
   const { normalizeSessionDeliveryState } = await import("../../utils/delivery-context.shared.js");
+  const channel = "reef",
+    accountId = "default",
+    peerId = "peer-agent";
+  const conversationRef = buildConversationRef({ channel, accountId, kind: "direct", peerId });
   await upsertSessionEntryCore(
     { ...scope, sessionKey: "agent:main:reef:direct:peer-agent" },
     {
@@ -46,15 +73,10 @@ export async function prepareConversationDelivery(
     operationKind: "send",
     message,
     preparedMessageId: "reef-prepared",
-    conversationRef: buildConversationRef({
-      channel: "reef",
-      accountId: "default",
-      kind: "direct",
-      peerId: "peer-agent",
-    }),
+    conversationRef,
   });
   return {
-    channel: "reef",
+    channel,
     to: "reef:peer-agent",
     payloads: [{ text: message }],
     deliveryCompletion: {
@@ -113,36 +135,14 @@ export async function loadPendingDeliveries(stateDir?: string): Promise<QueuedDe
 /** Installs Vitest hooks that provide a fresh delivery-queue state dir per case. */
 export function installDeliveryQueueTmpDirHooks(): { readonly tmpDir: () => string } {
   let tmpDir = "";
-  let fixtureRoot = "";
-  let fixtureCount = 0;
-
-  beforeAll(() => {
-    fixtureRoot = fs.realpathSync.native(
-      // openclaw-temp-dir: allow suite-owned queues drain their agent stores before removal
-      fs.mkdtempSync(path.join(resolvePreferredOpenClawTmpDir(), "openclaw-dq-suite-")),
-    );
-  });
-
+  const dirs = useSessionStoreTempDirs(afterAll, "openclaw-dq-suite-");
   beforeEach(() => {
-    tmpDir = path.join(fixtureRoot, `case-${fixtureCount++}`);
-    fs.mkdirSync(tmpDir, { recursive: true });
+    tmpDir = dirs.make();
   });
 
   afterEach(async () => {
     await closeStateDatabaseForTest();
     tmpDir = "";
-  });
-
-  afterAll(async () => {
-    if (fixtureRoot) {
-      await closeOpenClawAgentDatabasesAsync(fixtureRoot);
-    }
-    await closeStateDatabaseForTest();
-    if (!fixtureRoot) {
-      return;
-    }
-    fs.rmSync(fixtureRoot, { recursive: true, force: true });
-    fixtureRoot = "";
   });
 
   return { tmpDir: () => tmpDir };

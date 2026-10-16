@@ -1,10 +1,13 @@
 import path from "node:path";
-import { assert, describe, expect, it, vi } from "vitest";
+import { assert, expect, it, vi } from "vitest";
 import { persistPendingFinalDeliveryMarker } from "../../agents/pending-final-delivery-marker.js";
 import { capturePendingFinalRecoverySource } from "../../agents/pending-final-recovery-source.js";
 import { resolvePendingFinalDeliveryCompletion } from "../../auto-reply/reply/pending-final-delivery.js";
 import { createMessageReceiptFromOutboundResults } from "../../channels/message/receipt.js";
-import type { ChannelMessageSendResult } from "../../channels/message/types.js";
+import type {
+  ChannelMessageSendResult,
+  ChannelMessageSendTextContext as SendContext,
+} from "../../channels/message/types.js";
 import type { ChannelOutboundContext } from "../../channels/plugins/outbound.types.js";
 import { getRestartRecoveryTerminalDeliveryEvidence } from "../../config/sessions/restart-recovery-state.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
@@ -20,10 +23,8 @@ import {
   loadPendingDeliveries,
 } from "./delivery-queue.test-helpers.js";
 
-function receipt(
-  target?: string,
-  threadId?: string,
-): ChannelMessageSendResult & { messageId: string } {
+type Receipt = ChannelMessageSendResult & { messageId: string };
+function receipt(target?: string, threadId?: string): Receipt {
   return {
     messageId: "m",
     ...(target ? { target: { kind: "room", id: target } } : {}),
@@ -36,215 +37,177 @@ function receipt(
   };
 }
 
-describe("final receipt reported progress evidence", () => {
-  const { tmpDir, deliver: deliverOutboundPayloads } = installDeliveryCompletionHooks();
+const context = { channel: "matrix", to: "!original:example", threadId: "thread" };
+function placementCases(): Record<string, [boolean, Receipt?, Receipt?]> {
+  const partThread = receipt();
+  partThread.receipt.parts[0]!.threadId = "wrong";
+  const nestedTarget = receipt();
+  nestedTarget.receipt.raw = [{ roomId: "!other:example" }];
+  const nestedThread = receipt();
+  nestedThread.receipt.parts[0]!.raw = { ...receipt(undefined, "wrong"), messageId: "nested" };
+  const aggregate = (
+    results: Parameters<typeof createMessageReceiptFromOutboundResults>[0]["results"],
+  ): Receipt => ({ ...receipt(), receipt: createMessageReceiptFromOutboundResults({ results }) });
+  const unconfirmed = { messageId: "" },
+    identified = { messageId: "m" };
+  const nested = aggregate([unconfirmed, identified]);
+  const mutatedRaw = aggregate([{ receipt: nested.receipt }, identified]);
+  unconfirmed.messageId = "m";
+  const incomplete = { receipt: aggregate([{ messageId: "" }, identified]).receipt };
+  const metadata = receipt();
+  metadata.receipt.raw = [{ roomId: context.to }];
+  return {
+    omitted: [true],
+    enriched: [true, undefined, receipt(context.to, context.threadId)],
+    normalized: [true, receipt("matrix:!original:example")],
+    target: [false, receipt("!other:example")],
+    "receipt-thread": [false, receipt(undefined, "wrong")],
+    "part-thread": [false, partThread],
+    "nested-target": [false, nestedTarget],
+    "nested-thread": [false, nestedThread],
+    "mutated-target": [false, receipt("!other:example")],
+    "callback-mutation": [false, receipt("!other:example")],
+    "aggregate-blank-first": [false, undefined, aggregate([{ messageId: "" }, identified])],
+    "aggregate-blank-last": [false, undefined, aggregate([identified, { messageId: "" }])],
+    "aggregate-nested": [false, undefined, aggregate([incomplete, identified])],
+    "aggregate-mutated-raw": [false, undefined, mutatedRaw],
+    "aggregate-not-sent": [false, undefined, aggregate([{ outcome: "not_sent" }, identified])],
+    "aggregate-complete": [true, undefined, aggregate([{ messageId: "first" }, identified])],
+    "aggregate-metadata": [true, undefined, aggregate([metadata])],
+    "legacy-channel": [false],
+    "legacy-expected": [true],
+    "legacy-omitted": [true],
+  };
+}
 
-  it.each(
-    (["live", "recovery"] as const).flatMap((mode) =>
-      (
-        [
-          ["omitted", true],
-          ["enriched", true],
-          ["normalized", true],
-          ["target", false],
-          ["receipt-thread", false],
-          ["part-thread", false],
-          ["nested-target", false],
-          ["nested-thread", false],
-          ["mutated-target", false],
-          ["callback-mutation", false],
-          ["aggregate-blank-first", false],
-          ["aggregate-blank-last", false],
-          ["aggregate-nested", false],
-          ["aggregate-mutated-raw", false],
-          ["aggregate-not-sent", false],
-          ["aggregate-complete", true],
-          ["aggregate-metadata", true],
-          ["legacy-channel", false],
-          ["legacy-expected", true],
-          ["legacy-omitted", true],
-        ] as const
-      ).map(([placement, eligible]) => ({ mode, placement, eligible })),
-    ),
-  )(
-    "retains reported placement across same-ID final replacement ($mode, $placement)",
-    async ({ mode, placement, eligible }) => {
-      const scope = {
-        agentId: "main",
-        sessionKey: "agent:main:dashboard:progress-evidence",
-        storePath: path.join(tmpDir(), "sessions.json"),
+const { tmpDir, deliver: deliverOutboundPayloads } = installDeliveryCompletionHooks();
+
+it.each(
+  (["live", "recovery"] as const).flatMap((mode) =>
+    Object.entries(placementCases()).map(([name, [eligible]]) => [mode, name, eligible] as const),
+  ),
+)(
+  "retains reported placement across same-ID final replacement (%s, %s)",
+  async (mode, placement, eligible) => {
+    const [, progress = receipt(), final = receipt()] = placementCases()[placement]!;
+    const scope = {
+      agentId: "main",
+      sessionKey: "agent:main:dashboard:progress-evidence",
+      storePath: path.join(tmpDir(), "sessions.json"),
+    };
+    await replaceSessionEntry(scope, {
+      sessionId: "session",
+      updatedAt: 1,
+      restartRecoveryDeliveryRunId: "run",
+      restartRecoveryDeliverySourceRunId: "source",
+      restartRecoveryDeliveryContext: context,
+    });
+    const entry = loadSessionEntry(scope);
+    assert(entry, "missing fixture session");
+    const payloads = [{ text: "final" }];
+    await persistPendingFinalDeliveryMarker({
+      ...scope,
+      deliver: true,
+      sessionEntry: entry,
+      sessionStore: { [scope.sessionKey]: entry },
+      admittedRecoverySource: capturePendingFinalRecoverySource(entry),
+      suppressVisibleSessionEffects: false,
+      sessionReboundDuringRun: false,
+      payloads,
+      deliveryContext: context,
+      runOwnedSessionId: entry.sessionId,
+    });
+    const completion = resolvePendingFinalDeliveryCompletion(payloads);
+    assert(completion, "missing final custody");
+    const committed = vi.fn();
+    const send = vi.fn(async (ctx: SendContext) => {
+      await ctx.onDeliveryResult?.(progress);
+      if (placement === "mutated-target") {
+        progress.target!.id = context.to;
+      }
+      return final;
+    });
+    const plugin = createOutboundTestPlugin({
+      id: "matrix",
+      outbound: matrixOutboundForQueueTest,
+      messaging: { normalizeTarget: (raw) => raw.replace(/^matrix:/, "") },
+    });
+    const legacy = placement.startsWith("legacy-");
+    const legacySend = vi.fn(async (ctx: ChannelOutboundContext) => {
+      const result: OutboundDeliveryResult = {
+        ...receipt(),
+        channel: placement === "legacy-channel" ? "discord" : "matrix",
       };
-      const context = { channel: "matrix", to: "!original:example", threadId: "thread" };
-      await replaceSessionEntry(scope, {
-        sessionId: "session",
-        updatedAt: 1,
-        restartRecoveryDeliveryRunId: "run",
-        restartRecoveryDeliverySourceRunId: "source",
-        restartRecoveryDeliveryContext: context,
-      });
-      const entry = loadSessionEntry(scope);
-      assert(entry, "missing fixture session");
-      const payloads = [{ text: "final" }];
-      await persistPendingFinalDeliveryMarker({
-        ...scope,
-        deliver: true,
-        sessionEntry: entry,
-        sessionStore: { [scope.sessionKey]: entry },
-        admittedRecoverySource: capturePendingFinalRecoverySource(entry),
-        suppressVisibleSessionEffects: false,
-        sessionReboundDuringRun: false,
-        payloads,
-        deliveryContext: context,
-        runOwnedSessionId: entry.sessionId,
-      });
-      const completion = resolvePendingFinalDeliveryCompletion(payloads);
-      assert(completion, "missing final custody");
-      const progress = receipt(
-        ["target", "mutated-target", "callback-mutation"].includes(placement)
-          ? "!other:example"
-          : placement === "normalized"
-            ? "matrix:!original:example"
-            : undefined,
-        placement === "receipt-thread" ? "wrong" : undefined,
-      );
-      if (placement === "part-thread") {
-        progress.receipt.parts[0]!.threadId = "wrong";
+      if (placement === "legacy-omitted") {
+        delete result.receipt;
       }
-      if (placement === "nested-target") {
-        progress.receipt.raw = [{ roomId: "!other:example" }];
-      }
-      if (placement === "nested-thread") {
-        progress.receipt.parts[0]!.raw = { ...receipt(undefined, "wrong"), messageId: "nested" };
-      }
-      const committed = vi.fn();
-      const send = vi.fn(
-        async (ctx: {
-          onDeliveryResult?: (result: ChannelMessageSendResult) => Promise<void> | void;
-        }) => {
-          await ctx.onDeliveryResult?.(progress);
-          if (placement === "mutated-target") {
-            progress.target!.id = context.to;
+      await ctx.onDeliveryResult?.(result);
+      return { ...receipt(), channel: "matrix" };
+    });
+    if (legacy) {
+      plugin.outbound = { ...matrixOutboundForQueueTest, sendText: legacySend };
+    } else {
+      plugin.message = {
+        send: { text: send, lifecycle: { afterCommit: committed } },
+        durableFinal: { capabilities: { text: true, thread: true, afterCommit: true } },
+      };
+    }
+    setActivePluginRegistry(createTestRegistry([{ pluginId: "matrix", source: "test", plugin }]));
+    const seen: string[] = [];
+    const runDelivery: typeof deliverOutboundPayloads = (params) =>
+      deliverOutboundPayloads({
+        ...params,
+        onDeliveryResult: async (result) => {
+          seen.push(result.messageId);
+          if (placement === "legacy-channel") {
+            result.channel = "matrix";
           }
-          const final =
-            placement === "enriched" ? receipt(context.to, context.threadId) : receipt();
-          if (placement.startsWith("aggregate-")) {
-            const unconfirmed = { messageId: "" };
-            const identified = { messageId: "m" };
-            const nested = createMessageReceiptFromOutboundResults({
-              results: [unconfirmed, identified],
-            });
-            const variants: Record<
-              string,
-              Parameters<typeof createMessageReceiptFromOutboundResults>[0]["results"]
-            > = {
-              "aggregate-blank-first": [unconfirmed, identified],
-              "aggregate-blank-last": [identified, unconfirmed],
-              "aggregate-nested": [{ receipt: nested }, identified],
-              "aggregate-mutated-raw": [{ receipt: nested }, identified],
-              "aggregate-not-sent": [{ outcome: "not_sent" }, identified],
-              "aggregate-complete": [{ messageId: "first" }, identified],
-              "aggregate-metadata": [
-                {
-                  ...identified,
-                  receipt: { ...receipt().receipt, raw: [{ roomId: context.to }] },
-                },
-              ],
-            };
-            final.receipt = createMessageReceiptFromOutboundResults({
-              results: variants[placement]!,
-            });
-            if (placement === "aggregate-mutated-raw") {
-              unconfirmed.messageId = "m";
-            }
+          if (placement === "callback-mutation" && result.target) {
+            result.target.id = context.to;
           }
-          return final;
+          await params.onDeliveryResult?.(result);
         },
-      );
-      const plugin = createOutboundTestPlugin({
-        id: "matrix",
-        outbound: matrixOutboundForQueueTest,
-        messaging: { normalizeTarget: (raw) => raw.replace(/^matrix:/, "") },
       });
-      const legacy = placement.startsWith("legacy-");
-      const legacySend = vi.fn(async (ctx: ChannelOutboundContext) => {
-        const result: OutboundDeliveryResult = {
-          ...receipt(),
-          channel: placement === "legacy-channel" ? "discord" : "matrix",
-        };
-        if (placement === "legacy-omitted") {
-          delete result.receipt;
-        }
-        await ctx.onDeliveryResult?.(result);
-        return { ...receipt(), channel: "matrix" };
-      });
-      if (legacy) {
-        plugin.outbound = { ...matrixOutboundForQueueTest, sendText: legacySend };
-      } else {
-        plugin.message = {
-          send: { text: send, lifecycle: { afterCommit: committed } },
-          durableFinal: { capabilities: { text: true, thread: true, afterCommit: true } },
-        };
-      }
-      setActivePluginRegistry(createTestRegistry([{ pluginId: "matrix", source: "test", plugin }]));
-      const seen: string[] = [];
-      const runDelivery: typeof deliverOutboundPayloads = (params) =>
-        deliverOutboundPayloads({
-          ...params,
-          onDeliveryResult: async (result) => {
-            seen.push(result.messageId);
-            if (placement === "legacy-channel") {
-              result.channel = "matrix";
-            }
-            if (placement === "callback-mutation" && result.target) {
-              result.target.id = context.to;
-            }
-            await params.onDeliveryResult?.(result);
-          },
-        });
-      const recover = () =>
-        recoverPendingDeliveries({
-          cfg: {},
-          stateDir: tmpDir(),
-          log: createRecoveryLog(),
-          deliver: runDelivery,
-        });
-      const params = {
+    const recover = () =>
+      recoverPendingDeliveries({
         cfg: {},
-        ...context,
-        payloads,
-        deliveryCompletion: completion,
-        deliveryIntentId: completion.deliveryId,
-        queuePolicy: "required" as const,
-      };
-      if (mode === "live") {
-        await runDelivery(params);
-      } else {
-        await enqueueDeliveryOnce(params, completion.deliveryId, tmpDir());
-        await recover();
-      }
-      const evidence = getRestartRecoveryTerminalDeliveryEvidence(
-        loadSessionEntry(scope),
-        "source",
-      );
-      if (eligible) {
-        expect(evidence).toMatchObject({
-          deliveryStatus: {
-            status: "sent",
-            resultCount: placement === "aggregate-complete" ? 2 : 1,
-          },
-          durableFinalReceipt: {
-            platformMessageId: placement === "aggregate-complete" ? "first" : "m",
-          },
-        });
-      } else {
-        expect(evidence).toBeUndefined();
-      }
-      expect(seen).toEqual(["m"]);
-      expect(committed).toHaveBeenCalledTimes(legacy ? 0 : 1);
+        stateDir: tmpDir(),
+        log: createRecoveryLog(),
+        deliver: runDelivery,
+      });
+    const params = {
+      cfg: {},
+      ...context,
+      payloads,
+      deliveryCompletion: completion,
+      deliveryIntentId: completion.deliveryId,
+      queuePolicy: "required" as const,
+    };
+    if (mode === "live") {
+      await runDelivery(params);
+    } else {
+      await enqueueDeliveryOnce(params, completion.deliveryId, tmpDir());
       await recover();
-      expect(send).toHaveBeenCalledTimes(legacy ? 0 : 1);
-      expect(legacySend).toHaveBeenCalledTimes(legacy ? 1 : 0);
-      expect(await loadPendingDeliveries(tmpDir())).toEqual([]);
-    },
-  );
-});
+    }
+    const evidence = getRestartRecoveryTerminalDeliveryEvidence(loadSessionEntry(scope), "source");
+    if (eligible) {
+      expect(evidence).toMatchObject({
+        deliveryStatus: {
+          status: "sent",
+          resultCount: placement === "aggregate-complete" ? 2 : 1,
+        },
+        durableFinalReceipt: {
+          platformMessageId: placement === "aggregate-complete" ? "first" : "m",
+        },
+      });
+    } else {
+      expect(evidence).toBeUndefined();
+    }
+    expect(seen).toEqual(["m"]);
+    expect(committed).toHaveBeenCalledTimes(legacy ? 0 : 1);
+    await recover();
+    expect(send).toHaveBeenCalledTimes(legacy ? 0 : 1);
+    expect(legacySend).toHaveBeenCalledTimes(legacy ? 1 : 0);
+    expect(await loadPendingDeliveries(tmpDir())).toEqual([]);
+  },
+);

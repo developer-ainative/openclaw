@@ -19,6 +19,7 @@ import { recoverPendingDeliveries } from "./delivery-queue-recovery.js";
 import { enqueueDeliveryOnce } from "./delivery-queue-storage.js";
 import {
   createRecoveryLog,
+  createPendingFinalFixture,
   loadPendingDeliveries,
   installDeliveryCompletionHooks,
 } from "./delivery-queue.test-helpers.js";
@@ -33,28 +34,9 @@ describe("pending-final durable delivery completion", () => {
     sessionKey = "global",
     store = "sessions.json",
   ) {
-    const completion = {
-      kind: "pending-final" as const,
-      deliveryId: `${name}-delivery`,
-      intentId: `${name}-intent`,
-      sessionId: `${name}-session`,
-      sessionKey,
-      storePath: path.join(tmpDir(), store),
-    };
-    return {
-      completion,
-      entry: {
-        sessionId: completion.sessionId,
-        updatedAt: 1,
-        pendingFinalDelivery: {
-          kind: "replayable" as const,
-          text,
-          createdAt: 1,
-          intentId: completion.intentId,
-          deliveries: [{ id: completion.deliveryId, state: "prepared" as const }],
-        },
-      },
-    };
+    return createPendingFinalFixture(path.join(tmpDir(), store), `${name}-delivery`, sessionKey, {
+      text,
+    });
   }
   async function prepareWriter(name: string) {
     const scope = {

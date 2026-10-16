@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { controlNextRecoverySleep } from "../../../test/helpers/infra/delivery-recovery.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { drainPendingDeliveries as drainPluginPendingDeliveries } from "../../plugin-sdk/delivery-queue-runtime.js";
-import { PlatformMessageNotDispatchedError } from "./deliver-types.js";
 import {
   type DeliverFn,
   drainPendingDeliveriesCore,
@@ -58,9 +57,7 @@ describe("drainPendingDeliveriesCore for reconnect", () => {
       ...overrides,
     });
   }
-  function options() {
-    return { cfg: stubCfg, log, stateDir: tmpDir, deliver };
-  }
+  const options = () => ({ cfg: stubCfg, log, stateDir: tmpDir, deliver });
   function recover(recoveryLog = createRecoveryLog()) {
     return recoverPendingDeliveries({ ...options(), log: recoveryLog });
   }
@@ -112,11 +109,9 @@ describe("drainPendingDeliveriesCore for reconnect", () => {
     deliver.mockReset().mockResolvedValue(undefined);
     sleepMock.mockReset().mockResolvedValue(undefined);
   });
-
   afterEach(() => {
     vi.useRealTimers();
   });
-
   it("leaves Gateway conversation records for the authorized recovery owner", async () => {
     const operationId = "conversation-reconnect";
     const storePath = path.join(tmpDir, "agent-sessions.json");
@@ -129,12 +124,6 @@ describe("drainPendingDeliveriesCore for reconnect", () => {
     );
     const id = await enqueue({ ...delivery, accountId: "default" });
     await failDelivery(id, NO_LISTENER_ERROR, tmpDir);
-    deliver.mockImplementation(async () => {
-      throw new PlatformMessageNotDispatchedError(
-        "Conversation delivery is missing its current route authorization",
-        { cause: undefined, retryable: false },
-      );
-    });
     await drainPluginPendingDeliveries({
       ...options(),
       drainKey: "reef:default",
@@ -233,44 +222,33 @@ describe("drainPendingDeliveriesCore for reconnect", () => {
 
   it("shares replay pacing between reconnect and startup drains", async () => {
     vi.useFakeTimers();
-    const startedAt = new Date("2026-04-23T00:00:00.000Z");
+    const startedAt = Date.parse("2026-04-23T00:00:00.000Z");
     vi.setSystemTime(startedAt);
-    try {
-      const controlledSleep = controlNextRecoverySleep(sleepMock);
-      const startupLog = createRecoveryLog();
-      const deliveryTimes: number[] = [];
-      const first = blockDelivery(
-        () => deliveryTimes.length === 1,
-        () => deliveryTimes.push(Date.now()),
-      );
-      for (const to of ["+1000", "+2000"]) {
-        await enqueue({ to });
-      }
-      const reconnectDrain = drain();
-      await first.entered;
-      const startupRecovery = recover(startupLog);
-      first.release();
-      await expect(controlledSleep.started).resolves.toBe(RECOVERY_REPLAY_SPACING_MS);
-      expect(deliver).toHaveBeenCalledTimes(1);
-      controlledSleep.release();
-      await Promise.all([reconnectDrain, startupRecovery]);
-      expect(deliver).toHaveBeenCalledTimes(2);
-      expect(deliveryTimes).toEqual([
-        startedAt.getTime(),
-        startedAt.getTime() + RECOVERY_REPLAY_SPACING_MS,
-      ]);
-    } finally {
-      vi.useRealTimers();
+    const controlledSleep = controlNextRecoverySleep(sleepMock);
+    const startupLog = createRecoveryLog();
+    const deliveryTimes: number[] = [];
+    const first = blockDelivery(
+      () => deliveryTimes.length === 1,
+      () => deliveryTimes.push(Date.now()),
+    );
+    for (const to of ["+1000", "+2000"]) {
+      await enqueue({ to });
     }
+    const reconnectDrain = drain();
+    await first.entered;
+    const startupRecovery = recover(startupLog);
+    first.release();
+    await expect(controlledSleep.started).resolves.toBe(RECOVERY_REPLAY_SPACING_MS);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    controlledSleep.release();
+    await Promise.all([reconnectDrain, startupRecovery]);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deliveryTimes).toEqual([startedAt, startedAt + RECOVERY_REPLAY_SPACING_MS]);
   });
 
   it("does not re-deliver a stale startup snapshot after reconnect already acked it", async () => {
     const startupLog = createRecoveryLog();
-    const deliveredTargets: string[] = [];
-    const blocker = blockDelivery(
-      ({ to }) => to === "+1000",
-      ({ to }) => deliveredTargets.push(to),
-    );
+    const blocker = blockDelivery(({ to }) => to === "+1000");
     await enqueue(
       {
         channel: "demo-channel-a",
@@ -292,7 +270,7 @@ describe("drainPendingDeliveriesCore for reconnect", () => {
       await startupRecovery;
     }
     expect(deliver).toHaveBeenCalledTimes(2);
-    expect(deliveredTargets.filter((target) => target === "+1555")).toHaveLength(1);
+    expect(deliver.mock.calls.filter(([entry]) => entry.to === "+1555")).toHaveLength(1);
     expectInfo(startupLog, "Recovery skipped for delivery");
   });
   it("recomputes backoff bypass after rereading the claimed entry", async () => {

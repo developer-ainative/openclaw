@@ -4,7 +4,7 @@ import { assert, afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import { onTrustedMessageAuditEventForTest } from "../../audit/message-audit-events.test-support.js";
 import type { ReplyPayload } from "../../auto-reply/types.js";
-import * as sessionAccessor from "../../config/sessions/session-accessor.js";
+import * as sessions from "../../config/sessions/session-accessor.js";
 import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import {
   closeOpenClawStateDatabaseForTest,
@@ -13,7 +13,7 @@ import {
 import { updateDeliveryQueueEntryInDatabase } from "../delivery-queue-sqlite.kernel.js";
 import { resolveDeliveryQueueStateEnv } from "../delivery-queue-state-context.js";
 import { PlatformMessageNotDispatchedError } from "./deliver-types.js";
-import * as completionRuntime from "./delivery-completion.js";
+import * as settlement from "./delivery-completion.js";
 import * as mediaSpool from "./delivery-queue-media-spool.js";
 import { OUTBOUND_DELIVERY_QUEUE_NAME } from "./delivery-queue-media-staging.js";
 import { renewDeliveryPlatformSendLease } from "./delivery-queue-platform-lease.js";
@@ -22,9 +22,10 @@ import {
   drainPendingDeliveriesCore,
   recoverPendingDeliveries,
 } from "./delivery-queue-recovery.js";
-import * as queueStorage from "./delivery-queue-storage.js";
+import * as queue from "./delivery-queue-storage.js";
 import {
   claimDeliveryQueueEntryForTest,
+  createPendingFinalFixture,
   createQueueMedia,
   createRecoveryLog,
   installDeliveryQueueTmpDirHooks,
@@ -39,36 +40,35 @@ vi.mock("./channel-resolution.js", () => ({
 
 describe("exhausted delivery producer recovery", () => {
   const { tmpDir } = installDeliveryQueueTmpDirHooks();
+  const audits: string[] = [];
+  const route = { channel: "directchat", to: "recipient" };
+  const sessionKey = "agent:main:directchat:direct:recipient";
   const database = () =>
     openOpenClawStateDatabase({ env: { ...process.env, OPENCLAW_STATE_DIR: tmpDir() } });
-  const recoveryOptions = (deliver: DeliverFn = vi.fn()) => ({
-    cfg: {},
-    log: createRecoveryLog(),
-    deliver,
-    stateDir: tmpDir(),
-  });
+  function recoveryOptions(deliver: DeliverFn = vi.fn()) {
+    return { cfg: {}, log: createRecoveryLog(), deliver, stateDir: tmpDir() };
+  }
 
   beforeEach(() => {
     resolveAdapter.mockReset();
+    audits.length = 0;
+    onTrustedMessageAuditEventForTest((event) => {
+      if (event.action === "message.outbound.finished") {
+        audits.push(event.outcome);
+      }
+    });
   });
   afterEach(() => {
     vi.restoreAllMocks();
     closeOpenClawAgentDatabasesForTest();
   });
 
-  async function enqueue(
+  function enqueue(
     id: string,
-    overrides: Partial<Parameters<typeof queueStorage.enqueueDeliveryOnce>[0]> = {},
+    overrides: Partial<Parameters<typeof queue.enqueueDeliveryOnce>[0]> = {},
   ) {
-    await queueStorage.enqueueDeliveryOnce(
-      {
-        channel: "directchat",
-        to: "recipient",
-        payloads: [{ text: id }],
-        requiresProducerClaim: false,
-        maxRetries: 1,
-        ...overrides,
-      },
+    return queue.enqueueDeliveryOnce(
+      { ...route, payloads: [{ text: id }], maxRetries: 1, ...overrides },
       id,
       tmpDir(),
     );
@@ -76,9 +76,9 @@ describe("exhausted delivery producer recovery", () => {
 
   async function reserveProducer(id: string) {
     await enqueue(id, { requiresProducerClaim: true });
-    const claimId = await queueStorage.claimDeliveryPlatformSendAttempt(id, tmpDir());
+    const claimId = await queue.claimDeliveryPlatformSendAttempt(id, tmpDir());
     assert(claimId, "Expected producer custody");
-    await queueStorage.reserveDeliveryAttempt(id, 1, tmpDir(), claimId);
+    await queue.reserveDeliveryAttempt(id, 1, tmpDir(), claimId);
     return claimId;
   }
 
@@ -110,7 +110,7 @@ describe("exhausted delivery producer recovery", () => {
   it("terminalizes expired final reservations and continues to later deliveries", async () => {
     await reserveProducer("expired-producer");
     await enqueue("later-control");
-    await queueStorage.reserveDeliveryAttempt("later-control", 1, tmpDir());
+    await queue.reserveDeliveryAttempt("later-control", 1, tmpDir());
     setProducerExpiry("expired-producer", Date.now() - 1);
     closeOpenClawStateDatabaseForTest();
     const log = await recover("recurring");
@@ -148,38 +148,26 @@ describe("exhausted delivery producer recovery", () => {
     await recover("recurring");
     expect(replacementClaim).toBeTruthy();
     expect(replacementClaim).not.toBe(originalClaim);
-    expect(await queueStorage.loadPendingDelivery("replaced-producer", tmpDir())).toMatchObject({
+    expect(await queue.loadPendingDelivery("replaced-producer", tmpDir())).toMatchObject({
       producerClaimId: replacementClaim,
       recoveryState: "producer_claimed",
       attemptCount: 1,
     });
   });
 
+  function sessionScope() {
+    const storePath = path.join(tmpDir(), "sessions.json");
+    return { sessionKey, storePath, env: resolveDeliveryQueueStateEnv(tmpDir()) };
+  }
   async function prepareSession(id: string, stale = false) {
-    const now = Date.now();
-    const completion = {
-      kind: "pending-final" as const,
-      deliveryId: id,
-      intentId: "pending-final-intent",
-      sessionId: "pending-final-session",
-      sessionKey: "agent:main:directchat:direct:recipient",
-      storePath: path.join(tmpDir(), "sessions.json"),
-    };
-    await sessionAccessor.replaceSessionEntry(
-      { ...completion, env: resolveDeliveryQueueStateEnv(tmpDir()) },
-      {
-        sessionId: completion.sessionId,
-        updatedAt: now,
-        pendingFinalDelivery: {
-          kind: "replayable",
-          text: "pending final",
-          context: { channel: "directchat", to: "recipient" },
-          createdAt: now,
-          intentId: completion.intentId,
-          deliveries: stale ? [] : [{ id, state: "queued" }],
-        },
-      },
-    );
+    const scope = sessionScope();
+    const { completion, entry } = createPendingFinalFixture(scope.storePath, id, scope.sessionKey, {
+      now: Date.now(),
+      state: "queued",
+      stale,
+      context: route,
+    });
+    await sessions.replaceSessionEntry(scope, entry);
     return completion;
   }
 
@@ -190,31 +178,17 @@ describe("exhausted delivery producer recovery", () => {
   ) {
     const completion = await prepareSession(id);
     await enqueue(id, { deliveryCompletion: completion, payloads, maxRetries });
-    await queueStorage.reserveDeliveryAttempt(id, 1, tmpDir());
+    await queue.reserveDeliveryAttempt(id, 1, tmpDir());
     return completion;
   }
-  function loadSession(completion: Awaited<ReturnType<typeof prepareSession>>) {
-    return sessionAccessor.loadSessionEntry({
-      ...completion,
-      env: resolveDeliveryQueueStateEnv(tmpDir()),
-    });
-  }
-  function captureTerminalAudits() {
-    const audits: string[] = [];
-    onTrustedMessageAuditEventForTest((event) => {
-      if (event.action === "message.outbound.finished") {
-        audits.push(event.outcome);
-      }
-    });
-    return audits;
-  }
+  const loadSession = () => sessions.loadSessionEntry(sessionScope());
 
   it("settles a producer-claimed entry whose durable completion has gone stale", async () => {
     const id = "stale-producer-claimed";
     const completion = await prepareSession(id, true);
     // Keep the attempt budget unused to reach completed-owner acknowledgement.
     await enqueue(id, { requiresProducerClaim: true, deliveryCompletion: completion });
-    const claimId = await queueStorage.claimDeliveryPlatformSendAttempt(id, tmpDir());
+    const claimId = await queue.claimDeliveryPlatformSendAttempt(id, tmpDir());
     assert(claimId, "Expected producer custody");
     setProducerExpiry(id, Date.now() - 1);
     await recover("startup");
@@ -223,19 +197,14 @@ describe("exhausted delivery producer recovery", () => {
 
   it("preserves suppressed payload outcomes when a rejected delivery resumes owner settlement", async () => {
     const id = "rejected-batch-settlement";
-    const completion = await preparePendingFinal(
-      id,
-      [{ text: "suppressed" }, { text: "rejected" }],
-      3,
-    );
-    const audits = captureTerminalAudits();
+    await preparePendingFinal(id, [{ text: "suppressed" }, { text: "rejected" }], 3);
     const deliver = vi.fn<DeliverFn>(async (params) => {
       params.onPayloadDeliveryOutcome?.({
         index: 0,
         status: "suppressed",
         reason: "no_visible_payload",
       });
-      vi.spyOn(completionRuntime, "settleDurableDelivery").mockRejectedValueOnce(
+      vi.spyOn(settlement, "settleDurableDelivery").mockRejectedValueOnce(
         new Error("synthetic rejection projection failure"),
       );
       throw new PlatformMessageNotDispatchedError("synthetic permanent rejection", {
@@ -246,18 +215,16 @@ describe("exhausted delivery producer recovery", () => {
     const options = recoveryOptions(deliver);
     await recoverPendingDeliveries(options);
     expect(audits).toEqual([]);
-    expect(readQueuedEntry(tmpDir(), id)).toMatchObject({
-      settlement: {
-        outcome: "failed",
-        rejectionError: "synthetic permanent rejection",
-        terminals: [
-          {
-            payloadIndex: 0,
-            terminal: { outcome: "suppressed", reasonCode: "no_visible_payload" },
-          },
-          { payloadIndex: 1, terminal: { outcome: "failed" } },
-        ],
-      },
+    expect(readQueuedEntry(tmpDir(), id).settlement).toMatchObject({
+      outcome: "failed",
+      rejectionError: "synthetic permanent rejection",
+      terminals: [
+        {
+          payloadIndex: 0,
+          terminal: { outcome: "suppressed", reasonCode: "no_visible_payload" },
+        },
+        { payloadIndex: 1, terminal: { outcome: "failed" } },
+      ],
     });
     vi.restoreAllMocks();
     closeOpenClawStateDatabaseForTest();
@@ -265,16 +232,14 @@ describe("exhausted delivery producer recovery", () => {
     await recoverPendingDeliveries(options);
     expect(deliver).toHaveBeenCalledTimes(1);
     expect(audits).toEqual(["suppressed", "failed"]);
-    expect(loadSession(completion)?.pendingFinalDelivery?.deliveries).toEqual([
-      { id, state: "suppressed" },
-    ]);
+    expect(loadSession()?.pendingFinalDelivery?.deliveries).toEqual([{ id, state: "suppressed" }]);
     expect(readQueuedEntry(tmpDir(), id)).not.toHaveProperty("settlement");
   });
   it("preserves a renewed platform lease when its scan snapshot is expired", async () => {
     const id = "renewed-platform-owner";
     const claimId = await reserveProducer(id);
-    await queueStorage.markDeliveryPlatformSendAttemptStarted(id, tmpDir(), undefined, claimId);
-    const snapshot = await queueStorage.loadUnfinishedDelivery(id, tmpDir());
+    await queue.markDeliveryPlatformSendAttemptStarted(id, tmpDir(), undefined, claimId);
+    const snapshot = await queue.loadUnfinishedDelivery(id, tmpDir());
     assert(snapshot && typeof snapshot.availableAt === "number", "Expected leased snapshot");
     const renewedUntil = await renewDeliveryPlatformSendLease(id, tmpDir(), claimId);
     expect(renewedUntil).toEqual(expect.any(Number));
@@ -282,12 +247,12 @@ describe("exhausted delivery producer recovery", () => {
     // Fix only the host clock after real worker renewal and before recovery
     // captures its deadline. Expire the detached view, not the authoritative row.
     vi.spyOn(Date, "now").mockReturnValue(renewedUntil - 1);
-    vi.spyOn(queueStorage, "loadUnfinishedDelivery").mockResolvedValueOnce({
+    vi.spyOn(queue, "loadUnfinishedDelivery").mockResolvedValueOnce({
       ...snapshot,
       availableAt: renewedUntil - 2,
     });
     await recover("startup");
-    expect(await queueStorage.loadPendingDelivery(id, tmpDir())).toMatchObject({
+    expect(await queue.loadPendingDelivery(id, tmpDir())).toMatchObject({
       recoveryState: "send_attempt_started",
       platformSendAttemptId: claimId,
       availableAt: renewedUntil,
@@ -299,22 +264,18 @@ describe("exhausted delivery producer recovery", () => {
   it("refuses a retained settlement snapshot after another owner finalized it", async () => {
     const id = "stale-settlement";
     const completion = await preparePendingFinal(id);
-    const pending = await queueStorage.loadPendingDelivery(id, tmpDir());
+    const pending = await queue.loadPendingDelivery(id, tmpDir());
     assert(pending, "Expected queued owner");
-    const staged = await queueStorage.stageDeliveryFailureSettlement(
+    const staged = await queue.stageDeliveryFailureSettlement(
       pending,
       { outcome: "failed", error: "exhausted" },
       tmpDir(),
     );
     assert(staged, "Expected settlement owner");
-    await completionRuntime.settleDurableDelivery(
-      completion,
-      { platformSendStarted: true },
-      tmpDir(),
-    );
-    expect(await queueStorage.finalizeDeliveryFailureSettlement(staged, tmpDir())).toBe(true);
+    await settlement.settleDurableDelivery(completion, { platformSendStarted: true }, tmpDir());
+    expect(await queue.finalizeDeliveryFailureSettlement(staged, tmpDir())).toBe(true);
     expect(
-      await queueStorage.stageDeliveryFailureSettlement(staged, staged.settlement!, tmpDir()),
+      await queue.stageDeliveryFailureSettlement(staged, staged.settlement!, tmpDir()),
     ).toBeUndefined();
   });
 
@@ -323,13 +284,12 @@ describe("exhausted delivery producer recovery", () => {
     await preparePendingFinal(id);
     const entered = createDeferred();
     const release = createDeferred();
-    const settle = completionRuntime.settleDurableDelivery;
-    vi.spyOn(completionRuntime, "settleDurableDelivery").mockImplementationOnce(async (...args) => {
+    const settle = settlement.settleDurableDelivery;
+    vi.spyOn(settlement, "settleDurableDelivery").mockImplementationOnce(async (...args) => {
       entered.resolve();
       await release.promise;
       return settle(...args);
     });
-    const audits = captureTerminalAudits();
     const startup = recover("startup");
     try {
       await awaitGateBeforeSettlement(
@@ -352,20 +312,16 @@ describe("exhausted delivery producer recovery", () => {
     const artifact = await createQueueMedia(tmpDir(), "000000000001", "audio-bytes");
     const completion = await preparePendingFinal(id, [{ text: "reply", mediaUrl: artifact }]);
     const fault = vi
-      .spyOn(completionRuntime, "settleDurableDelivery")
+      .spyOn(settlement, "settleDurableDelivery")
       .mockRejectedValueOnce(new Error("synthetic owner fault"));
     await recover("startup");
-    expect(await queueStorage.findDeliveryIntentOwner(id, tmpDir())).toMatchObject({
+    expect(await queue.findDeliveryIntentOwner(id, tmpDir())).toMatchObject({
       status: "failed",
       settlementPending: true,
     });
-    expect(await queueStorage.claimDeliveryPlatformSendAttempt(id, tmpDir())).toBeUndefined();
-    await expect(queueStorage.reserveDeliveryAttempt(id, 5, tmpDir())).rejects.toThrow(
-      "No pending",
-    );
-    expect(loadSession(completion)?.pendingFinalDelivery?.deliveries).toEqual([
-      { id, state: "queued" },
-    ]);
+    expect(await queue.claimDeliveryPlatformSendAttempt(id, tmpDir())).toBeUndefined();
+    await expect(queue.reserveDeliveryAttempt(id, 5, tmpDir())).rejects.toThrow("No pending");
+    expect(loadSession()?.pendingFinalDelivery?.deliveries).toEqual([{ id, state: "queued" }]);
     database()
       .db.prepare("UPDATE schema_meta SET app_version = ? WHERE meta_key = 'primary'")
       .run("synthetic-older-version");
@@ -383,7 +339,7 @@ describe("exhausted delivery producer recovery", () => {
     fault.mockRestore();
     await recover("recurring");
     expect(queueStatus(id)).toBe("failed");
-    expect(loadSession(completion)).toMatchObject({
+    expect(loadSession()).toMatchObject({
       pendingFinalDelivery: { deliveries: [{ id, state: "unknown" }] },
       pendingDeliveryNotice: { intentId: completion.intentId, state: "owed" },
     });
@@ -394,20 +350,15 @@ describe("exhausted delivery producer recovery", () => {
 
   it("keeps the committed terminal outcome when media cleanup fails", async () => {
     const id = "cleanup-after-settlement";
-    const completion = await preparePendingFinal(id);
+    await preparePendingFinal(id);
     vi.spyOn(mediaSpool, "releaseSpoolArtifacts").mockRejectedValueOnce(
       new Error("synthetic cleanup fault"),
     );
-    const audits = captureTerminalAudits();
     const log = await recover("startup");
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("terminal cleanup failed"));
     expect(audits).toEqual(["failed"]);
-    expect(await queueStorage.findDeliveryIntentOwner(id, tmpDir())).toMatchObject({
-      status: "failed",
-    });
+    expect(await queue.findDeliveryIntentOwner(id, tmpDir())).toMatchObject({ status: "failed" });
     expect(readQueuedEntry(tmpDir(), id)).not.toHaveProperty("settlement");
-    expect(loadSession(completion)?.pendingFinalDelivery?.deliveries).toEqual([
-      { id, state: "unknown" },
-    ]);
+    expect(loadSession()?.pendingFinalDelivery?.deliveries).toEqual([{ id, state: "unknown" }]);
   });
 });
