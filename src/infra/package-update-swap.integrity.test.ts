@@ -72,6 +72,26 @@ async function createLinkedPackageSwapFixture(rootDir: string, relative = false)
   };
 }
 
+function afterLinkObservation(root: string, action: () => Promise<void> | void) {
+  let observed = false;
+  const readlink = fs.readlink.bind(fs);
+  vi.spyOn(fs, "readlink").mockImplementation(async (...args) => {
+    const target = await readlink(...args);
+    if (String(args[0]) === root) {
+      observed = true;
+    }
+    return target;
+  });
+  const lstat = fs.lstat.bind(fs);
+  vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
+    const stat = await lstat(...args);
+    if (String(args[0]) === root && observed) {
+      await action();
+    }
+    return stat;
+  });
+}
+
 type LinkedFixture = Awaited<ReturnType<typeof createLinkedPackageSwapFixture>>;
 async function expectLink(fixture: LinkedFixture, root: string) {
   expect(await fs.lstat(root)).toMatchObject({ ino: fixture.linkIdentity });
@@ -183,27 +203,13 @@ describe("retained npm package integrity", () => {
     const fixture = await createLinkedPackageSwapFixture(base);
     const transaction = await retain(fixture.params);
     let current = true;
-    let targetRead = false;
     const assertCurrent = () => {
       if (!current) {
         throw new Error("link retirement executor lost");
       }
     };
-    const readlink = fs.readlink.bind(fs);
-    vi.spyOn(fs, "readlink").mockImplementation(async (...args) => {
-      const target = await readlink(...args);
-      if (String(args[0]) === transaction.backupRoot) {
-        targetRead = true;
-      }
-      return target;
-    });
-    const lstat = fs.lstat.bind(fs);
-    vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
-      const stat = await lstat(...args);
-      if (String(args[0]) === transaction.backupRoot && targetRead) {
-        current = false;
-      }
-      return stat;
+    afterLinkObservation(transaction.backupRoot, () => {
+      current = false;
     });
     const unlink = vi.spyOn(fs, "unlink");
     await expect(transaction.complete({ activationVerified: true }, assertCurrent)).rejects.toThrow(
@@ -288,7 +294,6 @@ describe("retained npm package integrity", () => {
           return observed;
         });
       }
-      expect(transaction.assertRollbackSafe).toBeTypeOf("function");
       await expect(transaction.assertRollbackSafe?.()).rejects.toThrow("Git runtime changed");
       if (timing === "before") {
         const rename = vi.spyOn(fs, "rename");
@@ -424,23 +429,11 @@ describe("retained npm package integrity", () => {
       await fs.rename(transaction.backupRoot, `${transaction.backupRoot}.original`);
       await fs.rename(fixture.checkout, transaction.backupRoot);
     };
-    const readlink = fs.readlink.bind(fs);
-    const lstat = fs.lstat.bind(fs);
-    let targetRead = false;
-    vi.spyOn(fs, "readlink").mockImplementation(async (...args) => {
-      const target = await readlink(...args);
-      if (String(args[0]) === transaction.backupRoot) {
-        targetRead = true;
-      }
-      return target;
-    });
-    vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
-      const stat = await lstat(...args);
-      if (String(args[0]) === transaction.backupRoot && targetRead && !replaced) {
-        // The check observes the old link; only non-recursive removal is safe afterward.
+    // The check sees the old link; removal must remain non-recursive afterward.
+    afterLinkObservation(transaction.backupRoot, async () => {
+      if (!replaced) {
         await replaceLink();
       }
-      return stat;
     });
     expect(await transaction.complete({ activationVerified: true }, () => {})).toMatchObject({
       name: "package-backup-retention",
