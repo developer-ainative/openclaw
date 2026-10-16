@@ -20,7 +20,10 @@ import { clearAgentRunContext, registerAgentRunContext } from "../../infra/agent
 import { buildPersistedUserTurnMessage } from "../../sessions/user-turn-transcript.message.js";
 import { prepareUserProfileCatalog } from "../../state/user-profile-list.js";
 import { ensureProfileForEmail } from "../../state/user-profiles.js";
-import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../../test-utils/openclaw-test-state.js";
 import { projectChatDisplayMessage } from "../chat-display-projection.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import { rolePolicyConfig, sharingPolicyClient } from "../session-sharing.test-utils.js";
@@ -33,11 +36,33 @@ import { chatHistoryHandlers } from "./chat-history-handler.js";
 import { createHistoryReadContext } from "./chat-history.test-helpers.js";
 import type { GatewayClient, GatewayRequestContext } from "./types.js";
 
-const scope = {
-  agentId: "main",
-  sessionKey: "agent:main:activity-images",
-  sessionId: "activity-images",
-};
+function sessionScope(
+  sessionId: string,
+  agentId = "main",
+  sessionKey = `agent:${agentId}:${sessionId}`,
+) {
+  return { agentId, sessionKey, sessionId };
+}
+const scope = sessionScope("activity-images");
+const imageUrl = (name: string | number) => `https://images.example.test/${name}.png`;
+const imageUrlsFor = (count: number, prefix = "") =>
+  Array.from({ length: count }, (_, i) => imageUrl(`${prefix}${i}`));
+const imageMessage = (data: string, role = "assistant") => ({
+  role,
+  content: [{ type: "image", data, mimeType: "image/png" }],
+});
+const withState = (run: (state: OpenClawTestState) => Promise<void>) =>
+  withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, run);
+
+async function configuredState(state: OpenClawTestState, source: OpenClawConfig) {
+  await state.writeConfig(source);
+  const config = materializeRuntimeConfig(source, {
+    env: state.env,
+    manifestRegistry: { plugins: [] },
+  });
+  setRuntimeConfigSnapshot(config, source);
+  return config;
+}
 
 async function invoke(
   method: "chat.history" | "artifacts.list" | "artifacts.get" | "artifacts.download",
@@ -76,12 +101,12 @@ function imageUrls(result: ArtifactsListResult) {
   return result.artifacts.map((artifact) => artifact.image?.url);
 }
 
-async function append(content: unknown) {
-  await appendTranscriptMessage(scope, { message: { role: "assistant", content } });
+async function append(content: unknown, role = "assistant") {
+  await appendTranscriptMessage(scope, { message: { role, content } });
 }
 
 function withImages(run: () => Promise<void>) {
-  return withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
+  return withState(async () => {
     await captureRuntimeConfigAsyncReader()();
     await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
     await run();
@@ -90,6 +115,14 @@ function withImages(run: () => Promise<void>) {
 
 function expectArtifactError(result: Awaited<ReturnType<typeof invoke>>, type: string) {
   expect(result).toMatchObject({ ok: false, error: { details: { type } } });
+}
+
+function expectArtifacts(
+  result: Awaited<ReturnType<typeof invoke>>,
+  artifacts: unknown[],
+  soft = false,
+) {
+  (soft ? expect.soft : expect)(result).toMatchObject({ ok: true, payload: { artifacts } });
 }
 
 function fileMessage(title: string, data = "aGVsbG8=", runId?: string) {
@@ -165,23 +198,15 @@ describe("bounded Activity image discovery", () => {
 
   it("honors assistant image filters and binds pagination to the same role", async () => {
     await withImages(async () => {
-      const urls = Array.from(
-        { length: 6 },
-        (_, index) => `https://images.example.test/assistant-${index}.png`,
-      );
+      const urls = imageUrlsFor(6, "assistant-");
       await append(urls.map((url) => ({ type: "image", url })));
       for (const role of ["user", "toolResult"]) {
-        await appendTranscriptMessage(scope, {
-          message: {
-            role,
-            content: [{ type: "image", url: `https://images.example.test/${role}.png` }],
-          },
-        });
+        await append([{ type: "image", url: imageUrl(role) }], role);
       }
       const all = page(await list());
       expect(all.artifacts.slice(0, 2).map((artifact) => artifact.image?.url)).toEqual([
-        "https://images.example.test/toolResult.png",
-        "https://images.example.test/user.png",
+        imageUrl("toolResult"),
+        imageUrl("user"),
       ]);
       const filtered = page(await list({ messageRole: "assistant" }));
       expect(imageUrls(filtered)).toEqual(urls.toReversed().slice(0, 4));
@@ -200,11 +225,7 @@ describe("bounded Activity image discovery", () => {
     await withImages(async () => {
       await append([{ type: "image", data: "aGVsbG8=", mimeType: "image/png", alt: "inline" }]);
       await append(
-        Array.from({ length: 5 }, (_, index) => ({
-          type: "image",
-          url: `https://images.example.test/${index}.png`,
-          alt: `image-${index}`,
-        })),
+        imageUrlsFor(5).map((url, index) => ({ type: "image", url, alt: `image-${index}` })),
       );
       await append(
         "![Screenshot](/synthetic/nonexistent/screenshot.png)\n`![code](/private/code.png)`\n```md\n![fenced](/private/fenced.png)\n```",
@@ -212,16 +233,16 @@ describe("bounded Activity image discovery", () => {
       const first = page(await list());
       expect(imageUrls(first)).toEqual([
         "/synthetic/nonexistent/screenshot.png",
-        "https://images.example.test/4.png",
-        "https://images.example.test/3.png",
-        "https://images.example.test/2.png",
+        imageUrl(4),
+        imageUrl(3),
+        imageUrl(2),
       ]);
       expect(first.artifacts[0]?.download.mode).toBe("unsupported");
-      await append([{ type: "image", url: "https://images.example.test/new.png" }]);
+      await append([{ type: "image", url: imageUrl("new") }]);
       const second = page(await list({ cursor: first.nextCursor }));
       expect(imageUrls(second)).toEqual([
-        "https://images.example.test/1.png",
-        "https://images.example.test/0.png",
+        imageUrl(1),
+        imageUrl(0),
         "data:image/png;base64,aGVsbG8=",
       ]);
       expect(second.artifacts[2]).toMatchObject({
@@ -330,12 +351,7 @@ describe("bounded Activity image discovery", () => {
 
   it("rejects copied, retargeted, and reset cursors while rechecking current session access", async () => {
     await withImages(async () => {
-      await append(
-        Array.from({ length: 6 }, (_, index) => ({
-          type: "image",
-          url: `https://images.example.test/${index}.png`,
-        })),
-      );
+      await append(imageUrlsFor(6).map((url) => ({ type: "image", url })));
       const client = sharingPolicyClient({ user: "image-viewer", scopes: ["operator.read"] });
       const first = page(await list({}, client));
       const cursor = expectDefined(first.nextCursor, "image cursor");
@@ -374,192 +390,125 @@ describe("bounded Activity image discovery", () => {
 });
 
 it("keeps an admitted run on its stored main row when the public alias becomes global", async () => {
-  await withOpenClawTestState(
-    { scenario: "minimal", prepareProfileCatalog: true },
-    async (state) => {
-      const source: OpenClawConfig = {
-        agents: { ownership: "explicit", entries: { research: {} } },
-      };
-      const materialize = (config: OpenClawConfig) =>
-        materializeRuntimeConfig(config, {
-          env: state.env,
-          manifestRegistry: { plugins: [] },
-        });
-      await state.writeConfig(source);
-      const initial = materialize(source);
-      setRuntimeConfigSnapshot(initial, source);
-      const runId = "qualified-main-run";
-      const stored = {
-        agentId: "research",
-        sessionKey: "agent:research:main",
-        sessionId: "qualified-main-window",
-      };
-      await seedMessage(
-        stored,
-        fileMessage("stored-main.txt", "aGVsbG8=", runId),
-        undefined,
-        Date.now(),
-      );
-      const admitted = expectDefined(
-        await prepareAgentSession({
-          cfg: initial,
-          requestedSessionKey: stored.sessionKey,
-          requestedSessionId: stored.sessionId,
-          expectedExistingSessionId: stored.sessionId,
-          request: { message: "stored address proof", idempotencyKey: runId },
-          canUseCronRunContinuation: false,
-          lifecycleGeneration: getAgentEventLifecycleGeneration(),
-          respond: () => {
-            throw new Error("Expected session admission");
-          },
-        }),
-        "admitted session",
-      );
-      expect(admitted.canonicalKey).toBe(stored.sessionKey);
-      expect(admitted.canonicalSessionAgentId).toBe(stored.agentId);
-      registerAgentRunContext(runId, {
-        agentId: admitted.canonicalSessionAgentId,
-        sessionKey: admitted.canonicalKey,
-        sessionId: admitted.sessionId,
-      });
-      try {
-        const globalSource: OpenClawConfig = { ...source, session: { scope: "global" } };
-        await state.writeConfig(globalSource);
-        const current = materialize(globalSource);
-        setRuntimeConfigSnapshot(current, globalSource);
-        const global = { agentId: "research", sessionKey: "global", sessionId: "global-window" };
-        await seedMessage(global, fileMessage("global.txt", "Z2xvYmFs"), undefined, Date.now());
-        const context = createDirectChatContext({ getRuntimeConfig: () => current });
-        const client = sharingPolicyClient({ user: "artifact-viewer", scopes: ["operator.read"] });
-        const aliased = await invoke(
-          "artifacts.list",
-          { sessionKey: stored.sessionKey },
-          client,
-          context,
-        );
-        expect(aliased, JSON.stringify(aliased)).toMatchObject({
-          ok: true,
-          payload: { artifacts: [{ title: "global.txt", sessionKey: "global" }] },
-        });
-        for (const agentId of [undefined, "research"]) {
-          expect(
-            await invoke(
-              "artifacts.list",
-              { sessionKey: undefined, runId, agentId },
-              client,
-              context,
-            ),
-          ).toMatchObject({
-            ok: true,
-            payload: {
-              artifacts: [{ title: "stored-main.txt", sessionKey: stored.sessionKey, runId }],
-            },
-          });
-        }
-        await upsertSessionEntryCore(stored, {
-          sessionId: stored.sessionId,
-          updatedAt: Date.now(),
-          visibility: "draft",
-        });
-        expect(
-          await invoke("artifacts.list", { sessionKey: undefined, runId }, client, context),
-        ).toMatchObject({ ok: false, error: { details: { type: "artifact_scope_not_found" } } });
-        expect(
-          await invoke("artifacts.list", { sessionKey: stored.sessionKey }, client, context),
-        ).toMatchObject({ ok: true, payload: { artifacts: [{ title: "global.txt" }] } });
-      } finally {
-        clearAgentRunContext(runId);
-      }
-    },
-  );
-});
-
-describe("artifact run ownership", () => {
-  it("keeps cached run owners and physical global namespaces in artifact queries", async () => {
-    await withOpenClawTestState(
-      { scenario: "minimal", prepareProfileCatalog: true },
-      async (state) => {
-        const sourceConfig: OpenClawConfig = {
-          session: { scope: "global" },
-          agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
-        };
-        await state.writeConfig(sourceConfig);
-        const cfg = materializeRuntimeConfig(sourceConfig, {
-          env: state.env,
-          manifestRegistry: { plugins: [] },
-        });
-        setRuntimeConfigSnapshot(cfg, sourceConfig);
-        const rawRunId = "research-run";
-        const literalRunId = "research-literal-run";
-        const raw = {
-          agentId: "research",
-          sessionKey: "global",
-          sessionId: "research-raw-global",
-          runId: rawRunId,
-          title: "raw-global.txt",
-        };
-        const literal = {
-          agentId: "research",
-          sessionKey: "agent:research:global",
-          sessionId: "research-literal-global",
-          runId: literalRunId,
-          title: "literal-qualified-global.txt",
-        };
-        for (const target of [raw, literal]) {
-          await seedMessage(target, fileMessage(target.title, "aGVsbG8=", target.runId));
-        }
-        registerAgentRunContext(rawRunId, raw);
-        registerAgentRunContext(literalRunId, literal);
-        try {
-          const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
-          const outcomes = [];
-          for (const [params, target, control] of [
-            [{ runId: rawRunId, agentId: "research" }, raw, true],
-            [{ sessionKey: literal.sessionKey, agentId: "research" }, literal, true],
-            [{ runId: rawRunId }, raw, false],
-            [{ runId: literalRunId, agentId: "research" }, literal, false],
-          ] as const) {
-            const name = JSON.stringify(params);
-            const response = await invoke(
-              "artifacts.list",
-              { sessionKey: undefined, ...params },
-              null,
-              context,
-            );
-            const expected = {
-              ok: true,
-              payload: {
-                artifacts: [
-                  { title: target.title, sessionKey: target.sessionKey, runId: target.runId },
-                ],
-              },
-            };
-            if (control) {
-              expect(response, name).toMatchObject(expected);
-            } else {
-              outcomes.push({ name, response, expected });
-            }
-          }
-          for (const { name, response, expected } of outcomes) {
-            expect.soft(response, name).toMatchObject(expected);
-          }
-        } finally {
-          clearAgentRunContext(rawRunId);
-          clearAgentRunContext(literalRunId);
-        }
-      },
+  await withState(async (state) => {
+    const source: OpenClawConfig = {
+      agents: { ownership: "explicit", entries: { research: {} } },
+    };
+    const initial = await configuredState(state, source);
+    const runId = "qualified-main-run";
+    const stored = sessionScope("qualified-main-window", "research", "agent:research:main");
+    await seedMessage(
+      stored,
+      fileMessage("stored-main.txt", "aGVsbG8=", runId),
+      undefined,
+      Date.now(),
     );
+    const admitted = expectDefined(
+      await prepareAgentSession({
+        cfg: initial,
+        requestedSessionKey: stored.sessionKey,
+        requestedSessionId: stored.sessionId,
+        expectedExistingSessionId: stored.sessionId,
+        request: { message: "stored address proof", idempotencyKey: runId },
+        canUseCronRunContinuation: false,
+        lifecycleGeneration: getAgentEventLifecycleGeneration(),
+        respond: () => {
+          throw new Error("Expected session admission");
+        },
+      }),
+      "admitted session",
+    );
+    expect(admitted.canonicalKey).toBe(stored.sessionKey);
+    expect(admitted.canonicalSessionAgentId).toBe(stored.agentId);
+    registerAgentRunContext(runId, {
+      agentId: admitted.canonicalSessionAgentId,
+      sessionKey: admitted.canonicalKey,
+      sessionId: admitted.sessionId,
+    });
+    try {
+      const globalSource: OpenClawConfig = { ...source, session: { scope: "global" } };
+      const current = await configuredState(state, globalSource);
+      const global = sessionScope("global-window", "research", "global");
+      await seedMessage(global, fileMessage("global.txt", "Z2xvYmFs"), undefined, Date.now());
+      const context = createDirectChatContext({ getRuntimeConfig: () => current });
+      const client = sharingPolicyClient({ user: "artifact-viewer", scopes: ["operator.read"] });
+      const query = (params: Record<string, unknown>) =>
+        invoke("artifacts.list", params, client, context);
+      expectArtifacts(await query({ sessionKey: stored.sessionKey }), [
+        { title: "global.txt", sessionKey: "global" },
+      ]);
+      for (const agentId of [undefined, "research"]) {
+        expectArtifacts(await query({ sessionKey: undefined, runId, agentId }), [
+          { title: "stored-main.txt", sessionKey: stored.sessionKey, runId },
+        ]);
+      }
+      await upsertSessionEntryCore(stored, {
+        sessionId: stored.sessionId,
+        updatedAt: Date.now(),
+        visibility: "draft",
+      });
+      expectArtifactError(
+        await query({ sessionKey: undefined, runId }),
+        "artifact_scope_not_found",
+      );
+      expectArtifacts(await query({ sessionKey: stored.sessionKey }), [{ title: "global.txt" }]);
+    } finally {
+      clearAgentRunContext(runId);
+    }
   });
 });
 
+it("keeps cached run owners and physical global namespaces in artifact queries", async () => {
+  await withState(async (state) => {
+    const sourceConfig: OpenClawConfig = {
+      session: { scope: "global" },
+      agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
+    };
+    const cfg = await configuredState(state, sourceConfig);
+    const rawRunId = "research-run";
+    const literalRunId = "research-literal-run";
+    const raw = {
+      ...sessionScope("research-raw-global", "research", "global"),
+      runId: rawRunId,
+      title: "raw-global.txt",
+    };
+    const literal = {
+      ...sessionScope("research-literal-global", "research", "agent:research:global"),
+      runId: literalRunId,
+      title: "literal-qualified-global.txt",
+    };
+    for (const target of [raw, literal]) {
+      await seedMessage(target, fileMessage(target.title, "aGVsbG8=", target.runId));
+    }
+    registerAgentRunContext(rawRunId, raw);
+    registerAgentRunContext(literalRunId, literal);
+    try {
+      const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
+      for (const [params, target, control] of [
+        [{ runId: rawRunId, agentId: "research" }, raw, true],
+        [{ sessionKey: literal.sessionKey, agentId: "research" }, literal, true],
+        [{ runId: rawRunId }, raw, false],
+        [{ runId: literalRunId, agentId: "research" }, literal, false],
+      ] as const) {
+        const { title, sessionKey, runId } = target;
+        const response = await invoke(
+          "artifacts.list",
+          { sessionKey: undefined, ...params },
+          null,
+          context,
+        );
+        expectArtifacts(response, [{ title, sessionKey, runId }], !control);
+      }
+    } finally {
+      clearAgentRunContext(rawRunId);
+      clearAgentRunContext(literalRunId);
+    }
+  });
+});
 describe("persisted chat image artifact recovery", () => {
-  const transcriptScope = {
-    agentId: "main",
-    sessionKey: "agent:main:computer-images",
-    sessionId: "computer-images",
-  };
+  const transcriptScope = sessionScope("computer-images");
 
-  function invokeTranscriptArtifact(
+  function transcriptRpc(
     method: "chat.history" | "artifacts.get" | "artifacts.download",
     params: Record<string, unknown>,
     client: GatewayClient | null = null,
@@ -595,14 +544,22 @@ describe("persisted chat image artifact recovery", () => {
   }
 
   async function expectDownload(artifactId: string, data: string) {
-    expect(await invokeTranscriptArtifact("artifacts.download", { artifactId })).toMatchObject({
+    expect(await transcriptRpc("artifacts.download", { artifactId })).toMatchObject({
       ok: true,
       payload: { encoding: "base64", data },
     });
   }
 
+  async function historyMessages() {
+    const history = await transcriptRpc("chat.history", {}, null, await createHistoryReadContext());
+    expect(history.ok).toBe(true);
+    const messages = asOptionalRecord(history.payload)?.messages;
+    expect(Array.isArray(messages)).toBe(true);
+    return Array.isArray(messages) ? messages : [];
+  }
+
   it("recovers each visible legacy image when transcript rows reuse a message id", async () => {
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
+    await withState(async () => {
       await captureRuntimeConfigAsyncReader()();
       const images = ["Zmlyc3Q=", "c2Vjb25k"];
       await seedUnindexedTranscriptForTest({
@@ -614,19 +571,11 @@ describe("persisted chat image artifact recovery", () => {
           created_at: seq,
           event_json: JSON.stringify({
             id: "reused-legacy-id",
-            message: {
-              role: "toolResult",
-              content: [{ type: "image", data, mimeType: "image/png" }],
-            },
+            message: imageMessage(data, "toolResult"),
           }),
         })),
       });
-      const context = await createHistoryReadContext();
-      const history = await invokeTranscriptArtifact("chat.history", {}, null, context);
-      expect(history.ok).toBe(true);
-      const messages = asOptionalRecord(history.payload)?.messages;
-      expect(Array.isArray(messages)).toBe(true);
-      const ids = Array.isArray(messages) ? messages.flatMap(imageIds) : [];
+      const ids = (await historyMessages()).flatMap(imageIds);
       expect(ids).toHaveLength(2);
       expect(new Set(ids).size).toBe(2);
       const reads = observeSqliteReadSql(StatementSync.prototype);
@@ -642,12 +591,9 @@ describe("persisted chat image artifact recovery", () => {
   });
 
   it("downloads the exact image bytes referenced by history and committed live messages", async () => {
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
+    await withState(async () => {
       await captureRuntimeConfigAsyncReader()();
-      await seedMessage(transcriptScope, {
-        role: "assistant",
-        content: [{ type: "image", data: "b2xk", mimeType: "image/png" }],
-      });
+      await seedMessage(transcriptScope, imageMessage("b2xk"));
       const images = [Buffer.alloc(300 * 1024, 1).toString("base64"), "c2Vjb25k"];
       const message = {
         role: "toolResult",
@@ -663,17 +609,9 @@ describe("persisted chat image artifact recovery", () => {
         details: { media: { outbound: false } },
       };
       const appended = await appendTranscriptMessage(transcriptScope, { message });
-      const context = await createHistoryReadContext();
-      const history = await invokeTranscriptArtifact("chat.history", {}, null, context);
-      expect(history.ok).toBe(true);
-      const messages = asOptionalRecord(history.payload)?.messages;
-      expect(Array.isArray(messages)).toBe(true);
-      const displayed = Array.isArray(messages)
-        ? messages.find(
-            (row) =>
-              asOptionalRecord(asOptionalRecord(row)?.["__openclaw"])?.id === appended.messageId,
-          )
-        : undefined;
+      const displayed = (await historyMessages()).find(
+        (row) => asOptionalRecord(asOptionalRecord(row)?.["__openclaw"])?.id === appended.messageId,
+      );
       const ids = imageIds(displayed);
       expect(ids).toHaveLength(2);
       const persisted = await transcriptReaders.readSessionMessageByIdAsync(
@@ -694,13 +632,13 @@ describe("persisted chat image artifact recovery", () => {
         details: message.details,
       });
       for (const [index, artifactId] of ids.entries()) {
-        expect(await invokeTranscriptArtifact("artifacts.get", { artifactId })).toMatchObject({
+        expect(await transcriptRpc("artifacts.get", { artifactId })).toMatchObject({
           ok: true,
           payload: { artifact: { id: artifactId, type: "image", download: { mode: "bytes" } } },
         });
         await expectDownload(artifactId, expectDefined(images[index], "image bytes"));
         expectArtifactError(
-          await invokeTranscriptArtifact("artifacts.download", {
+          await transcriptRpc("artifacts.download", {
             artifactId,
             messageRole: "assistant",
           }),
@@ -713,22 +651,15 @@ describe("persisted chat image artifact recovery", () => {
   });
 
   it("does not retarget references across sessions or replacement incarnations with the same message id", async () => {
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
+    await withState(async () => {
       await captureRuntimeConfigAsyncReader()();
-      const message = {
-        role: "assistant",
-        content: [{ type: "image", data: "b3JpZ2luYWw=", mimeType: "image/png" }],
-      };
+      const message = imageMessage("b3JpZ2luYWw=");
       await seedMessage(transcriptScope, message, "shared-message-id");
       const artifactId = await imageReference(transcriptScope, "shared-message-id");
-      const other = {
-        ...transcriptScope,
-        sessionKey: "agent:main:other-images",
-        sessionId: "other-images",
-      };
+      const other = sessionScope("other-images");
       await seedMessage(other, message, "shared-message-id");
       expectArtifactError(
-        await invokeTranscriptArtifact("artifacts.download", {
+        await transcriptRpc("artifacts.download", {
           sessionKey: other.sessionKey,
           artifactId,
         }),
@@ -737,14 +668,12 @@ describe("persisted chat image artifact recovery", () => {
       const replacement = { ...transcriptScope, sessionId: "replacement-images" };
       await seedMessage(replacement, message, "shared-message-id", 2);
       expectArtifactError(
-        await invokeTranscriptArtifact("artifacts.download", { artifactId }),
+        await transcriptRpc("artifacts.download", { artifactId }),
         "artifact_not_found",
       );
       const currentId = await imageReference(replacement, "shared-message-id");
       expect(currentId).not.toBe(artifactId);
-      expect(
-        await invokeTranscriptArtifact("artifacts.download", { artifactId: currentId }),
-      ).toMatchObject({
+      expect(await transcriptRpc("artifacts.download", { artifactId: currentId })).toMatchObject({
         ok: true,
         payload: { data: "b3JpZ2luYWw=" },
       });
@@ -756,7 +685,7 @@ describe("persisted chat image artifact recovery", () => {
     { phase: "response", revocation: "sharing" },
     { phase: "read", revocation: "runtime policy" },
   ] as const)("rechecks $revocation after the $phase await", async ({ phase, revocation }) => {
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
+    await withState(async () => {
       let config: OpenClawConfig = {};
       setRuntimeConfigSnapshot(config);
       const context = createDirectChatContext({ getRuntimeConfig: () => config });
@@ -770,15 +699,12 @@ describe("persisted chat image artifact recovery", () => {
       };
       await upsertSessionEntryCore(transcriptScope, { ...entry, visibility: "shared" });
       const appended = await appendTranscriptMessage(transcriptScope, {
-        message: {
-          role: "assistant",
-          content: [{ type: "image", data: "cHJpdmF0ZQ==", mimeType: "image/png" }],
-        },
+        message: imageMessage("cHJpdmF0ZQ=="),
       });
       const artifactId = await imageReference(transcriptScope, appended.messageId);
       const client = sharingPolicyClient({ user: viewer.id, scopes: ["operator.read"] });
       expect(
-        await invokeTranscriptArtifact("artifacts.download", { artifactId }, client, context),
+        await transcriptRpc("artifacts.download", { artifactId }, client, context),
       ).toMatchObject({
         ok: true,
       });
@@ -819,14 +745,8 @@ describe("persisted chat image artifact recovery", () => {
                 return result;
               });
       try {
-        const denied = await invokeTranscriptArtifact(
-          "artifacts.download",
-          { artifactId },
-          client,
-          context,
-        );
-        expect(denied.ok).toBe(false);
-        expect(denied.payload).toBeUndefined();
+        const denied = await transcriptRpc("artifacts.download", { artifactId }, client, context);
+        expect(denied).toMatchObject({ ok: false, payload: undefined });
       } finally {
         spy.mockRestore();
       }

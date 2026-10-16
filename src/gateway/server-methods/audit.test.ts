@@ -61,28 +61,13 @@ async function runAuditHandler(
   params: object,
 ) {
   const respond = vi.fn();
-  await expectDefined(
-    auditHandlers[method],
-    "auditHandlers[method] test invariant",
-  )({ params, respond } as never);
+  await expectDefined(auditHandlers[method], "audit handler")({ params, respond } as never);
   return respond;
 }
 
 async function expectInspection(params: object, selected: object = params) {
   await runAuditHandler("audit.run.inspect", params);
   expect(inspectExecutionIdentityRun).toHaveBeenLastCalledWith(selected);
-}
-
-async function expectMirroredCursor(decisionCursor: string, executionOffset?: number) {
-  const request = { runId: "run-1", decisionCursor, decisionLimit: 25 };
-  await expectInspection(
-    { ...request, executionCursor: decisionCursor },
-    {
-      ...request,
-      executionLimit: 50,
-      ...(executionOffset === undefined ? {} : { executionOffset }),
-    },
-  );
 }
 
 describe("audit gateway methods", () => {
@@ -308,13 +293,23 @@ describe("audit gateway methods", () => {
     expect(json).not.toContain("SYNTHETIC_PRIVATE_");
   });
 
-  it("preserves mirrored numeric cursors for execution paging", async () => {
-    await expectMirroredCursor("001", 1);
-  });
-
-  it("treats mirrored owner decision cursors as decision-only", async () => {
-    await expectMirroredCursor("a:2000:42");
-  });
+  it.each([
+    ["001", 1],
+    ["a:2000:42", undefined],
+  ] as const)(
+    "preserves mirrored decision cursor %s without inventing an execution offset",
+    async (decisionCursor, executionOffset) => {
+      const request = { runId: "run-1", decisionCursor, decisionLimit: 25 };
+      await expectInspection(
+        { ...request, executionCursor: decisionCursor },
+        {
+          ...request,
+          executionLimit: 50,
+          ...(executionOffset === undefined ? {} : { executionOffset }),
+        },
+      );
+    },
+  );
 
   it("rejects malformed run inspection before storage access", async () => {
     expectInvalid(await runAuditHandler("audit.run.inspect", { runId: "", extra: true }));

@@ -4,24 +4,19 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { cleanupTempDirs, makeTempDir } from "../../../test/helpers/temp-dir.js";
 import { listAuditEvents, recordAuditEventInDatabase } from "../../audit/audit-event-store.js";
-import {
-  configureExecutionIdentityAdmissionSink,
-  enqueueExecutionIdentityContextAtAdmission,
-} from "../../audit/execution-identity-admission.js";
-import { processExecutionIdentityAdmissionWorkInDatabase } from "../../audit/execution-identity-context.js";
+import { prepareExecutionIdentityContextAtAdmission } from "../../audit/execution-identity.test-support.js";
 import { requireNodeSqlite } from "../../infra/node-sqlite.js";
 import {
   closeOpenClawStateDatabaseForTest,
   closeOpenClawStateDatabaseAsync,
   openOpenClawStateDatabase,
-  type OpenClawStateDatabaseOptions,
 } from "../../state/openclaw-state-db.js";
 import { observeMainThreadSql } from "../../test-utils/main-thread-sql-spies.test-support.js";
 import { auditHandlers } from "./audit.js";
 
 const tempDirs: string[] = [];
 
-function createDatabaseOptions(): OpenClawStateDatabaseOptions {
+function createDatabaseOptions() {
   const stateDir = makeTempDir(tempDirs, "openclaw-audit-trim-");
   process.env.OPENCLAW_STATE_DIR = stateDir;
   return { env: { OPENCLAW_STATE_DIR: stateDir } };
@@ -30,7 +25,9 @@ function createDatabaseOptions(): OpenClawStateDatabaseOptions {
 async function callAudit(method: keyof typeof auditHandlers, params: object) {
   const respond = vi.fn();
   await expectDefined(auditHandlers[method], "audit handler")({ params, respond } as never);
-  return respond;
+  expect(respond).toHaveBeenCalledWith(true, expect.anything());
+  const result: unknown = respond.mock.calls[0]?.[1];
+  return result;
 }
 afterEach(async () => {
   await closeOpenClawStateDatabaseAsync();
@@ -39,58 +36,41 @@ afterEach(async () => {
   delete process.env.OPENCLAW_STATE_DIR;
 });
 
-afterAll(() => {
-  cleanupTempDirs(tempDirs);
-});
+afterAll(() => cleanupTempDirs(tempDirs));
 
 describe("audit methods against a real audit store", () => {
   it.each([false, true])(
     "inspects retained execution identity without host SQLite (writable actor: %s)",
     async (warmActor) => {
       const database = createDatabaseOptions();
-      const clear = configureExecutionIdentityAdmissionSink((work) => {
-        processExecutionIdentityAdmissionWorkInDatabase(work, {
-          ...database,
-          database: openOpenClawStateDatabase(database),
-        });
-        return true;
-      });
-      try {
-        expect(
-          enqueueExecutionIdentityContextAtAdmission(
-            {
-              runId: "inspection-run",
-              agentId: "main",
-              ingress: { kind: "local-cli", boundary: "agent-command.local", state: "present" },
-              runtime: { kind: "embedded" },
-            },
-            { enabled: true, contextId: "inspection-context", executionId: "inspection-execution" },
-          ),
-        ).toBeDefined();
-      } finally {
-        clear();
-      }
+      expect(
+        prepareExecutionIdentityContextAtAdmission(
+          {
+            runId: "inspection-run",
+            agentId: "main",
+            ingress: { kind: "local-cli", boundary: "agent-command.local", state: "present" },
+            runtime: { kind: "embedded" },
+          },
+          { ...database, contextId: "inspection-context", executionId: "inspection-execution" },
+        ),
+      ).toBeDefined();
       await closeOpenClawStateDatabaseAsync();
       if (warmActor) {
         await listAuditEvents({ database, limit: 1 });
       }
       requireNodeSqlite();
       const counters = observeMainThreadSql({ includeClose: true });
-      const respond = await callAudit("audit.run.inspect", {
+      const result = await callAudit("audit.run.inspect", {
         executionId: "inspection-execution",
         decisionLimit: 1,
       });
-      expect(respond).toHaveBeenCalledWith(
-        true,
-        expect.objectContaining({
-          run: { runId: "inspection-run", executionId: "inspection-execution", status: "known" },
-          identity: expect.objectContaining({ state: "present" }),
-          decisionDisplays: [
-            expect.objectContaining({ selectorId: "inspection-context:admission" }),
-          ],
-        }),
-      );
-      expect(respond.mock.calls[0]?.[1]).not.toHaveProperty("decisions");
+      const run = { runId: "inspection-run", executionId: "inspection-execution", status: "known" };
+      expect(result).toHaveProperty("run", run);
+      expect(result).toMatchObject({
+        identity: { state: "present" },
+        decisionDisplays: [{ selectorId: "inspection-context:admission" }],
+      });
+      expect(result).not.toHaveProperty("decisions");
       counters.expectIdle();
     },
   );
@@ -99,15 +79,11 @@ describe("audit methods against a real audit store", () => {
     "keeps absent state absent during inspection: %j",
     async (params) => {
       const database = createDatabaseOptions();
-      const stateDir = expectDefined(database.env?.OPENCLAW_STATE_DIR, "temp state dir");
-      const respond = await callAudit("audit.run.inspect", params);
-      expect(respond).toHaveBeenCalledWith(
-        true,
-        expect.objectContaining({
-          identity: expect.objectContaining({ state: "unknown" }),
-          decisionDisplays: [],
-        }),
-      );
+      const stateDir = database.env.OPENCLAW_STATE_DIR;
+      expect(await callAudit("audit.run.inspect", params)).toMatchObject({
+        identity: { state: "unknown" },
+        decisionDisplays: [],
+      });
       expect(existsSync(path.join(stateDir, "state", "openclaw.sqlite"))).toBe(false);
     },
   );
@@ -142,20 +118,17 @@ describe("audit methods against a real audit store", () => {
       );
 
       // Negative control: untrimmed filter values miss the planted row at the store.
-      expect(
-        (
-          await listAuditEvents({
-            limit: 20,
-            filters: { agentId: " main ", runId: " run-trim-1 " },
-            database,
-          })
-        ).events,
-      ).toEqual([]);
+      const untrimmed = await listAuditEvents({
+        limit: 20,
+        filters: { agentId: " main ", runId: " run-trim-1 " },
+        database,
+      });
+      expect(untrimmed.events).toEqual([]);
 
       await closeOpenClawStateDatabaseAsync();
       requireNodeSqlite();
       const counters = observeMainThreadSql();
-      const respond = await callAudit(method, {
+      const result = await callAudit(method, {
         limit: 1,
         agentId: " main ",
         sessionKey: " agent:main:main ",
@@ -163,21 +136,18 @@ describe("audit methods against a real audit store", () => {
       });
 
       counters.expectIdle();
-      expect(respond).toHaveBeenCalledWith(
-        true,
-        expect.objectContaining({
-          nextCursor: String(finished?.sequence),
-          events: [
-            expect.objectContaining({
-              agentId: "main",
-              runId: "run-trim-1",
-              action: "agent.run.finished",
-            }),
-          ],
-        }),
-      );
+      expect(result).toMatchObject({
+        nextCursor: String(finished?.sequence),
+        events: [
+          {
+            agentId: "main",
+            runId: "run-trim-1",
+            action: "agent.run.finished",
+          },
+        ],
+      });
       const next = await callAudit(method, { limit: 1, cursor: String(finished?.sequence) });
-      expect(next).toHaveBeenCalledWith(true, {
+      expect(next).toEqual({
         events: [expect.objectContaining({ action: "agent.run.started" })],
       });
       counters.expectIdle();
