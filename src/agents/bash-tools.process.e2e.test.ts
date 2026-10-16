@@ -127,7 +127,10 @@ afterAll(async () => {
   await state?.cleanup();
 });
 
-async function seedOrigin(sessionKey: string) {
+async function seedOrigin(
+  sessionKey: string,
+  overrides: Partial<Parameters<typeof replaceSessionEntry>[1]> = {},
+) {
   await replaceSessionEntry(
     { agentId: "main", sessionKey },
     {
@@ -136,6 +139,7 @@ async function seedOrigin(sessionKey: string) {
       updatedAt: Date.now(),
       sessionStartedAt: Date.now(),
       permissionMode: "full",
+      ...overrides,
     },
   );
 }
@@ -172,21 +176,29 @@ function textContent(result: { content: Array<{ type: string; text?: string }> }
 }
 
 function runSandboxProcess({
-  containerName,
+  command,
+  containerName = command,
   child,
-  finalizeExec,
+  finalizeExec = async () => {},
   maxOutput = 1000,
+  timeoutSec = 10,
+  notifyOnExit = true,
   ...options
 }: Pick<
   Parameters<typeof runExecProcess>[0],
-  "command" | "scopeKey" | "timeoutSec" | "notifyOnExit" | "notifyOnExitEmptySuccess"
+  "command" | "scopeKey" | "notifyOnExitEmptySuccess"
 > & {
-  containerName: string;
   child: string;
-  finalizeExec: () => Promise<void>;
+  containerName?: string;
+  finalizeExec?: () => Promise<void>;
   maxOutput?: number;
+  timeoutSec?: number;
+  notifyOnExit?: boolean;
 }) {
   return runExecProcess({
+    command,
+    timeoutSec,
+    notifyOnExit,
     workdir: process.cwd(),
     env: {},
     sandbox: {
@@ -219,8 +231,13 @@ function createGatewayExecTool(defaults: Parameters<typeof createExecTool>[0]) {
   });
 }
 
-function backgroundTool(scopeKey: string, notifyOnExit = true, notifyOnExitEmptySuccess = true) {
-  return createGatewayExecTool({
+async function startBackground(
+  scopeKey: string,
+  source: string,
+  options: { notifyOnExit?: boolean; notifyOnExitEmptySuccess?: boolean; pty?: boolean } = {},
+) {
+  const { notifyOnExit = true, notifyOnExitEmptySuccess = true, ...params } = options;
+  const tool = createGatewayExecTool({
     allowBackground: true,
     backgroundMs: 0,
     notifyOnExit,
@@ -228,6 +245,13 @@ function backgroundTool(scopeKey: string, notifyOnExit = true, notifyOnExitEmpty
     sessionKey: notifyOnExit ? scopeKey : undefined,
     scopeKey,
   });
+  const started = await tool.execute("start", {
+    command: currentNodeEvalCommand(source),
+    background: true,
+    ...params,
+  });
+  const sessionId = backgroundSessionId(started.details);
+  return { sessionId, ...processActions(scopeKey, sessionId) };
 }
 
 function processActions(scopeKey: string, sessionId: string) {
@@ -262,7 +286,7 @@ function backgroundSessionId(details: ExecToolDetails): string {
   return sessionId;
 }
 
-const SYNTHETIC_FINALIZER_CREDENTIAL = ["sk", "synthetic", "fixture", "never", "real"].join("-");
+const FINALIZER_SECRET = ["sk", "synthetic", "fixture", "never", "real"].join("-");
 
 test.skipIf(process.platform === "win32")(
   "keeps subagent yield blocked until a real finalized background exec is collected",
@@ -275,27 +299,16 @@ test.skipIf(process.platform === "win32")(
       runId,
       childSessionKey: scopeKey,
       childAgentId: "main",
-      requesterSessionKey: "agent:main:main",
-      requesterDisplayKey: "main",
-      task: "Collect the owned process before waiting",
-      cleanup: "keep",
       createdAt: 1,
-      execution: { status: "running" },
       expectsCompletionMessage: false,
-      completion: { required: false },
-      delivery: { status: "not_required" },
     });
     const finalization = createDeferredCore();
     const run = await runSandboxProcess({
       command: "yield-retention-proof",
-      containerName: "yield-retention-proof",
       child: "process.exit(2)",
-      async finalizeExec() {
-        await finalization.promise;
-      },
+      finalizeExec: () => finalization.promise,
       notifyOnExit: false,
       scopeKey,
-      timeoutSec: 10,
     });
     markBackgrounded(run.session);
     let yieldCount = 0;
@@ -324,10 +337,7 @@ test.skipIf(process.platform === "win32")(
         error: expect.stringContaining("Use process to poll and collect"),
       });
       expect(yieldCount).toBe(0);
-      const poll = await createProcessTool({ scopeKey }).execute("poll-finished", {
-        action: "poll",
-        sessionId: run.session.id,
-      });
+      const poll = await processActions(scopeKey, run.session.id).call("poll");
       acknowledgeInternalToolResult(poll);
       expect(
         (await yieldTool.execute("yield-collected", { waitFor: "message" })).details,
@@ -351,22 +361,19 @@ test.skipIf(process.platform === "win32").for([false, true])(
     await seedOrigin(scopeKey);
     const run = await runSandboxProcess({
       command: "requested-stop-proof",
-      containerName: "requested-stop-proof",
       child: 'process.stdout.write("STOP_PROOF_READY"); setInterval(() => {}, 1000)',
       async finalizeExec() {
         if (finalizerFails) {
           throw new Error("requested stop cleanup failed");
         }
       },
-      notifyOnExit: true,
       scopeKey,
-      timeoutSec: 10,
     });
     markBackgrounded(run.session);
-    const processTool = createProcessTool({ scopeKey });
+    const { tool: processTool, call } = processActions(scopeKey, run.session.id);
     try {
       await expect.poll(() => run.session.aggregated).toContain("STOP_PROOF_READY");
-      await processTool.execute("requested-stop", { action: "kill", sessionId: run.session.id });
+      await call("kill");
       await run.promise;
       if (finalizerFails) {
         expect(await completionPrompt(scopeKey, signal)).toContain("Exec failed");
@@ -375,10 +382,7 @@ test.skipIf(process.platform === "win32").for([false, true])(
         expect(model).not.toHaveBeenCalled();
       }
       for (const action of ["poll", "log"] as const) {
-        const observed = await processTool.execute(`requested-stop-${action}`, {
-          action,
-          sessionId: run.session.id,
-        });
+        const observed = await call(action);
         expect(observed.details).toMatchObject({
           status: finalizerFails ? "failed" : "completed",
           exitReason: "manual-cancel",
@@ -406,35 +410,22 @@ test.skipIf(process.platform === "win32").for([
     name: "post-exit finalizer failure",
     child: 'setTimeout(() => { process.stdout.write("REAL_CHILD_OUTPUT"); process.exit(0); }, 80)',
     timeoutSec: 5,
-    finalizerError: `REAL_FINALIZER_DIAGNOSTIC Authorization: Bearer ${SYNTHETIC_FINALIZER_CREDENTIAL}`,
-    expectedStatus: "failed",
-    expectedExitCode: undefined,
-    expectedExitLabel: "unknown exit code",
+    error: `REAL_FINALIZER_DIAGNOSTIC Authorization: Bearer ${FINALIZER_SECRET}`,
+    code: undefined,
+    label: "unknown exit code",
   },
   {
     name: "timeout after a clean child exit",
     child:
       'process.on("SIGTERM", () => process.exit(0)); process.stdout.write("REAL_CHILD_OUTPUT"); setInterval(() => {}, 1000)',
     timeoutSec: 1,
-    finalizerError: undefined,
-    expectedStatus: "failed",
-    expectedExitCode: 0,
-    expectedExitLabel: "code 0",
+    error: undefined,
+    code: 0,
+    label: "code 0",
   },
 ] as const)(
   "keeps $name truthful across a real background child, notification, and waiting poll",
-  async (
-    {
-      name,
-      child,
-      timeoutSec,
-      finalizerError,
-      expectedStatus,
-      expectedExitCode,
-      expectedExitLabel,
-    },
-    { signal },
-  ) => {
+  async ({ name, child, timeoutSec, error, code, label }, { signal }) => {
     const scopeKey = `agent:main:process-terminal-${name.replaceAll(" ", "-")}`;
     await seedOrigin(scopeKey);
     const run = await runSandboxProcess({
@@ -442,24 +433,19 @@ test.skipIf(process.platform === "win32").for([
       containerName: "process-terminal-proof",
       child,
       async finalizeExec() {
-        if (finalizerError) {
-          throw new Error(finalizerError);
+        if (error) {
+          throw new Error(error);
         }
       },
       maxOutput: 10_000,
-      notifyOnExit: true,
       notifyOnExitEmptySuccess: true,
       scopeKey,
       timeoutSec,
     });
     markBackgrounded(run.session);
 
-    const processTool = createProcessTool({ scopeKey });
-    const pendingPoll = processTool.execute(`process-terminal-poll-${name}`, {
-      action: "poll",
-      sessionId: run.session.id,
-      timeout: 2_000,
-    });
+    const { tool: processTool, call } = processActions(scopeKey, run.session.id);
+    const pendingPoll = call("poll", { timeout: 2_000 });
 
     const outcome = await run.promise;
     const notification = await completionPrompt(scopeKey, signal);
@@ -471,28 +457,23 @@ test.skipIf(process.platform === "win32").for([
         aggregated: "REAL_CHILD_OUTPUT",
       });
       expect(textContent(poll)).toContain("REAL_CHILD_OUTPUT");
-      poll = await processTool.execute(`process-terminal-final-poll-${name}`, {
-        action: "poll",
-        sessionId: run.session.id,
-      });
+      poll = await call("poll");
     }
     const details = poll.details as { status?: string; exitCode?: number };
 
-    expect(outcome.status).toBe(expectedStatus);
-    expect(details.status).toBe(expectedStatus);
+    expect(outcome.status).toBe("failed");
+    expect(details.status).toBe("failed");
     expect(Value.Check(processTool.outputSchema!, poll.details)).toBe(true);
-    expect(details.exitCode).toBe(expectedExitCode);
-    expect(getFinishedSession(run.session.id)?.terminalStatus).toBe(expectedStatus);
-    expect(textContent(poll)).toContain(`Process exited with ${expectedExitLabel}.`);
-    expect(notification).toContain(expectedExitLabel);
-    if (finalizerError) {
-      expect(textContent(poll)).toContain("REAL_FINALIZER_DIAGNOSTIC");
-      expect(notification).toContain("REAL_FINALIZER_DIAGNOSTIC");
-      expect(textContent(poll)).not.toContain(SYNTHETIC_FINALIZER_CREDENTIAL);
-      expect(notification).not.toContain(SYNTHETIC_FINALIZER_CREDENTIAL);
-      expect(getFinishedSession(run.session.id)?.aggregated).not.toContain(
-        SYNTHETIC_FINALIZER_CREDENTIAL,
-      );
+    expect(details.exitCode).toBe(code);
+    expect(getFinishedSession(run.session.id)?.terminalStatus).toBe("failed");
+    expect(textContent(poll)).toContain(`Process exited with ${label}.`);
+    expect(notification).toContain(label);
+    if (error) {
+      for (const text of [textContent(poll), notification]) {
+        expect(text).toContain("REAL_FINALIZER_DIAGNOSTIC");
+        expect(text).not.toContain(FINALIZER_SECRET);
+      }
+      expect(getFinishedSession(run.session.id)?.aggregated).not.toContain(FINALIZER_SECRET);
       expect(notification).not.toContain("code 0");
     }
   },
@@ -531,12 +512,9 @@ test.skipIf(process.platform === "win32").for([
   async ({ name, exitCode, expectsNotification }, { signal }) => {
     const scopeKey = `agent:main:process-default-wake-${name.replaceAll(" ", "-")}`;
     await seedOrigin(scopeKey);
-    const execTool = backgroundTool(scopeKey, true, false);
-    const started = await execTool.execute(`process-default-wake-${name}`, {
-      command: currentNodeEvalCommand(`process.exit(${exitCode});`),
-      background: true,
+    const { sessionId } = await startBackground(scopeKey, `process.exit(${exitCode});`, {
+      notifyOnExitEmptySuccess: false,
     });
-    const sessionId = backgroundSessionId(started.details);
 
     await waitForExecScope(scopeKey);
     expect(getFinishedSession(sessionId)).toBeDefined();
@@ -571,18 +549,14 @@ test.skipIf(process.platform === "win32")(
       abortSignal: signal,
       deliver: false,
     });
-    const execTool = backgroundTool(scopeKey);
-    const processTool = createProcessTool({ scopeKey });
     const marker = "REAL_NOTIFY_ON_EXIT";
     try {
       expect(await withinTest(predecessor.accepted, signal)).toEqual({ ok: true });
       await withinTest(entered.promise, signal);
-      const started = await execTool.execute("process-notify-start", {
-        command: currentNodeEvalCommand(`process.stdout.write(${JSON.stringify(marker)});`),
-        background: true,
-      });
-      expect(started.details).toMatchObject({ status: "running" });
-      const sessionId = backgroundSessionId(started.details);
+      const { sessionId, call } = await startBackground(
+        scopeKey,
+        `process.stdout.write(${JSON.stringify(marker)});`,
+      );
 
       await waitForExecScope(scopeKey);
       const completion = expectDefined(completions.get(scopeKey), "queued exec completion");
@@ -591,10 +565,7 @@ test.skipIf(process.platform === "win32")(
         expect.objectContaining({ id: completion.id, text: expect.stringContaining(marker) }),
       ]);
 
-      const poll = await processTool.execute("process-notify-poll", {
-        action: "poll",
-        sessionId,
-      });
+      const poll = await call("poll");
       expect(poll.details).toMatchObject({ status: "completed", sessionId });
       expect(peekSystemEventEntries(scopeKey)).toHaveLength(1);
       acknowledgeInternalToolResult(poll);
@@ -618,44 +589,36 @@ test.skipIf(process.platform === "win32")(
   "controls and cancels one real interactive background child through process tools",
   async () => {
     const scopeKey = "agent:main:process-control-roundtrip";
-    const execTool = backgroundTool(scopeKey, false);
-    const command = currentNodeEvalCommand(
-      [
-        'process.stdin.setEncoding("utf8");',
-        "process.stdin.setRawMode?.(true);",
-        'let pending = "";',
-        "let lineCount = 0;",
-        'process.stdout.write("READY\\n");',
-        'process.stdin.on("data", (chunk) => {',
-        "  for (const char of chunk) {",
-        '    if (char === "\\u0003") {',
-        "      process.stdout.write(`CONTROL:CTRL-C:${lineCount}\\n`);",
-        "      continue;",
-        "    }",
-        '    if (char !== "\\r" && char !== "\\n") {',
-        "      pending += char;",
-        "      continue;",
-        "    }",
-        "    if (!pending) continue;",
-        "    lineCount += 1;",
-        "    process.stdout.write(`LINE:${pending}\\n`);",
-        '    pending = "";',
-        "  }",
-        "});",
-        "setInterval(() => {}, 1_000);",
-      ].join("\n"),
-    );
+    const source = [
+      'process.stdin.setEncoding("utf8");',
+      "process.stdin.setRawMode?.(true);",
+      'let pending = "";',
+      "let lineCount = 0;",
+      'process.stdout.write("READY\\n");',
+      'process.stdin.on("data", (chunk) => {',
+      "  for (const char of chunk) {",
+      '    if (char === "\\u0003") {',
+      "      process.stdout.write(`CONTROL:CTRL-C:${lineCount}\\n`);",
+      "      continue;",
+      "    }",
+      '    if (char !== "\\r" && char !== "\\n") {',
+      "      pending += char;",
+      "      continue;",
+      "    }",
+      "    if (!pending) continue;",
+      "    lineCount += 1;",
+      "    process.stdout.write(`LINE:${pending}\\n`);",
+      '    pending = "";',
+      "  }",
+      "});",
+      "setInterval(() => {}, 1_000);",
+    ].join("\n");
 
     let sessionId: string | undefined;
     try {
-      const started = await execTool.execute("process-control-start", {
-        command,
-        background: true,
-        pty: true,
-      });
-      expect(started.details).toMatchObject({ status: "running" });
-      sessionId = backgroundSessionId(started.details);
-      const { tool: processTool, call, waitFor } = processActions(scopeKey, sessionId);
+      const started = await startBackground(scopeKey, source, { notifyOnExit: false, pty: true });
+      sessionId = started.sessionId;
+      const { tool: processTool, call, waitFor } = started;
 
       const listed = await call("list");
       expect(listed.details).toMatchObject({
@@ -721,9 +684,9 @@ test.skipIf(process.platform === "win32")(
       const completedLog = await call("log");
       expect(completedLog.details).toMatchObject({ status: "completed", sessionId });
       expect(Value.Check(processTool.outputSchema!, completedLog.details)).toBe(true);
-      expect(textContent(completedLog)).toContain("LINE:alpha");
-      expect(textContent(completedLog)).toContain("LINE:beta");
-      expect(textContent(completedLog)).toContain("CONTROL:CTRL-C:2");
+      for (const output of ["LINE:alpha", "LINE:beta", "CONTROL:CTRL-C:2"]) {
+        expect(textContent(completedLog)).toContain(output);
+      }
     } finally {
       if (sessionId && getSession(sessionId)) {
         await processActions(scopeKey, sessionId).call("kill");
@@ -737,20 +700,13 @@ test.skipIf(process.platform === "win32")(
   "re-admits a real deferred exec completion under a policy published mid-turn",
   async ({ signal }) => {
     const scopeKey = "agent:main:process-config-readmission";
-    await replaceSessionEntry(
-      { agentId: "main", sessionKey: scopeKey },
-      {
-        sessionId: "process-config-readmission",
-        lifecycleRevision: "original",
-        updatedAt: Date.now(),
-        sessionStartedAt: Date.now(),
-        permissionMode: "full",
-        // A channel route arms the durable exec source claim.
-        delivery: normalizeSessionDeliveryState({
-          context: { channel: "telegram", to: "-100001", accountId: "readmission" },
-        }),
-      },
-    );
+    await seedOrigin(scopeKey, {
+      sessionId: "process-config-readmission",
+      // A channel route arms the durable exec source claim.
+      delivery: normalizeSessionDeliveryState({
+        context: { channel: "telegram", to: "-100001", accountId: "readmission" },
+      }),
+    });
     const held = createDeferredCore();
     const firstStarted = createDeferredCore();
     const turns: Array<{ prompt: string; deny: readonly string[] | undefined }> = [];
@@ -775,13 +731,9 @@ test.skipIf(process.platform === "win32")(
       await withinTest(firstStarted.promise, signal);
       const run = await runSandboxProcess({
         command: "config-readmission-proof",
-        containerName: "config-readmission-proof",
         child: 'setTimeout(() => { process.stdout.write("READMISSION_CHILD_OUTPUT"); }, 100)',
-        async finalizeExec() {},
-        notifyOnExit: true,
         notifyOnExitEmptySuccess: true,
         scopeKey,
-        timeoutSec: 10,
       });
       markBackgrounded(run.session);
       await run.promise;
