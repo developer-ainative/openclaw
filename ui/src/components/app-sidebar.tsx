@@ -18,6 +18,7 @@ import { PluginView } from "../plugins/control-ui-view.solid.tsx";
 import { appSidebarProperties, type AppSidebarProps } from "./app-sidebar-base.ts";
 import { AppSidebarOwner } from "./app-sidebar-owner.tsx";
 import { createSidebarScroll } from "./sidebar-context-controller.ts";
+import { createSidebarPeople } from "./sidebar-people.ts";
 
 export { AppSidebarOwner } from "./app-sidebar-owner.tsx";
 
@@ -57,6 +58,10 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
     subscribe: (current, notify) => current.subscribe(notify),
     equality: "revision",
   });
+  const people = (owner.peopleView = createSidebarPeople(owner, owner.people, () => {
+    Object.values(props);
+    return projection.read();
+  }));
   const presentationRevision = createParkedProjection(
     () => {
       Object.values(props);
@@ -123,11 +128,13 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
       // Props remain on the bridge's live object; source changes refresh its subscriptions.
       Object.values(props);
       owner.prepareRender();
+      people.capture();
       scroll.capture();
     },
     () =>
       untrack(() => {
         owner.commitRender();
+        people.syncRendered();
         scroll.restore();
       }),
   );
