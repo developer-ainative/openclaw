@@ -278,7 +278,7 @@ const streamingReply =
     ? createControlUiStreamingReply()
     : undefined;
 if (values["interaction-latency"]) {
-  // One event/history owner keeps the long answer coherent across session switches.
+  // One reply owns this conversation; background traffic must not append newer turns.
   const deltaCount = (interactionDurationMs / 1000) * streamingReply!.deltasPerSecond;
   streamingReply!.deltas = Array.from({ length: deltaCount }, (_, index) =>
     streamingReply!.text.slice(
@@ -287,7 +287,9 @@ if (values["interaction-latency"]) {
     ),
   );
   fixture.liveEvents = [
-    ...fixture.liveEvents.filter((item) => item.event !== "chat"),
+    ...fixture.liveEvents.filter(
+      (item) => item.event !== "chat" && item.event !== "session.message",
+    ),
     ...streamingReply!.deltas.map((text, index) => ({
       atMs: ((index + 1) * 1000) / streamingReply!.deltasPerSecond,
       kind: "chat.delta.reply",

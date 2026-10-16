@@ -62,6 +62,8 @@ not a measurement of native IndexedDB cost alone.
 End/PageUp, session-menu opening, and pinned-session switches during a
 90-second reply stream at 30 cumulative deltas per second plus Team background
 events. It cannot be combined with `--live-events` or `--streaming-reply`.
+The selected conversation has one streamed reply and the operator's unsent draft;
+competing reply deltas and new user turns are excluded from its background mix.
 `run-N.interactions.json` records per-type input, processing, presentation, and
 total latency distributions, raw Event Timing entries, native input delays, and
 overlapping LoAF scripts. Event Timing omits durations below 16 ms and rounds to
