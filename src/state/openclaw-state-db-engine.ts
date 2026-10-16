@@ -224,7 +224,7 @@ export function ensureStatePostgresFragment(db: PostgresSqlConnection, table: st
   admitStatePostgres(db, false);
 }
 
-export function openStatePostgresReadConnection(pathname: string, expectedIdentity?: string) {
+export function openExistingStatePostgresConnection(pathname: string, expectedIdentity?: string) {
   const input = stateEngineInput();
   if (!input) {
     return undefined;
@@ -260,7 +260,7 @@ export function openStatePostgresReadConnection(pathname: string, expectedIdenti
             db: selected,
             path: pathname,
           }),
-          "PostgreSQL state reader cleanup failed.",
+          "PostgreSQL state connection cleanup failed.",
         );
         return !selected.isOpen && !anchor.isOpen;
       },
@@ -273,7 +273,7 @@ export function openStatePostgresReadConnection(pathname: string, expectedIdenti
     if (errors.length) {
       throw createSqliteLifecycleAggregateError(
         [error, ...errors],
-        "PostgreSQL state reader acquisition and cleanup failed.",
+        "PostgreSQL state connection acquisition and cleanup failed.",
         error,
       );
     }

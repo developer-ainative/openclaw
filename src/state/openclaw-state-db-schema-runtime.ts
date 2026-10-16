@@ -126,7 +126,8 @@ export function ensureOpenClawStateRuntimeSchema(
           createStateConfigMachineTable(db);
           executeCanonicalStateSchema(db, {
             includeVersionLazyAdditiveTables: true,
-            includeAgentDeletionJournal: initialization.kind === "fresh",
+            includeAgentDeletionJournal:
+              initialization.kind === "fresh" || initialization.nativeBootstrapEligible === true,
           });
           writeCurrentStateSchemaMetadata(db, now);
           runtimeReady = true;
@@ -166,7 +167,8 @@ export function ensureOpenClawStateRuntimeSchema(
         const includeAgentDeletionJournal =
           tableExists(db, "agent_deletion_journal") ||
           hasPreJournalStateSchema(db) ||
-          (initialization.kind === "fresh" && isUninitializedNativeStartupDatabase(db));
+          ((initialization.kind === "fresh" || initialization.nativeBootstrapEligible === true) &&
+            isUninitializedNativeStartupDatabase(db));
         // Older schemas still need atomic content transforms before retiring their columns.
         dropLegacyStateTables(db);
         const changes = retirements.runRetiredStateTableMigrations(db, previousVersion);

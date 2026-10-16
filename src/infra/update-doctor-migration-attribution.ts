@@ -20,7 +20,10 @@ export function runWithUpdateDoctorMigrationCapture<T>(
 }
 
 /** Called inside the engine's migration transaction, before its first mutation. */
-export function beginUpdatePostgresMigration(db: PostgresSyncConnection) {
+export function beginUpdatePostgresMigration(
+  db: PostgresSyncConnection,
+  assertMigrationCurrent?: () => void,
+) {
   const capture = captures.getStore();
   const pathname = db.anchor.location();
   const expected = pathname && capture?.expected(pathname);
@@ -34,7 +37,11 @@ export function beginUpdatePostgresMigration(db: PostgresSyncConnection) {
   }
   const assertCurrent = () => {
     maintenance.assertAdmission();
-    maintenance.assertDatabaseAccess(pathname);
+    if (assertMigrationCurrent) {
+      assertMigrationCurrent();
+    } else {
+      maintenance.assertDatabaseAccess(pathname);
+    }
     capture.assertCurrent();
   };
   assertCurrent();

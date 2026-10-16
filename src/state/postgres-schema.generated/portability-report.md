@@ -14,7 +14,7 @@
 | Database | Object        | Total | Translated | Reported |
 | -------- | ------------- | ----: | ---------: | -------: |
 | state    | table         |   131 |        131 |        0 |
-| state    | column        |  1378 |       1376 |        2 |
+| state    | column        |  1379 |       1377 |        2 |
 | state    | index         |   284 |        284 |        0 |
 | state    | foreignKey    |    32 |         32 |        0 |
 | state    | check         |   293 |        293 |        0 |
