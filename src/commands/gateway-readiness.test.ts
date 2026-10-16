@@ -18,7 +18,7 @@ type StatusOverrides = Omit<Partial<DaemonStatus>, "service"> & {
   service?: Omit<DaemonStatus["service"], "loaded">;
 };
 
-function createStatus(overrides: StatusOverrides = {}): DaemonStatus {
+function createStatus(overrides: StatusOverrides = {}, port = 18789): DaemonStatus {
   const { service, ...rest } = overrides;
   const serviceStatus = service ?? {
     label: "systemd user",
@@ -39,19 +39,19 @@ function createStatus(overrides: StatusOverrides = {}): DaemonStatus {
     gateway: {
       bindMode: "loopback",
       bindHost: "127.0.0.1",
-      port: 18789,
+      port,
       portSource: "env/config",
-      probeUrl: "ws://127.0.0.1:18789",
+      probeUrl: `ws://127.0.0.1:${port}`,
     },
     port: {
-      port: 18789,
+      port,
       status: "free",
       listeners: [],
       hints: [],
     },
     rpc: {
       ok: false,
-      error: "connect ECONNREFUSED 127.0.0.1:18789",
+      error: `connect ECONNREFUSED 127.0.0.1:${port}`,
     },
     extraServices: [],
     ...rest,
@@ -88,27 +88,23 @@ describe("ensureDashboardGatewayReady", () => {
     vi.resetAllMocks();
   });
 
-  it.each(["timeout"])(
-    "does not start over a busy listener after an inconclusive %s probe",
-    async (error) => {
-      const status = createStatus({
-        port: { port: 18789, status: "busy", listeners: [], hints: [] },
-        rpc: { ok: false, error },
-      });
-      confirm.mockResolvedValue(false);
-      gatherStatus.mockResolvedValue(status);
+  it("does not start over a busy listener after an inconclusive timeout probe", async () => {
+    const status = createStatus({
+      port: { port: 18789, status: "busy", listeners: [], hints: [] },
+      rpc: { ok: false, error: "timeout" },
+    });
+    gatherStatus.mockResolvedValue(status);
 
-      const result = await check();
+    const result = await check();
 
-      expect(result).toMatchObject({ ready: false, recoverable: false });
-      expect(confirm).not.toHaveBeenCalled();
-      expect(installGateway).not.toHaveBeenCalled();
-      expect(startGateway).not.toHaveBeenCalled();
-      expect(output()).toContain("Gateway check failed:");
-      expect(output()).not.toContain("Gateway is not running");
-      expect(output()).not.toContain("gateway start");
-    },
-  );
+    expect(result).toMatchObject({ ready: false, recoverable: false });
+    expect(confirm).not.toHaveBeenCalled();
+    expect(installGateway).not.toHaveBeenCalled();
+    expect(startGateway).not.toHaveBeenCalled();
+    expect(output()).toContain("Gateway check failed:");
+    expect(output()).not.toContain("Gateway is not running");
+    expect(output()).not.toContain("gateway start");
+  });
 
   it("prints diagnosis and skips recovery when an interactive user declines", async () => {
     gatherStatus.mockResolvedValue(createStatus());
@@ -134,8 +130,6 @@ describe("ensureDashboardGatewayReady", () => {
         })
       : createStatus();
     gatherStatus.mockResolvedValueOnce(stopped).mockResolvedValueOnce(runningStatus());
-    installGateway.mockResolvedValue(undefined);
-    startGateway.mockResolvedValue(undefined);
 
     const result = await check({ yes: true });
 
@@ -145,26 +139,20 @@ describe("ensureDashboardGatewayReady", () => {
   });
 
   it("does not recover a diagnostic-only native service for an active external target", async () => {
-    const status = createStatus({
-      service: installedService({
-        targetRole: "diagnostic-only",
-        command: { programArguments: ["openclaw", "gateway", "run", "--port", "18789"] },
-      }),
-      gateway: {
-        bindMode: "loopback",
-        bindHost: "127.0.0.1",
-        port: 18900,
-        portSource: "env/config",
-        probeUrl: "ws://127.0.0.1:18900",
+    const status = createStatus(
+      {
+        service: installedService({
+          targetRole: "diagnostic-only",
+          command: { programArguments: ["openclaw", "gateway", "run", "--port", "18789"] },
+        }),
+        rpc: {
+          ok: false,
+          error: "connect ECONNREFUSED 127.0.0.1:18900",
+          url: "ws://127.0.0.1:18900",
+        },
       },
-      port: { port: 18900, status: "free", listeners: [], hints: [] },
-      rpc: {
-        ok: false,
-        error: "connect ECONNREFUSED 127.0.0.1:18900",
-        url: "ws://127.0.0.1:18900",
-      },
-    });
-    confirm.mockResolvedValue(false);
+      18900,
+    );
 
     gatherStatus.mockResolvedValue(status);
 

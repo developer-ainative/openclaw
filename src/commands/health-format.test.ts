@@ -8,48 +8,32 @@ import {
   formatGatewayClosedDiagnostic,
   formatHealthChannelLines,
 } from "./health-format.js";
+import {
+  healthSummary as createHealthSummary,
+  multiAccountHealth as createMultiAccountHealthSummary,
+  pluginHealthError,
+  unavailablePlugin,
+} from "./health.test-fixtures.js";
 
-describe("formatGatewayClosedDiagnostic", () => {
-  it("formats a coded gateway transport close", () => {
-    const error = Object.assign(new Error("gateway closed (1006): no close reason"), {
+it.each([
+  [
+    1006,
+    "gateway closed (1006): no close reason",
+    "Gateway connect failed: gateway closed (1006): no close reason",
+  ],
+  [undefined, "Gateway not reachable at ws://127.0.0.1:18789", undefined],
+] as const)(
+  "formatGatewayClosedDiagnostic distinguishes coded websocket closes from connect-time closes (%s)",
+  (code, message, expected) => {
+    const error = Object.assign(new Error(message), {
       name: "GatewayTransportError",
       kind: "closed",
-      code: 1006,
+      ...(code === undefined ? {} : { code }),
       connectionDetails: {},
     });
-
-    expect(formatGatewayClosedDiagnostic(error)).toBe(
-      "Gateway connect failed: gateway closed (1006): no close reason",
-    );
-  });
-
-  it("does not equate an uncoded connect-time close with a websocket close", () => {
-    const error = Object.assign(new Error("Gateway not reachable at ws://127.0.0.1:18789"), {
-      name: "GatewayTransportError",
-      kind: "closed",
-      connectionDetails: {},
-    });
-
-    expect(formatGatewayClosedDiagnostic(error)).toBeUndefined();
-  });
-});
-
-const createHealthSummary = (
-  params: Pick<HealthSummary, "channels" | "channelOrder" | "channelLabels"> = {
-    channels: {},
-    channelOrder: [],
-    channelLabels: {},
+    expect(formatGatewayClosedDiagnostic(error)).toBe(expected);
   },
-): HealthSummary => ({
-  ok: true,
-  ts: 0,
-  durationMs: 0,
-  heartbeatSeconds: 60,
-  defaultAgentId: "main",
-  agents: [],
-  sessions: { path: "/tmp/sessions.json", count: 0, recent: [] },
-  ...params,
-});
+);
 
 const channelSummary = (id: string, label: string, account: ChannelAccountHealthSummary) =>
   createHealthSummary({
@@ -72,32 +56,6 @@ const ingressPressure = (channelId: string, accountId: string, overrides = {}) =
   oldestReceivedAt: 90_000,
   ...overrides,
 });
-
-function createMultiAccountHealthSummary(
-  secondary: Partial<ChannelAccountHealthSummary>,
-  primaryOverrides: Partial<ChannelAccountHealthSummary> = {},
-): HealthSummary {
-  const primary = {
-    accountId: "main",
-    enabled: true,
-    configured: true,
-    linked: true,
-    healthState: "healthy",
-    probe: { ok: true, elapsedMs: 12 },
-    ...primaryOverrides,
-  };
-  const secondaryAccount = {
-    accountId: "alerts",
-    enabled: true,
-    configured: true,
-    linked: true,
-    ...secondary,
-  };
-  return channelSummary("matrix", "Matrix", {
-    ...primary,
-    accounts: { [primary.accountId]: primary, [secondaryAccount.accountId]: secondaryAccount },
-  });
-}
 
 describe("formatHealthChannelLines", () => {
   it("keeps the named startup error after removing terminal controls", () => {
@@ -168,21 +126,15 @@ describe("formatHealthChannelLines", () => {
   });
 
   it.each([
-    {
-      name: "successful",
-      probe: { ok: true, elapsedMs: 12 },
-      expected: "ok (12ms)",
-      expectedAll: "ok (alerts:alerts:12ms)",
-    },
-    {
-      name: "failed",
-      probe: { ok: false, error: "sync rejected" },
-      expected: "failed (unknown) - sync rejected",
-      expectedAll: "failed (unknown) - sync rejected",
-    },
-  ])(
-    "reports the $name active probe when the preferred account is inactive",
-    ({ probe, expected, expectedAll }) => {
+    [{ ok: true, elapsedMs: 12 }, "ok (12ms)", "ok (alerts:alerts:12ms)"],
+    [
+      { ok: false, error: "sync rejected" },
+      "failed (unknown) - sync rejected",
+      "failed (unknown) - sync rejected",
+    ],
+  ] as const)(
+    "reports active probe %j when the preferred account is inactive",
+    (probe, expected, expectedAll) => {
       for (const [inactive, scopedState] of [
         [{ configured: false }, "not configured"],
         [{ enabled: false }, "disabled"],
@@ -275,13 +227,11 @@ describe("formatHealthChannelLines", () => {
       summary.plugins = {
         loaded: [],
         errors: [
-          {
-            id: "\u202eplug\u200b\u001b[31min9X\u2069",
-            origin: "config",
-            activated: true,
-            error:
-              "lineA9\nlineB7 pass\u200bword=mockPass7X deploymentMark\u200ber7 vis\u{E0061}ible\u2028 context\u2029\ufeff\uD800",
-          },
+          pluginHealthError(
+            "\u202eplug\u200b\u001b[31min9X\u2069",
+            "lineA9\nlineB7 pass\u200bword=mockPass7X deploymentMark\u200ber7 vis\u{E0061}ible\u2028 context\u2029\ufeff\uD800",
+            { origin: "config", activated: true },
+          ),
         ],
       };
 
@@ -299,30 +249,15 @@ describe("formatHealthChannelLines", () => {
     summary.plugins = {
       loaded: [],
       errors: [
-        ...Array.from({ length: 10 }, (_, index) => ({
-          id: `plugin-${index}`,
-          origin: "workspace" as const,
-          activated: true,
-          error: "x".repeat(600),
-        })),
-        { id: "inactive", origin: "workspace", activated: false, error: "hidden inactive" },
-        {
-          id: "disabled",
-          origin: "workspace",
-          activated: false,
-          activationSource: "disabled",
-          error: "hidden disabled",
-        },
+        ...Array.from({ length: 10 }, (_, index) =>
+          pluginHealthError(`plugin-${index}`, "x".repeat(600), { activated: true }),
+        ),
+        pluginHealthError("inactive", "hidden inactive"),
+        pluginHealthError("disabled", "hidden disabled", { activationSource: "disabled" }),
       ],
-      unavailable: Array.from({ length: 11 }, (_, index) => ({
-        id: `unavailable-${index}`,
-        state: "configured-unavailable",
-        diagnostic: {
-          kind: "plugin-verification",
-          reason: "unreadable-package-json",
-          detail: "manifest unreadable",
-        },
-      })),
+      unavailable: Array.from({ length: 11 }, (_, index) =>
+        unavailablePlugin(`unavailable-${index}`),
+      ),
     };
     const original = structuredClone(summary);
 
@@ -339,37 +274,31 @@ describe("formatHealthChannelLines", () => {
   });
 });
 
-describe("formatDeliveryQueueHealthLine", () => {
-  it("summarizes dead-lettered ingress entries per channel account", () => {
-    const summary = createHealthSummary();
-    summary.deliveryQueues = {
+it.each<{ name: string; queues?: HealthSummary["deliveryQueues"]; expected: string | null }>([
+  {
+    name: "dead-lettered ingress entries per channel account",
+    queues: {
       failed: [],
       ingressFailed: [
         { channelId: "line", accountId: "default", count: 1, oldestFailedAt: 90_000 },
         { channelId: "telegram", accountId: "ops", count: 2 },
       ],
-    };
-
-    expect(formatDeliveryQueueHealthLine(summary, 7_290_000)).toBe(
+    },
+    expected:
       "Delivery queue: warning (dead-lettered entries — inbound line/default: 1, inbound telegram/ops: 2; oldest 2h ago)",
-    );
-  });
-
-  it("summarizes ingress pressure per channel account", () => {
-    const summary = createHealthSummary();
-    summary.deliveryQueues = {
+  },
+  {
+    name: "ingress pressure per channel account",
+    queues: {
       failed: [],
       ingressPressure: [ingressPressure("telegram", "ops")],
-    };
-
-    expect(formatDeliveryQueueHealthLine(summary, 7_290_000)).toBe(
+    },
+    expected:
       "Delivery queue: warning (ingress pressure — inbound telegram/ops: 1 pressured lane, 56 pending, 0 claimed, 55 blocked; oldest 2h ago)",
-    );
-  });
-
-  it("summarizes dead letters and ingress pressure together", () => {
-    const summary = createHealthSummary();
-    summary.deliveryQueues = {
+  },
+  {
+    name: "dead letters and ingress pressure together",
+    queues: {
       failed: [{ queueName: "outbound", count: 2, oldestFailedAt: 90_000 }],
       ingressPressure: [
         ingressPressure("line", "default", {
@@ -380,16 +309,13 @@ describe("formatDeliveryQueueHealthLine", () => {
           oldestReceivedAt: 3_690_000,
         }),
       ],
-    };
-
-    expect(formatDeliveryQueueHealthLine(summary, 7_290_000)).toBe(
+    },
+    expected:
       "Delivery queue: warning (dead-lettered entries — outbound: 2; oldest 2h ago; ingress pressure — inbound line/default: 2 pressured lanes, 3 pending, 1 claimed, 2 blocked; oldest 1h ago)",
-    );
-  });
-
-  it("returns null when no dead-lettered entries are reported", () => {
-    const summary = createHealthSummary();
-
-    expect(formatDeliveryQueueHealthLine(summary)).toBeNull();
-  });
+  },
+  { name: "no entries", expected: null },
+])("formatDeliveryQueueHealthLine: $name", ({ queues, expected }) => {
+  expect(
+    formatDeliveryQueueHealthLine(createHealthSummary({ deliveryQueues: queues }), 7_290_000),
+  ).toBe(expected);
 });
