@@ -335,8 +335,8 @@ function withTranscriptContextSnapshot<T>(
                   .orderBy("seq", "asc"),
               )) {
                 // Only navigation crosses into JavaScript before the canonical context is selected.
-                // SAFETY: SQL preserves entry discriminants and replaces payloads with readable empty bodies.
                 yield {
+                  // SAFETY: SQL preserves entry discriminants and replaces payloads with readable empty bodies.
                   entry: { ...(JSON.parse(row.navigation_json) as SessionTreeEntry), seq: row.seq },
                   bytes: row.model_bytes,
                   withoutCheckpointBytes: row.retained_bytes,
