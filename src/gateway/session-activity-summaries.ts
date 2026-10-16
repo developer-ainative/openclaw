@@ -113,10 +113,7 @@ export type SessionActivitySummaryService = {
     target: { key: string; agentId?: string; storePath: string },
     entry: SessionEntry | undefined,
   ): SessionActivitySummaryCompletion | undefined;
-  ensure: (
-    target: ActivitySummaryTarget,
-    entry: SessionEntry | undefined,
-  ) => Promise<ActivitySummaryView>;
+  ensure(target: ActivitySummaryTarget, entry: SessionEntry | undefined): Promise<ActivitySummaryView>;
   handleEvent: (event: SessionObserverEvent) => void;
   handleTranscript: (event: InternalSessionTranscriptUpdate) => void;
   handleLifecycle: (event: SessionLifecycleEvent) => void;
@@ -675,10 +672,7 @@ export function createSessionActivitySummaries(deps: {
         event.agentId ?? runContext?.agentId,
       );
       if (target) {
-        const completion = states.get(activitySummaryScope(target))?.completion;
-        if (completion) {
-          completion.terminal = true;
-        }
+        states.get(activitySummaryScope(target))?.completion?.markTerminal();
         requestInBackground(target);
       }
     },
