@@ -102,7 +102,7 @@ describe("delivery-queue storage", () => {
     maxAgeMs: 24 * 60 * 60_000,
     maxEntries: 2_000,
   };
-  function failedFence(id: string, timestamp: number | ReturnType<typeof expect.any>) {
+  function failedFence(id: string, timestamp: unknown) {
     return {
       id,
       enqueuedAt: timestamp,

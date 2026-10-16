@@ -13,7 +13,7 @@ import type { RetainUpdateRuntime } from "../infra/update-retained-runtime.js";
 import { captureEnv } from "../test-utils/env.js";
 import { createCliRuntimeCapture } from "./test-runtime-capture.js";
 
-export const commandTransport = vi.hoisted(() => ({
+const commandTransport = vi.hoisted(() => ({
   run: vi.fn<typeof import("../process/exec.js").runCommandWithTimeout>(),
   exec: vi.fn<typeof import("../process/exec.js").runExec>(async () => ({
     stdout: "",
@@ -60,7 +60,7 @@ const spinner = vi.fn(() => ({ start: vi.fn(), stop: vi.fn(), clear: vi.fn() }))
 export const triageCommand = vi.fn<typeof import("../commands/triage.js").triageCommand>();
 export const triageAfterFailure =
   vi.fn<typeof import("../commands/triage-failure.js").triageAfterFailure>();
-export const updateFailureActionMocks = vi.hoisted(() => ({
+const updateFailureActionMocks = vi.hoisted(() => ({
   runInteractiveUpdateFailureAction: vi.fn(),
 }));
 
@@ -79,20 +79,20 @@ export const unrelatedGatewayFixturePid = process.pid + 2;
 
 export const suspendScheduledTaskAutoStartForUpdate = vi.fn();
 export const resumeScheduledTaskAutoStartAfterUpdate = vi.fn();
-export const managedUpdateHandoff = vi.hoisted(() => ({
+const managedUpdateHandoff = vi.hoisted(() => ({
   start: vi.fn(),
   transfer: vi.fn(),
   cancel: vi.fn(),
 }));
-export const candidateValidation = vi.hoisted(() => vi.fn());
-export const retainUpdateRuntime = vi.hoisted(() => vi.fn<RetainUpdateRuntime>());
-export const systemdPolicy = vi.hoisted(() =>
+const candidateValidation = vi.hoisted(() => vi.fn());
+const retainUpdateRuntime = vi.hoisted(() => vi.fn<RetainUpdateRuntime>());
+const systemdPolicy = vi.hoisted(() =>
   vi.fn<typeof import("../daemon/systemd-maintenance.js").prepareSystemdGatewayMaintenance>(),
 );
-export const sourceRuntimeCompletion = vi.hoisted(() =>
+const sourceRuntimeCompletion = vi.hoisted(() =>
   vi.fn<typeof import("./update-cli/update-command-runtime.js").completeSourceUpdateRuntime>(),
 );
-export const pluginAvailabilityPreflight = vi.hoisted(() => vi.fn());
+const pluginAvailabilityPreflight = vi.hoisted(() => vi.fn());
 vi.mock("../daemon/service-process-membership.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../daemon/service-process-membership.js")>()),
   inspectServiceProcessMembershipSync: vi.fn(() => "outside"),
@@ -101,11 +101,11 @@ vi.mock("../daemon/service-process-membership.js", async (importOriginal) => ({
 vi.mock("./update-cli/update-command-plugin-preflight.js", () => ({
   preflightConfiguredNpmPluginTargets: pluginAvailabilityPreflight,
 }));
-export const inferenceRepair = vi.hoisted(() =>
+const inferenceRepair = vi.hoisted(() =>
   vi.fn<typeof import("../infra/update-repair-agent.js").runUpdateRepairLoop>(),
 );
-export const httpReadiness = vi.hoisted(() => vi.fn());
-export const stateSchemaVersions = vi.hoisted(() => vi.fn());
+const httpReadiness = vi.hoisted(() => vi.fn());
+const stateSchemaVersions = vi.hoisted(() => vi.fn());
 const mockedRunDaemonInstall = vi.fn();
 export const serviceReadCommand = vi.fn();
 export const serviceReadRuntime = vi.fn();
@@ -136,20 +136,20 @@ export const checkShellCompletionStatus = vi.fn();
 export const ensureCompletionCacheExists = vi.fn();
 export const installCompletion = vi.fn();
 export const createPreUpdateConfigSnapshotMock = vi.fn();
-export const legacyConfigRepairMocks = vi.hoisted(() => ({
+const legacyConfigRepairMocks = vi.hoisted(() => ({
   repairLegacyConfigForUpdateChannel:
     vi.fn<
       typeof import("../commands/doctor/legacy-config-repair.js").repairLegacyConfigForUpdateChannel
     >(),
 }));
-export const launchdUpdateCleanupMocks = vi.hoisted(() => ({
+const launchdUpdateCleanupMocks = vi.hoisted(() => ({
   disableCurrentOpenClawUpdateLaunchdJob: vi.fn(async () => false),
 }));
-export const windowsOfflineProbe = vi.hoisted(() => vi.fn(async () => null));
-export const databasePreflightMocks = vi.hoisted(() => ({
+const windowsOfflineProbe = vi.hoisted(() => vi.fn(async () => null));
+const databasePreflightMocks = vi.hoisted(() => ({
   preflightOpenClawDatabaseSchemas: vi.fn(),
 }));
-export const restartHealthTestControl = vi.hoisted(() => ({
+const restartHealthTestControl = vi.hoisted(() => ({
   snapshot: undefined as unknown,
 }));
 const { nodeVersionSatisfiesEngine, resolveNodeRuntimeInfo, execFile, spawn } = await vi.hoisted(
@@ -671,6 +671,22 @@ vi.mock("../commands/triage-failure.js", () => ({ triageAfterFailure }));
 vi.mock("./update-cli/update-command-report.js", () => updateFailureActionMocks);
 
 export {
+  commandTransport,
+  updateFailureActionMocks,
+  managedUpdateHandoff,
+  candidateValidation,
+  retainUpdateRuntime,
+  systemdPolicy,
+  sourceRuntimeCompletion,
+  pluginAvailabilityPreflight,
+  inferenceRepair,
+  httpReadiness,
+  stateSchemaVersions,
+  legacyConfigRepairMocks,
+  launchdUpdateCleanupMocks,
+  windowsOfflineProbe,
+  databasePreflightMocks,
+  restartHealthTestControl,
   nodeVersionSatisfiesEngine,
   resetRuntimeCapture,
   resolveNodeRuntimeInfo,

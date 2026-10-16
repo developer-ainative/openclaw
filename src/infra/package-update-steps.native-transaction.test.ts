@@ -34,10 +34,10 @@ const writeOwner = async (root: string, version: string) => {
 function executorAuthority() {
   let current = true;
   return {
-    revoke() {
+    revoke: () => {
       current = false;
     },
-    assertCurrent() {
+    assertCurrent: () => {
       assert(current, "native executor lost");
     },
   };
