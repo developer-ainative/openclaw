@@ -45,16 +45,16 @@ export function registerCompactionSafeguardTests({
       retry: { enabled: false },
     });
   it.each([
-    { modelCallUrgency: undefined, expectedUrgency: "background" },
-    { modelCallUrgency: "foreground", expectedUrgency: "foreground" },
-    { modelCallUrgency: "normal", expectedUrgency: "normal" },
+    [undefined, "background"],
+    ["foreground", "foreground"],
+    ["normal", "normal"],
   ] as const)(
-    "carries the pending request and $expectedUrgency urgency into safeguard budget recovery",
-    async ({ modelCallUrgency, expectedUrgency }) => {
+    "carries pending input and %s urgency into safeguard recovery",
+    async (modelCallUrgency, expectedUrgency) => {
       const { attachCompactionAccountingRecorder } =
         await import("./run/compaction-accounting-bridge.js");
-      const contextEngineRuntimeContext = {};
-      attachCompactionAccountingRecorder(contextEngineRuntimeContext, {
+      const runtime = {};
+      attachCompactionAccountingRecorder(runtime, {
         pendingRequestState: "unresolved",
       });
       resolveEffectiveCompactionModeMock.mockReturnValue("safeguard");
@@ -62,7 +62,7 @@ export function registerCompactionSafeguardTests({
       const compactionParams = wrappedCompactionArgs({
         trigger: "budget",
         modelCallUrgency,
-        contextEngineRuntimeContext,
+        contextEngineRuntimeContext: runtime,
       });
       const result = await compactEmbeddedAgentSessionDirect(compactionParams);
 
@@ -91,8 +91,7 @@ export function registerCompactionSafeguardTests({
     let summaryBridge: typeof import("../sessions/index.js").generateSummary;
 
     beforeAll(async () => {
-      // The outer harness resets modules and mocks the session SDK. Retain the real
-      // disposable session fixture above, but share the safeguard registry with the runner.
+      // Share the reset harness registry while retaining the real session fixture.
       safeguard = (await import("../agent-hooks/compaction-safeguard.js")).default;
       setSafeguardRuntime = (await import("../agent-hooks/compaction-safeguard-runtime.js"))
         .setCompactionSafeguardRuntime;
@@ -112,7 +111,28 @@ export function registerCompactionSafeguardTests({
         createExtensionRuntime(),
       );
 
-    async function bindSession(sessionManager: SessionManager, stream?: StreamFn) {
+    function createConversation(contents: string[]) {
+      const manager = SessionManager.inMemory(getWorkspaceDir());
+      for (const content of contents) {
+        manager.appendMessage({ role: "user", content, timestamp: 1 });
+      }
+      return manager;
+    }
+
+    async function bindSession(
+      sessionManager: SessionManager,
+      {
+        stream,
+        handlers,
+        retention,
+        reasoning,
+      }: {
+        stream?: StreamFn;
+        handlers?: Parameters<typeof createResourceLoader>[0];
+        retention?: number;
+        reasoning?: boolean;
+      } = {},
+    ) {
       const { createAgentSession } = await import("../sessions/sdk.js");
       const { guardSessionManager } = await import("../session-tool-result-guard-wrapper.js");
       vi.mocked(guardSessionManager).mockReturnValue(sessionManager);
@@ -124,7 +144,31 @@ export function registerCompactionSafeguardTests({
           strategy: "session-custom",
         });
       }
-      return vi.mocked(createAgentSession);
+      vi.mocked(createAgentSession).mockImplementation(async ({ model, thinkingLevel }) => {
+        const created = await createTestSession({
+          model:
+            reasoning === undefined && retention === undefined
+              ? testModel
+              : {
+                  ...testModel,
+                  ...expectDefined(model, "prepared compaction model"),
+                  ...(reasoning === undefined ? {} : { reasoning, maxTokens: 1_024 }),
+                },
+          sessionManager,
+          settingsManager:
+            retention === undefined
+              ? settings()
+              : SettingsManager.inMemory({
+                  compaction: { keepRecentTokens: retention },
+                  retry: { enabled: false },
+                }),
+          resourceLoader: createResourceLoader(handlers),
+        });
+        if (reasoning !== undefined) {
+          await created.session.setThinkingLevel(thinkingLevel ?? "off");
+        }
+        return created;
+      });
     }
 
     it("keeps workspace rules in explicit compaction when the Gateway cwd differs", async () => {
@@ -135,27 +179,17 @@ export function registerCompactionSafeguardTests({
         join(getWorkspaceDir(), "AGENTS.md"),
         "## Compaction fixture\nWORKSPACE_RULE_MARKER\n",
       );
-      const sessionManager = SessionManager.inMemory(getWorkspaceDir());
-      for (const content of [
+      const sessionManager = createConversation([
         "Start the task.",
         "Preserve workspace rules.",
         "Continue the task.",
-      ]) {
-        await sessionManager.appendMessageAsync({ role: "user", content, timestamp: 1 });
-      }
+      ]);
       const extension = await loadSafeguard();
       vi.mocked(buildEmbeddedExtensionFactories).mockImplementation(
         actualExtensions.buildEmbeddedExtensionFactories,
       );
       resolveEffectiveCompactionModeMock.mockReturnValue("safeguard");
-      (await bindSession(sessionManager)).mockImplementation(async () =>
-        createTestSession({
-          model: testModel,
-          sessionManager,
-          settingsManager: settings(),
-          resourceLoader: createResourceLoader(extension.handlers),
-        }),
-      );
+      await bindSession(sessionManager, { handlers: extension.handlers });
       const result = await compact({
         config: {
           agents: {
@@ -192,25 +226,14 @@ export function registerCompactionSafeguardTests({
         content: "b".repeat(52_602),
         timestamp: 3,
       });
-      const contextEngineRuntimeContext = {};
-      attachCompactionAccountingRecorder(contextEngineRuntimeContext, { pendingUserEntryId });
+      const runtime = {};
+      attachCompactionAccountingRecorder(runtime, { pendingUserEntryId });
       const conversation = () =>
         sessionManager.getBranch().filter((entry) => entry.type === "message");
       const before = structuredClone(conversation());
       const stream = vi.fn<StreamFn>();
-      (await bindSession(sessionManager, stream)).mockImplementation(async ({ model }) => {
-        expectDefined(model, "prepared compaction model");
-        return await createTestSession({
-          model: { ...testModel, ...model },
-          sessionManager,
-          settingsManager: SettingsManager.inMemory({
-            compaction: { keepRecentTokens: 20_000 },
-            retry: { enabled: false },
-          }),
-          resourceLoader: createResourceLoader(),
-        });
-      });
-      const result = await compact({ trigger: "budget", contextEngineRuntimeContext });
+      await bindSession(sessionManager, { stream, retention: 20_000 });
+      const result = await compact({ trigger: "budget", contextEngineRuntimeContext: runtime });
       expect(result).toMatchObject({
         ok: true,
         compacted: false,
@@ -245,28 +268,19 @@ export function registerCompactionSafeguardTests({
         const backup = "summary-backup";
         const explicitModel = scenario === "explicit model timeout";
         const fallbackSummary = [
-          "## Decisions",
-          "Review the deployment checklist before rollout.",
-          "## Open TODOs",
-          "Compare the remaining options.",
-          "## Constraints/Rules",
-          "None.",
-          "## Pending user asks",
-          "Compare the remaining options.",
-          "## Exact identifiers",
-          "None.",
+          "## Decisions\nReview the deployment checklist before rollout.",
+          "## Open TODOs\nCompare the remaining options.",
+          "## Constraints/Rules\nNone.",
+          "## Pending user asks\nCompare the remaining options.",
+          "## Exact identifiers\nNone.",
         ].join("\n");
-        const expectedSummaryRequest = `Latest user request context: ${JSON.stringify("Keep the rollout notes.")}`;
-        const sessionManager = SessionManager.inMemory(getWorkspaceDir());
-        for (const content of [
+        const expectedSummaryRequest = 'Latest user request context: "Keep the rollout notes."';
+        const sessionManager = createConversation([
           "Review the deployment checklist.",
           "Compare the remaining options.",
           "Keep the rollout notes.",
-        ]) {
-          sessionManager.appendMessage({ role: "user", content, timestamp: 1 });
-        }
+        ]);
         const originalMessages = sessionManager.buildSessionContext().messages;
-        const settingsManager = settings();
         const extension = await loadSafeguard();
         const requestedModels: string[] = [];
         const requestedThinking: Array<string | undefined> = [];
@@ -279,18 +293,14 @@ export function registerCompactionSafeguardTests({
             errorMessage &&
             !(outcome === "thinking" && options?.reasoning === "minimal") &&
             !(corrective && requestedModels.length === 1);
+          const text =
+            outcome === "cancel" || outcome === "degrade" || corrective
+              ? "Missing required sections."
+              : fallbackSummary;
           return createAssistantResultStream(
             rejected
               ? { ...createAssistant(activeModel, [], "error"), errorMessage }
-              : createAssistant(activeModel, [
-                  {
-                    type: "text",
-                    text:
-                      outcome === "cancel" || outcome === "degrade" || corrective
-                        ? "Missing required sections."
-                        : fallbackSummary,
-                  },
-                ]),
+              : createAssistant(activeModel, [{ type: "text", text }]),
           );
         });
         vi.mocked(summaryBridge).mockImplementation(generateRealSummary);
@@ -304,24 +314,11 @@ export function registerCompactionSafeguardTests({
           });
           return [];
         });
-        (await bindSession(sessionManager, stream)).mockImplementation(
-          async ({ model, thinkingLevel }) => {
-            expectDefined(model, "prepared compaction model");
-            const created = await createTestSession({
-              model: {
-                ...testModel,
-                ...model,
-                reasoning: outcome === "thinking",
-                maxTokens: 1_024,
-              },
-              sessionManager,
-              settingsManager,
-              resourceLoader: createResourceLoader(extension.handlers),
-            });
-            await created.session.setThinkingLevel(thinkingLevel ?? "off");
-            return created;
-          },
-        );
+        await bindSession(sessionManager, {
+          stream,
+          handlers: extension.handlers,
+          reasoning: outcome === "thinking",
+        });
         const config = {
           agents: {
             defaults: {
@@ -374,9 +371,7 @@ export function registerCompactionSafeguardTests({
             sessionManager.getBranch().findLast((entry) => entry.type === "compaction"),
           ).toMatchObject({
             summary: expect.stringContaining(expectedSummaryRequest),
-            details: {
-              latestUnresolvedUserRequest: "Keep the rollout notes.",
-            },
+            details: { latestUnresolvedUserRequest: "Keep the rollout notes." },
           });
         } else {
           expect(result).toMatchObject({ ok: false, compacted: false });

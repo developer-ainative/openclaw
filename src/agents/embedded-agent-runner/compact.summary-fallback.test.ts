@@ -11,6 +11,7 @@ import {
 } from "../../test-utils/openclaw-test-state.js";
 import { closePreparedModelRuntimeSnapshots } from "../prepared-model-runtime.lifecycle.js";
 import { SessionManager } from "../sessions/session-manager.js";
+import { createZeroUsageFixture } from "../test-helpers/usage-fixtures.js";
 import { compactEmbeddedAgentSession } from "./compact.queued.js";
 
 // Real queued compaction, native delegate, AgentSession, and SQLite transcript; only the
@@ -105,14 +106,7 @@ function appendToolTurns(fixture: Fixture, first: number, count: number): string
         api: "openai-completions",
         provider: "fixture",
         model: "model",
-        usage: {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        },
+        usage: createZeroUsageFixture(),
         stopReason: "toolUse",
         timestamp: turn * 10 + 2,
       }),
@@ -189,10 +183,7 @@ async function withSession(
   }
 }
 
-function compactSession(
-  fixture: Fixture,
-  options: { trigger?: "budget" | "manual"; abortSignal?: AbortSignal } = {},
-) {
+function compactSession(fixture: Fixture, abortSignal?: AbortSignal) {
   return compactEmbeddedAgentSession(
     {
       ...fixture.target,
@@ -203,9 +194,9 @@ function compactSession(
       config: fixture.config,
       provider: "fixture",
       model: "model",
-      trigger: options.trigger ?? "budget",
+      trigger: "budget",
       force: true,
-      abortSignal: options.abortSignal,
+      abortSignal,
       enqueue: async (task) => await task(),
     },
     { sourceAuthority: { assertActive: () => {}, operatorAuthority: undefined } },
@@ -263,48 +254,37 @@ describe("automatic compaction summary failure", () => {
     });
   });
 
-  it("commits the reduction without trying a configured fallback model", async () => {
-    await withSession(
-      async (fixture) => {
-        appendToolTurns(fixture, 0, 8);
-        summaryMode = "provider-timeout";
+  it.each([
+    { mode: "provider-timeout", modelFallback: true, safeguard: false },
+    { mode: "bare-408", modelFallback: false, safeguard: true },
+  ] as const)("commits $mode reduction (safeguard=$safeguard)", async (options) => {
+    await withSession(async (fixture) => {
+      appendToolTurns(fixture, 0, 8);
+      summaryMode = options.mode;
 
-        expect(await compactSession(fixture)).toMatchObject({ ok: true, compacted: true });
-        // Each extra candidate could cost another full summary window.
+      expect(await compactSession(fixture)).toMatchObject({ ok: true, compacted: true });
+      if (options.safeguard) {
+        expect(summaryRequests.length).toBeGreaterThan(0);
+      } else {
         expect(summaryRequests.some((body) => body.includes('"model":"fallback-model"'))).toBe(
           false,
         );
-        expectFallbackSummary(fixture);
-      },
-      { modelFallback: true },
-    );
-  });
-
-  it("commits the reduction after a provider-returned timeout in safeguard mode", async () => {
-    await withSession(
-      async (fixture) => {
-        appendToolTurns(fixture, 0, 8);
-        summaryMode = "bare-408";
-
-        expect(await compactSession(fixture)).toMatchObject({ ok: true, compacted: true });
-        expect(summaryRequests.length).toBeGreaterThan(0);
-        expectFallbackSummary(fixture);
-      },
-      { safeguard: true },
-    );
+      }
+      expectFallbackSummary(fixture);
+    }, options);
   });
 
   it.each([
-    { failure: "a caller Stop", mode: "stall", trigger: "budget", stop: true },
-    { failure: "a non-timeout summary error", mode: "error", trigger: "budget", stop: false },
+    { failure: "a caller Stop", mode: "stall", stop: true },
+    { failure: "a non-timeout summary error", mode: "error", stop: false },
     // Wrapped summary text reads "…failed: 500 Internal Server Error"; it is not a timeout.
-    { failure: "a fast 500 summary error", mode: "server-error", trigger: "budget", stop: false },
-  ] as const)("keeps $failure as a failed compaction", async ({ mode, trigger, stop }) => {
+    { failure: "a fast 500 summary error", mode: "server-error", stop: false },
+  ] as const)("keeps $failure as a failed compaction", async ({ mode, stop }) => {
     await withSession(async (fixture) => {
       appendToolTurns(fixture, 0, 8);
       summaryMode = mode;
       const caller = new AbortController();
-      const pending = compactSession(fixture, { trigger, abortSignal: caller.signal });
+      const pending = compactSession(fixture, caller.signal);
       if (stop) {
         await summaryArrived.promise;
         caller.abort(new Error("user stop"));
