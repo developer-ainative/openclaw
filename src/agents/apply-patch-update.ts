@@ -152,7 +152,8 @@ function buildChunkLines(params: {
   contextOldIndexes: Array<number | undefined>;
 }): SourceLine[] {
   const { source, matchIndex, pattern, newSlice, contextOldIndexes } = params;
-  const lines: SourceLine[] = [];
+  // Large hunks exceed the engine's argument limit if spread into push/splice.
+  let lines: SourceLine[] = [];
   let oldStart = 0;
   let newStart = 0;
 
@@ -162,22 +163,22 @@ function buildChunkLines(params: {
     if (oldContext === undefined || oldContext >= pattern.length || newContext >= newSlice.length) {
       continue;
     }
-    lines.push(
-      ...buildChangedLines({
+    lines = lines.concat(
+      buildChangedLines({
         sourceLines: source.lines,
         startIndex: matchIndex + oldStart,
         oldCount: oldContext - oldStart,
         newLines: newSlice.slice(newStart, newContext),
         preferredEnding: source.preferredEnding,
       }),
-      source.lines[matchIndex + oldContext]!,
+      [source.lines[matchIndex + oldContext]!],
     );
     oldStart = oldContext + 1;
     newStart = newContext + 1;
   }
 
-  lines.push(
-    ...buildChangedLines({
+  return lines.concat(
+    buildChangedLines({
       sourceLines: source.lines,
       startIndex: matchIndex + oldStart,
       oldCount: pattern.length - oldStart,
@@ -185,7 +186,6 @@ function buildChunkLines(params: {
       preferredEnding: source.preferredEnding,
     }),
   );
-  return lines;
 }
 
 function buildChangedLines(params: {
@@ -216,11 +216,11 @@ function buildChangedLines(params: {
 }
 
 function applyReplacements(lines: SourceLine[], replacements: Replacement[]): SourceLine[] {
-  const result = [...lines];
+  let result = lines;
   // Apply from the end of the file backward so earlier replacement indexes stay
-  // stable while later replacements mutate the array.
+  // stable while later replacements rebuild the array.
   for (const [startIndex, oldLen, newLines] of replacements.toReversed()) {
-    result.splice(startIndex, oldLen, ...newLines);
+    result = result.slice(0, startIndex).concat(newLines, result.slice(startIndex + oldLen));
   }
   return result;
 }

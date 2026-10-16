@@ -178,3 +178,19 @@ describe("apply_patch update byte preservation", () => {
     expect(await runUpdate(testCase)).toBe(testCase.expected);
   });
 });
+
+describe("apply_patch large updates", () => {
+  it("applies a hunk larger than the engine's call argument limit", async () => {
+    const added = Array.from({ length: 200_000 }, (_, index) => `+line ${index}`);
+    const output = await runUpdate({
+      title: "large insertion",
+      initial: "start\nend\n",
+      changes: ["@@", " start", ...added, " end"],
+      expected: "",
+    });
+    const lines = output.split("\n");
+    expect(lines).toHaveLength(200_003);
+    expect(lines.at(1)).toBe("line 0");
+    expect(lines.at(-2)).toBe("end");
+  });
+});
