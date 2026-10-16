@@ -19,6 +19,7 @@ import {
   closeOpenClawAgentDatabasesAsync,
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
+import { withRestoredMocks } from "../../test-utils/vitest-spies.js";
 import { isRecordedModelFallbackStop } from "../model-fallback-stop.js";
 import { customData, opaqueEntry, sessionScope } from "./session-manager-fixtures.test-support.js";
 import * as metadataRuntime from "./session-manager-metadata-runtime.js";
@@ -181,7 +182,7 @@ it("settles queued suffix removals in order and rebuilds the pending branch proj
 });
 
 it.each(["read", "receipt"] as const)(
-  "fences a synchronous navigation change during a suffix %s wait",
+  "fences navigation changes during suffix %s waits",
   async (boundary) => {
     const { scope, manager } = await openSession();
     const seed = await appendUser(manager, "keep");
@@ -213,14 +214,11 @@ it.each(["read", "receipt"] as const)(
             .mockImplementation(
               afterWorkerCommand("session.transcript.replaceSuffix", () => manager.resetLeaf()),
             );
-    let failure: unknown;
-    try {
-      await manager.removeTrailingEntriesAsync((entry) => entry.id === removed);
-    } catch (error) {
-      failure = error;
-    } finally {
-      interception.mockRestore();
-    }
+    const failure = await withRestoredMocks([interception], () =>
+      manager
+        .removeTrailingEntriesAsync((entry) => entry.id === removed)
+        .catch((error: unknown) => error),
+    );
     if (boundary === "read") {
       expect(failure).toMatchObject({
         message: "Session transcript navigation changed before publication",
@@ -243,7 +241,7 @@ it.each(["read", "receipt"] as const)(
 );
 
 it.each(["same", "independent"] as const)(
-  "commits an awaited rewrite and refuses a stale rewrite after a %s manager writes",
+  "commits awaited rewrites and fences stale %s writers",
   async (writerKind) => {
     const { scope, manager } = await openSession();
     const sourceId = await manager.appendMessageAsync({
@@ -326,11 +324,7 @@ it("adopts only the submitted rewrite snapshot when the prepared manager changes
       laterPreparedId = await appendUser(rewrite.sessionManager, "uncommitted later edit");
     }),
   );
-  try {
-    await rewrite.commit(new Map([[sourceId, replacementId]]));
-  } finally {
-    observer.mockRestore();
-  }
+  await withRestoredMocks([observer], () => rewrite.commit(new Map([[sourceId, replacementId]])));
   expect(laterPreparedId).toEqual(expect.any(String));
   expect(rewrite.sessionManager.getLeafId()).toBe(laterPreparedId);
   expect(manager.getLeafId()).toBe(replacementId);
@@ -342,7 +336,7 @@ it("adopts only the submitted rewrite snapshot when the prepared manager changes
 });
 
 it.each(["append", "identity", "label", "leaf"] as const)(
-  "preserves an intervening detached %s mutation when rewrite commit is stale",
+  "preserves detached %s edits when rewrite commit is stale",
   async (mutation) => {
     const manager = SessionManager.inMemory();
     const sourceId = await appendUser(manager, "original");
@@ -430,13 +424,9 @@ it("preserves a committed branch and a later target rebinding", async () => {
       });
     }
   });
-  let branchSessionId: string | undefined;
-  try {
-    branchSessionId = await manager.createBranchedSession(selected);
-  } finally {
-    observer.mockRestore();
-    unsubscribe();
-  }
+  const branchSessionId = await withRestoredMocks([{ mockRestore: unsubscribe }, observer], () =>
+    manager.createBranchedSession(selected),
+  );
   const committed = loadSessionEntry(scope);
   expect(committed).toBeDefined();
   expect(committed?.sessionId).not.toBe(scope.sessionId);
@@ -450,8 +440,7 @@ it("preserves a committed branch and a later target rebinding", async () => {
     sessionId: replacementScope.sessionId,
     sessionKey: replacementScope.sessionKey,
   });
-  expect(manager.getBranch()).toEqual([]);
-  expect(manager.buildSessionContext().messages).toEqual([]);
+  expect([manager.getBranch(), manager.buildSessionContext().messages]).toEqual([[], []]);
   const reopened = await SessionManager.openAsync({ ...scope, sessionId: committed!.sessionId });
   expect(reopened.getLeafId()).toBe(selected);
 });

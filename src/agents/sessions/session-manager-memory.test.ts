@@ -7,7 +7,7 @@ import { runWithSessionActorStorage } from "../../config/sessions/session-actor-
 import type { InitialSessionTranscriptWriter } from "../../config/sessions/session-transcript-writer.types.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { resolveIncognitoOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
-import { makeAgentAssistantMessage } from "../test-helpers/agent-message-fixtures.js";
+import { assistantText, expectCancelledReads } from "./session-manager-fixtures.test-support.js";
 import { readSessionManagerModelContextAsync } from "./session-manager-incognito.js";
 import { withSessionMetadataWorker } from "./session-manager-metadata-runtime.js";
 import { receiveSessionManagerCommit } from "./session-manager-persistence-error.js";
@@ -82,7 +82,13 @@ function readMessages(target: Parameters<typeof SessionManager.openAsync>[0]) {
 async function fixture(name: string, create = true) {
   const actor = await actorFixture(name, create);
   const manager = await actor.run(() => SessionManager.openAsync(actor.target));
-  return { ...actor, manager, read: () => actor.run(() => readMessages(actor.target)) };
+  return {
+    ...actor,
+    manager,
+    read: () => actor.run(() => readMessages(actor.target)),
+    context: (options?: Parameters<typeof SessionManager.openModelContextAsync>[1]) =>
+      actor.run(() => SessionManager.openModelContextAsync(actor.target, options)),
+  };
 }
 
 it("retains its selected owner for ordered writes and reads current transcript state without SQLite", async () => {
@@ -155,45 +161,28 @@ it("keeps a detached context snapshot while an in-process append becomes visible
 });
 
 it("cancels context reads without preventing the next read", async () => {
-  const { target, run, manager } = await fixture("context-abort");
+  const { context: readContext, manager } = await fixture("context-abort");
   await manager.appendMessageAsync(userMessage("retained context", 1));
-  for (const alreadyAborted of [true, false]) {
-    const controller = new AbortController();
-    const reason = new Error("context cancelled");
-    if (alreadyAborted) {
-      controller.abort(reason);
-    }
-    const pending = run(() =>
-      SessionManager.openModelContextAsync(target, { signal: controller.signal }),
-    );
-    if (!alreadyAborted) {
-      controller.abort(reason);
-    }
-    await expect(pending).rejects.toBe(reason);
-  }
-  const context = await run(() => SessionManager.openModelContextAsync(target));
+  await expectCancelledReads((signal) => readContext({ signal }));
+  const context = await readContext();
   expect(context.isPersisted()).toBe(false);
   expect(context.buildSessionContext()).toEqual(manager.buildSessionContext());
 });
 
 it("keeps a completed-turn snapshot while a later rewrite invalidates its anchor for new reads", async () => {
-  const { target, run, manager } = await fixture("completed-context");
+  const { context: readContext, manager } = await fixture("completed-context");
   await manager.appendMessageAsync(userMessage("completed question", 1));
   const terminal = await manager.appendMessageWithTranscriptAnchorAsync(
-    makeAgentAssistantMessage({ content: [{ type: "text", text: "completed answer" }] }),
+    assistantText("completed answer"),
   );
   assert(terminal.anchor, "Missing completed-turn anchor");
   const expected = manager.buildSessionContext();
   await manager.appendMessageAsync(userMessage("later question", 2));
-  const context = await run(() =>
-    SessionManager.openModelContextAsync(target, { through: terminal.anchor }),
-  );
+  const context = await readContext({ through: terminal.anchor });
   expect(context.buildSessionContext()).toEqual(expected);
   await manager.removeTrailingEntriesAsync((entry) => entry.type === "message");
   expect(context.buildSessionContext()).toEqual(expected);
-  await expect(
-    run(() => SessionManager.openModelContextAsync(target, { through: terminal.anchor })),
-  ).rejects.toThrow(/transcript|anchor/i);
+  await expect(readContext({ through: terminal.anchor })).rejects.toThrow(/transcript|anchor/i);
 });
 
 it("drains accepted manager work on release while preserving manager-local order", async () => {
@@ -235,10 +224,7 @@ it.each(["agent:main:dashboard:incognito-unbound", "agent:main:dashboard:ordinar
     expect(await readMessages(target)).toEqual([]);
     const manager = await SessionManager.openAsync(target);
     expect(manager.getEntries()).toEqual([]);
-    const bounded = await SessionManager.openBoundedAsync(target, {
-      maxBytes: 4096,
-      maxEvents: 5,
-    });
+    const bounded = await SessionManager.openBoundedAsync(target, { maxBytes: 4096, maxEvents: 5 });
     const context = await SessionManager.openModelContextAsync(target);
     expect(bounded.getEntries()).toEqual([]);
     expect(context.buildSessionContext().messages).toEqual([]);

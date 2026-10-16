@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { vi } from "vitest";
+import { expect, vi } from "vitest";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import * as contextWorker from "../../config/sessions/session-transcript-read-worker-runtime.js";
 import {
@@ -13,6 +13,21 @@ import type { SessionManager } from "./session-manager.js";
 
 export function assistantText(text: string) {
   return makeAgentAssistantMessage({ content: [{ type: "text", text }] });
+}
+
+export async function expectCancelledReads(read: (signal: AbortSignal) => Promise<unknown>) {
+  for (const alreadyAborted of [true, false]) {
+    const controller = new AbortController();
+    const reason = new Error("context cancelled");
+    if (alreadyAborted) {
+      controller.abort(reason);
+    }
+    const pending = read(controller.signal);
+    if (!alreadyAborted) {
+      controller.abort(reason);
+    }
+    await expect(pending).rejects.toBe(reason);
+  }
 }
 
 export function customData(manager: SessionManager, id: string) {

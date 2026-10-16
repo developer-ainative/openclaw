@@ -32,8 +32,7 @@ async function openSession(label: string) {
 }
 
 function expectCanonicalView(manager: SessionManager, reopened: SessionManager) {
-  expect(reopened.getBoundaryCount()).toBe(1);
-  expect(manager.getBoundaryCount()).toBe(reopened.getBoundaryCount());
+  expect([manager.getBoundaryCount(), reopened.getBoundaryCount()]).toEqual([1, 1]);
   expect(manager.getBranch()).toEqual(reopened.getBranch());
   expect(manager.buildSessionContext()).toEqual(reopened.buildSessionContext());
 }
@@ -198,24 +197,21 @@ it("appends an assistant without parsing transcript rows outside the bounded con
     agentId: scope.agentId,
     path: resolveSessionTranscriptDatabasePath(scope),
   });
-  const excluded = database.db
-    .prepare("SELECT seq FROM transcript_event_identities WHERE session_id = ? AND event_id = ?")
-    .get(scope.sessionId, "excluded");
-  const excludedSeq = excluded?.seq;
+  const readIdentity = (id: string) =>
+    database.db
+      .prepare(
+        "SELECT seq, parent_id FROM transcript_event_identities WHERE session_id = ? AND event_id = ?",
+      )
+      .get(scope.sessionId, id);
+  const excludedSeq = readIdentity("excluded")?.seq;
   assert(typeof excludedSeq === "number", "Missing excluded transcript message");
   expect(manager.getEntry("excluded")).toBeUndefined();
-  const poisoned = database.db
-    .prepare("UPDATE transcript_events SET event_json = ? WHERE session_id = ? AND seq = ?")
-    .run("{", scope.sessionId, excludedSeq);
-  expect(poisoned.changes).toBe(1);
-
+  expect(
+    database.db
+      .prepare("UPDATE transcript_events SET event_json = ? WHERE session_id = ? AND seq = ?")
+      .run("{", scope.sessionId, excludedSeq).changes,
+  ).toBe(1);
   const assistantId = manager.appendMessage(assistantText("bounded reply"));
-
   expect(manager.getEntry(assistantId)).toMatchObject({ parentId: "retained" });
-  const stored = database.db
-    .prepare(
-      "SELECT parent_id FROM transcript_event_identities WHERE session_id = ? AND event_id = ?",
-    )
-    .get(scope.sessionId, assistantId);
-  expect(stored).toMatchObject({ parent_id: "retained" });
+  expect(readIdentity(assistantId)).toMatchObject({ parent_id: "retained" });
 });
