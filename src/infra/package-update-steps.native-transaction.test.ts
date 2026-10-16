@@ -321,8 +321,7 @@ describe.runIf(process.platform !== "win32")("native package transactions", () =
         if (shimFailure) {
           const activeRoot = path.join(globalRoot, "hash-openclaw", "node_modules", "openclaw");
           expect(result.failedStep).toMatchObject({ name: "package-swap", exitCode: 1 });
-          expect(result.activePackageRoot).toBe(activeRoot);
-          expect(result.afterVersion).toBe("2.0.0");
+          expect(result).toMatchObject({ activePackageRoot: activeRoot, afterVersion: "2.0.0" });
           await expectMissing(packageRoot);
           const { revoke, assertCurrent } = executorAuthority();
           const prototype = Object.getPrototypeOf(await fsSafeRoot(base)) as Root;
@@ -369,9 +368,8 @@ describe.runIf(process.platform !== "win32")("native package transactions", () =
           ).toEqual([]);
           return;
         }
-        expect(result.failedStep).toBeNull();
+        expect(result).toMatchObject({ failedStep: null, afterVersion: "2.0.0" });
         expect(phases).toEqual(["probe root", "probe bin", "validate", "stop"]);
-        expect(result.afterVersion).toBe("2.0.0");
         await expectText(metadata, "candidate metadata\n");
         await expectText(sibling, "unrelated package\n");
         await expect(fs.realpath(launcher)).resolves.toBe(
