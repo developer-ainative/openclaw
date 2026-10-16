@@ -51,13 +51,22 @@ const roots = useAutoCleanupTempDirTracker((cleanup) =>
   }),
 );
 
+function openDatabase(prefix: string) {
+  vi.stubEnv("OPENCLAW_STATE_DIR", roots.make(prefix));
+  return openOpenClawStateDatabase();
+}
+
+function sessionIdentity(sessionId: string) {
+  return { sessionId, agentId: "main", sessionKey: `agent:main:${sessionId}` };
+}
+
 async function activePlacement(
   database: OpenClawStateDatabase,
   sessionId: string,
   executionMode: WorkerPlacementExecutionMode = "worker-turn",
 ) {
   const store = createWorkerSessionPlacementStore({ database, now: () => 1000 });
-  const identity = { sessionId, agentId: "main", sessionKey: `agent:main:${sessionId}` };
+  const identity = sessionIdentity(sessionId);
   const environmentId = `environment-${sessionId}`;
   const placement = await advancePlacementFixtureToActive(
     store,
@@ -145,19 +154,10 @@ describe("worker placement read projection", () => {
   });
 
   it("prepares native placement lookups off thread and rejects a placement created before mutation", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", roots.make("placement-native-read-worker-"));
-    const database = openOpenClawStateDatabase();
+    const database = openDatabase("placement-native-read-worker-");
     const store = createWorkerSessionPlacementStore({ database });
-    const first = await store.startDispatch({
-      sessionId: "first",
-      sessionKey: "agent:main:first",
-      agentId: "main",
-    });
-    const second = await store.startDispatch({
-      sessionId: "second",
-      sessionKey: "agent:main:second",
-      agentId: "main",
-    });
+    const first = await store.startDispatch(sessionIdentity("first"));
+    const second = await store.startDispatch(sessionIdentity("second"));
     await store.getManyAsync([first.sessionId]);
     const sql = observeMainThreadSql();
     let assertCurrent: () => void;
@@ -178,17 +178,12 @@ describe("worker placement read projection", () => {
       sql.restore();
     }
     assertCurrent();
-    await store.startDispatch({
-      sessionId: "late-placement",
-      sessionKey: "agent:main:late-placement",
-      agentId: "main",
-    });
+    await store.startDispatch(sessionIdentity("late-placement"));
     expect(assertCurrent).toThrow("placement late-placement changed before mutation");
   });
 
   it("publishes node retention without host SQL and refuses a drained placement before dispatch", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", roots.make("placement-node-retention-"));
-    const database = openOpenClawStateDatabase();
+    const database = openDatabase("placement-node-retention-");
     const { store, placement, identity } = await activePlacement(database, "node-retention");
     await store.claimTurn({
       ...identity,
@@ -247,11 +242,7 @@ describe("worker placement read projection", () => {
       });
       expect(request.isDispatchAuthorized()).toBe(true);
       sql.expectIdle();
-      await store.startDispatch({
-        sessionId: "unrelated",
-        sessionKey: "agent:main:unrelated",
-        agentId: "main",
-      });
+      await store.startDispatch(sessionIdentity("unrelated"));
       expect(request.isDispatchAuthorized()).toBe(true);
       await store.startDrain({
         sessionId: placement.sessionId,
@@ -276,14 +267,9 @@ describe("worker placement read projection", () => {
   it.each(["local", "worker-turn", "remote-exec"] as const)(
     "fences session observations during %s publication settlement",
     async (kind) => {
-      vi.stubEnv("OPENCLAW_STATE_DIR", roots.make("placement-maintenance-settlement-"));
-      const database = openOpenClawStateDatabase();
+      const database = openDatabase("placement-maintenance-settlement-");
       const store = createWorkerSessionPlacementStore({ database });
-      const session = {
-        sessionId: "settling-placement",
-        sessionKey: "agent:main:settling-placement",
-        agentId: "main",
-      };
+      const session = sessionIdentity("settling-placement");
       if (kind !== "local") {
         await activePlacement(database, session.sessionId, kind);
       }
@@ -328,8 +314,7 @@ describe("worker placement read projection", () => {
   );
 
   it("derives inference from the bound snapshot without rewriting it", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", roots.make("placement-inference-snapshot-"));
-    const database = openOpenClawStateDatabase();
+    const database = openDatabase("placement-inference-snapshot-");
     const sessionId = "snapshot-worker";
     const environmentId = "environment-" + sessionId;
     const profileSnapshot = { settings: { device: "paired-node", inference: "worker" } };
@@ -357,8 +342,7 @@ describe("worker placement read projection", () => {
   });
 
   it("discovers disk-probe placements off thread before live sample checks", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", roots.make("placement-disk-inventory-"));
-    const database = openOpenClawStateDatabase();
+    const database = openDatabase("placement-disk-inventory-");
     const last = await activePlacement(database, "z-disk");
     const first = await activePlacement(database, "a-disk");
     const store = createWorkerSessionPlacementStore({ database, now: () => 2000 });
@@ -369,11 +353,7 @@ describe("worker placement read projection", () => {
       runId: "recent-disk-run",
     });
     await store.releaseTurn(claim);
-    await store.startDispatch({
-      sessionId: "inactive-disk",
-      sessionKey: "agent:main:inactive-disk",
-      agentId: "main",
-    });
+    await store.startDispatch(sessionIdentity("inactive-disk"));
     const sample: SpawnResult = {
       stdout: JSON.stringify({
         availableBytes: String(6 * 1024 ** 3),
@@ -447,11 +427,7 @@ describe("worker placement read projection", () => {
     const { store, placement, identity } = await activePlacement(database, "pending");
     const claim = await store.claimTurn({
       ...identity,
-      owner: {
-        kind: "worker",
-        environmentId: placement.environmentId,
-        ownerEpoch: placement.activeOwnerEpoch,
-      },
+      owner: placementTurnOwner(placement),
       claimId: "pending-claim",
       runId: "pending-run",
     });
@@ -544,8 +520,7 @@ describe("worker placement read projection", () => {
   it.each([false, true])(
     "reads exact recovery facts and candidate order with repository column %s",
     async (repositoryColumn) => {
-      vi.stubEnv("OPENCLAW_STATE_DIR", roots.make("placement-recovery-projection-"));
-      const database = openOpenClawStateDatabase();
+      const database = openDatabase("placement-recovery-projection-");
       const { db } = database;
       const store = createWorkerSessionPlacementStore({ database });
       if (!repositoryColumn) {
@@ -747,8 +722,7 @@ describe("worker placement read projection", () => {
   );
 
   it("prepares pending-result claim authority for live and claimless worker and local owners", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", roots.make("placement-result-claim-projection-"));
-    const database = openOpenClawStateDatabase();
+    const database = openDatabase("placement-result-claim-projection-");
     for (const executionMode of ["worker-turn", "remote-exec"] as const) {
       const { store, placement, identity } = await activePlacement(
         database,

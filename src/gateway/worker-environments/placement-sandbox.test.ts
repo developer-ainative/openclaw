@@ -1,4 +1,3 @@
-import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { WorkerSessionPlacementRecord } from "./placement-record.js";
 import { createRemoteExecPlacementSandbox } from "./placement-sandbox.js";
@@ -71,6 +70,17 @@ function attachedEnvironment() {
   } satisfies NonNullable<ReturnType<WorkerEnvironmentService["get"]>>;
 }
 
+function sandboxFor(
+  environments: Parameters<typeof createRemoteExecPlacementSandbox>[0]["environments"],
+  placement = remoteExecPlacement(),
+) {
+  return createRemoteExecPlacementSandbox({
+    environments,
+    placement,
+    workspaceDir: "/local/managed-worktree",
+  });
+}
+
 describe("remote-exec placement sandbox", () => {
   it("binds the exact SSH managed worktree and placement generation into the runtime", async () => {
     const placement = remoteExecPlacement();
@@ -80,11 +90,7 @@ describe("remote-exec placement sandbox", () => {
       contents: "private-key-material",
     }));
 
-    const sandbox = await createRemoteExecPlacementSandbox({
-      environments: { get: () => environment, resolveSshIdentity },
-      workspaceDir: "/local/managed-worktree",
-      placement,
-    });
+    const sandbox = await sandboxFor({ get: () => environment, resolveSshIdentity }, placement);
 
     expect(resolveSshIdentity).toHaveBeenCalledWith(environmentId);
     expect(sandbox).toMatchObject({
@@ -106,15 +112,7 @@ describe("remote-exec placement sandbox", () => {
     { platform: "POSIX", nodeWorkspaceDir: remoteWorkspaceDir },
     {
       platform: "Windows",
-      nodeWorkspaceDir: path.win32.join(
-        "C:\\",
-        "Users",
-        "Node",
-        ".openclaw",
-        "node-host",
-        "workspaces",
-        "session-1",
-      ),
+      nodeWorkspaceDir: String.raw`C:\Users\Node\.openclaw\node-host\workspaces\session-1`,
     },
   ])(
     "binds an exact $platform paired-node worktree without inventing an SSH backend or filesystem bridge",
@@ -129,11 +127,7 @@ describe("remote-exec placement sandbox", () => {
       } satisfies NonNullable<ReturnType<WorkerEnvironmentService["get"]>>;
       const resolveSshIdentity = vi.fn();
 
-      const sandbox = await createRemoteExecPlacementSandbox({
-        environments: { get: () => environment, resolveSshIdentity },
-        workspaceDir: "/local/managed-worktree",
-        placement,
-      });
+      const sandbox = await sandboxFor({ get: () => environment, resolveSshIdentity }, placement);
 
       expect(sandbox).toMatchObject({
         enabled: true,
@@ -172,11 +166,10 @@ describe("remote-exec placement sandbox", () => {
     };
 
     await expect(
-      createRemoteExecPlacementSandbox({
-        environments: { get: () => environment },
-        workspaceDir: "/local/managed-worktree",
-        placement: { ...remoteExecPlacement(), remoteWorkspaceDir: workspaceDir },
-      }),
+      sandboxFor(
+        { get: () => environment },
+        { ...remoteExecPlacement(), remoteWorkspaceDir: workspaceDir },
+      ),
     ).rejects.toThrow("invalid managed workspace path");
   });
 
@@ -185,14 +178,10 @@ describe("remote-exec placement sandbox", () => {
     const resolveSshIdentity = vi.fn();
 
     await expect(
-      createRemoteExecPlacementSandbox({
-        environments: { get: () => environment, resolveSshIdentity },
-        workspaceDir: "/local/managed-worktree",
-        placement: {
-          ...remoteExecPlacement(),
-          remoteWorkspaceDir: String.raw`C:\Users\Node\workspace`,
-        },
-      }),
+      sandboxFor(
+        { get: () => environment, resolveSshIdentity },
+        { ...remoteExecPlacement(), remoteWorkspaceDir: String.raw`C:\Users\Node\workspace` },
+      ),
     ).rejects.toThrow("invalid managed workspace path");
     expect(resolveSshIdentity).not.toHaveBeenCalled();
   });
@@ -200,59 +189,39 @@ describe("remote-exec placement sandbox", () => {
   it.each([
     {
       label: "stale owner epoch",
-      mutate: (environment: ReturnType<typeof attachedEnvironment>) => ({
-        ...environment,
-        ownerEpoch: environment.ownerEpoch + 1,
-      }),
+      replacement: { ownerEpoch: 8 },
     },
     {
       label: "different attached session",
-      mutate: (environment: ReturnType<typeof attachedEnvironment>) => ({
-        ...environment,
-        attachedSessionIds: ["replacement-session"],
-      }),
+      replacement: { attachedSessionIds: ["replacement-session"] },
     },
     {
       label: "different SSH endpoint",
-      mutate: (environment: ReturnType<typeof attachedEnvironment>) => ({
-        ...environment,
-        sshEndpoint: { ...environment.sshEndpoint, host: "replacement.example.test" },
-      }),
+      replacement: {
+        sshEndpoint: { ...attachedEnvironment().sshEndpoint, host: "replacement.example.test" },
+      },
     },
-  ])("rejects a $label after awaited SSH identity preparation", async ({ mutate }) => {
+  ])("rejects a $label after awaited SSH identity preparation", async ({ replacement }) => {
     const placement = remoteExecPlacement();
     let environment = attachedEnvironment();
     const resolveSshIdentity = vi.fn(async () => {
-      environment = mutate(environment);
+      environment = { ...environment, ...replacement };
       return { kind: "material" as const, contents: "private-key-material" };
     });
 
     await expect(
-      createRemoteExecPlacementSandbox({
-        environments: { get: () => environment, resolveSshIdentity },
-        workspaceDir: "/local/managed-worktree",
-        placement,
-      }),
+      sandboxFor({ get: () => environment, resolveSshIdentity }, placement),
     ).rejects.toThrow("lost its exact environment");
   });
 
   it.each([
-    {
-      label: "node identity",
-      replacement: { nodeDeviceId: "replacement-node" },
-    },
+    { label: "node identity", replacement: { nodeDeviceId: "replacement-node" } },
     {
       label: "environment identity",
       replacement: { environmentId: "worker:replacement-environment" },
     },
-    {
-      label: "owner epoch",
-      replacement: { ownerEpoch: 8 },
-    },
-    {
-      label: "session identity",
-      replacement: { attachedSessionIds: ["replacement-session"] },
-    },
+    { label: "owner epoch", replacement: { ownerEpoch: 8 } },
+    { label: "session identity", replacement: { attachedSessionIds: ["replacement-session"] } },
   ])(
     "rejects a paired node's replaced $label before returning its sandbox",
     async ({ replacement }) => {
@@ -267,13 +236,7 @@ describe("remote-exec placement sandbox", () => {
         .mockReturnValueOnce(environment)
         .mockReturnValueOnce({ ...environment, ...replacement });
 
-      await expect(
-        createRemoteExecPlacementSandbox({
-          environments: { get },
-          workspaceDir: "/local/managed-worktree",
-          placement,
-        }),
-      ).rejects.toThrow("lost its exact environment");
+      await expect(sandboxFor({ get }, placement)).rejects.toThrow("lost its exact environment");
     },
   );
 });

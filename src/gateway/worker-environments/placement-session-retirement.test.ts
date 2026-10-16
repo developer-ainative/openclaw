@@ -17,9 +17,9 @@ import {
   type WorkerSessionPlacementRetirement,
 } from "./placement-store.js";
 
-function localPlacement(
-  sessionId: string,
-): Extract<WorkerSessionPlacementRecord, { state: "local" }> {
+type Placement<State> = Extract<WorkerSessionPlacementRecord, { state: State }>;
+
+function localPlacement(sessionId: string): Placement<"local"> {
   return {
     sessionId,
     sessionKey: `agent:main:${sessionId}`,
@@ -44,9 +44,7 @@ function localPlacement(
   };
 }
 
-function activePlacement(
-  sessionId: string,
-): Extract<WorkerSessionPlacementRecord, { state: "active" }> {
+function activePlacement(sessionId: string): Placement<"active"> {
   return {
     ...localPlacement(sessionId),
     state: "active",
@@ -60,9 +58,7 @@ function activePlacement(
   };
 }
 
-function failedPlacement(
-  placement: Extract<WorkerSessionPlacementRecord, { state: "active" }>,
-): Extract<WorkerSessionPlacementRecord, { state: "failed" }> {
+function failedPlacement(placement: Placement<"active">): Placement<"failed"> {
   return {
     ...placement,
     state: "failed",
@@ -79,22 +75,16 @@ function createHarness(records: WorkerSessionPlacementRecord[]) {
   const environments = new Map<
     string,
     { environmentId: string; state: "attached" | "destroyed"; leaseId: string | null }
-  >(
-    records.flatMap((record) =>
-      record.environmentId
-        ? [
-            [
-              record.environmentId,
-              {
-                environmentId: record.environmentId,
-                state: "attached" as const,
-                leaseId: `lease:${record.environmentId}`,
-              },
-            ] as const,
-          ]
-        : [],
-    ),
-  );
+  >();
+  for (const { environmentId } of records) {
+    if (environmentId) {
+      environments.set(environmentId, {
+        environmentId,
+        state: "attached",
+        leaseId: `lease:${environmentId}`,
+      });
+    }
+  }
   const retired: WorkerSessionPlacementRetirement[] = [];
   const resolveSessionEvidence = vi.fn(
     async (_placement: WorkerSessionPlacementRecord): Promise<PlacementSessionEvidence> => "absent",

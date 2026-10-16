@@ -35,36 +35,112 @@ async function preparePatchError(
 
 const originalPluginRegistry = getActivePluginRegistry();
 
+function registerHarness(id: string, overrides: Partial<AgentHarness> = {}) {
+  registerAgentHarness({
+    id,
+    label: id,
+    cloudPlacement: {
+      mode: "remote-exec",
+      devicePlacement: {
+        requiredNodeCommands: ["runtime.exec-server.v1"],
+        consumesWorkerSlot: false,
+      },
+    },
+    supports: () => ({ supported: true }),
+    async runAttempt() {
+      throw new Error("not used");
+    },
+    ...overrides,
+  });
+}
+
+function runtimeCapabilities(
+  entry: Partial<Parameters<typeof resolveWorkerPlacementSessionRuntime>[0]["entry"]>,
+  cfg: Parameters<typeof resolveWorkerPlacementSessionRuntime>[0]["cfg"] = {},
+) {
+  return resolveWorkerPlacementCapabilities(
+    resolveWorkerPlacementSessionRuntime({
+      readSourceEntry: () => undefined,
+      cfg,
+      entry: { sessionId: "runtime-session", updatedAt: 0, ...entry },
+      agentId: "main",
+      sessionKey: "agent:main:runtime-session",
+    }),
+  );
+}
+
+function registerCliBackend(modelProvider?: string) {
+  getActivePluginRegistry()?.cliBackends.push({
+    pluginId: "test-cli-plugin",
+    pluginName: "test-cli-plugin",
+    backend: {
+      id: "claude-cli",
+      ...(modelProvider ? { modelProvider } : {}),
+      config: { command: "claude" },
+    },
+    source: "test",
+  });
+}
+
+function authConfig(order: string[]) {
+  return {
+    auth: {
+      order: { anthropic: order },
+      profiles: {
+        "anthropic:api": { provider: "anthropic", mode: "api_key" as const },
+        "anthropic:claude-cli": { provider: "claude-cli", mode: "oauth" as const },
+      },
+    },
+  };
+}
+
+function patchPlacement(sessionId: string) {
+  return {
+    sessionId,
+    state: "active" as const,
+    executionMode: "worker-turn" as const,
+    generation: 1,
+    environmentId: "env-1",
+    runnerId: "runner-1",
+    runnerStatus: "available" as const,
+    recoveryError: null,
+    terminalReason: null,
+    terminalAtMs: null,
+    transitionGeneration: 1,
+    ownerId: "worker",
+    ownerEpoch: 1,
+    turnClaim: null,
+    workspace: null,
+    retirement: null,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+  };
+}
+
+beforeEach(() => {
+  clearRuntimeAuthProfileStoreSnapshots();
+  setActivePluginRegistry(createEmptyPluginRegistry(), "placement-runtime-test", "default");
+});
+
+afterEach(() => {
+  clearRuntimeAuthProfileStoreSnapshots();
+  clearRuntimeConfigSnapshot();
+  if (originalPluginRegistry) {
+    setActivePluginRegistry(originalPluginRegistry, "placement-runtime-test-restore", "default");
+    return;
+  }
+  resetPluginRuntimeStateForTest();
+});
+
 describe("worker placement runtime capabilities", () => {
-  beforeEach(() => {
-    clearRuntimeAuthProfileStoreSnapshots();
-    setActivePluginRegistry(createEmptyPluginRegistry(), "placement-runtime-test", "default");
-  });
-
-  afterEach(() => {
-    clearRuntimeAuthProfileStoreSnapshots();
-    clearRuntimeConfigSnapshot();
-    if (originalPluginRegistry) {
-      setActivePluginRegistry(originalPluginRegistry, "placement-runtime-test-restore", "default");
-      return;
-    }
-    resetPluginRuntimeStateForTest();
-  });
-
   it("derives presence preparation mode from the default session runtime owner", () => {
-    registerAgentHarness({
-      id: "codex",
-      label: "Codex",
+    registerHarness("codex", {
       cloudPlacement: {
         mode: "remote-exec",
         devicePlacement: {
           requiredNodeCommands: ["codex.exec-server.stdio.v1"],
           consumesWorkerSlot: false,
         },
-      },
-      supports: () => ({ supported: true }),
-      async runAttempt() {
-        throw new Error("not used");
       },
     });
     const cfg = {
@@ -240,16 +316,7 @@ describe("worker placement runtime capabilities", () => {
     },
   ] as const)("$name", ({ runtimeId, executionMode, devicePlacementSupported, ...declaration }) => {
     if ("cloudPlacement" in declaration) {
-      const harness: AgentHarness = {
-        id: runtimeId,
-        label: runtimeId,
-        cloudPlacement: declaration.cloudPlacement,
-        supports: () => ({ supported: true }),
-        async runAttempt() {
-          throw new Error("not used");
-        },
-      };
-      registerAgentHarness(harness);
+      registerHarness(runtimeId, { cloudPlacement: declaration.cloudPlacement });
     }
 
     expect(resolveWorkerPlacementExecutionMode(runtimeId)).toBe(executionMode);
@@ -257,9 +324,6 @@ describe("worker placement runtime capabilities", () => {
       ...(executionMode ? { executionMode } : {}),
       ...("devicePlacement" in declaration ? { devicePlacement: declaration.devicePlacement } : {}),
     });
-    expect(resolveWorkerPlacementCapabilities(runtimeId).devicePlacement !== undefined).toBe(
-      devicePlacementSupported,
-    );
     expect(projectWorkerPlacementAgentRuntime({ id: runtimeId, source: "model" })).toEqual({
       id: runtimeId,
       cloudPlacementSupported: executionMode !== undefined,
@@ -271,19 +335,13 @@ describe("worker placement runtime capabilities", () => {
   });
 
   it("fails closed when a harness requires more than the bounded command count", () => {
-    registerAgentHarness({
-      id: "oversized-harness",
-      label: "oversized-harness",
+    registerHarness("oversized-harness", {
       cloudPlacement: {
         mode: "remote-exec",
         devicePlacement: {
           requiredNodeCommands: Array.from({ length: 33 }, (_, index) => `runtime.${index}.v1`),
           consumesWorkerSlot: false,
         },
-      },
-      supports: () => ({ supported: true }),
-      async runAttempt() {
-        throw new Error("not used");
       },
     });
 
@@ -301,205 +359,72 @@ describe("worker placement runtime capabilities", () => {
 });
 
 describe("worker placement runtime capability projection", () => {
-  beforeEach(() => {
-    clearRuntimeAuthProfileStoreSnapshots();
-    setActivePluginRegistry(createEmptyPluginRegistry(), "placement-runtime-test", "default");
-  });
-
-  afterEach(() => {
-    clearRuntimeAuthProfileStoreSnapshots();
-    clearRuntimeConfigSnapshot();
-    if (originalPluginRegistry) {
-      setActivePluginRegistry(originalPluginRegistry, "placement-runtime-test-restore", "default");
-      return;
-    }
-    resetPluginRuntimeStateForTest();
-  });
-
   it("rejects a CLI-backed provider whose dispatch runs as a local process", () => {
-    // The reported #136611 case: Claude CLI is registered as a CLI backend
-    // (registerCliBackend), not an agent harness. Its dispatch runs
-    // runCliFallbackCandidate locally, so it cannot claim an active cloud
-    // worker-turn placement. The guard must reject it via the same
-    // CLI-execution classifier the dispatch path uses, instead of misreading
-    // the unclaimed "auto" as the built-in openclaw worker-turn runtime.
-    const registry = getActivePluginRegistry();
-    if (registry) {
-      registry.cliBackends.push({
-        pluginId: "test-cli-plugin",
-        pluginName: "test-cli-plugin",
-        backend: { id: "claude-cli", config: { command: "claude" } },
-        source: "test",
-      });
-    }
-    const caps = resolveWorkerPlacementCapabilities(
-      resolveWorkerPlacementSessionRuntime({
-        readSourceEntry: () => undefined,
-        cfg: {},
-        entry: {
-          sessionId: "s-cli",
-          updatedAt: 0,
-          providerOverride: "claude-cli",
-          modelOverride: "claude-fable-5-1",
-        },
-        agentId: "main",
-        sessionKey: "agent:main:s-cli",
-      }),
-    );
+    // #136611: CLI backends dispatch locally even when no harness claims the model.
+    registerCliBackend();
+    const caps = runtimeCapabilities({
+      providerOverride: "claude-cli",
+      modelOverride: "claude-fable-5-1",
+    });
     expect(caps.executionMode).toBeUndefined();
     expect(caps.devicePlacement).toBeUndefined();
   });
 
   it("honors a non-CLI session runtime override over a CLI-backed provider", () => {
-    // P1: when agentRuntimeOverride="openclaw" is active, dispatch skips CLI
-    // aliasing and runs the embedded runtime. The guard must agree — the
-    // CLI-backed provider must NOT be rejected because the override takes
-    // precedence (mirrors agent-runner-fallback-candidate.ts:113-119).
-    const registry = getActivePluginRegistry();
-    if (registry) {
-      registry.cliBackends.push({
-        pluginId: "test-cli-plugin",
-        pluginName: "test-cli-plugin",
-        backend: { id: "claude-cli", config: { command: "claude" } },
-        source: "test",
-      });
-    }
-    const caps = resolveWorkerPlacementCapabilities(
-      resolveWorkerPlacementSessionRuntime({
-        readSourceEntry: () => undefined,
-        cfg: {},
-        entry: {
-          sessionId: "s-override",
-          updatedAt: 0,
-          providerOverride: "claude-cli",
-          modelOverride: "opus-4.7",
-          agentRuntimeOverride: "openclaw",
-        },
-        agentId: "main",
-        sessionKey: "agent:main:s-override",
-      }),
-    );
+    registerCliBackend();
+    const caps = runtimeCapabilities({
+      providerOverride: "claude-cli",
+      modelOverride: "opus-4.7",
+      agentRuntimeOverride: "openclaw",
+    });
     expect(caps.executionMode).toBe("worker-turn");
   });
 
   it("passes the selected auth profile to CLI classification — direct-API profile overrides CLI auth order", () => {
-    // P1: with CLI-first auth order but an explicit direct-API authProfileOverride,
-    // dispatch resolves a non-CLI provider. The guard must pass the profile and
-    // not reject (model-runtime-aliases.test.ts:281-290 contract).
-    const registry = getActivePluginRegistry();
-    if (registry) {
-      registry.cliBackends.push({
-        pluginId: "test-cli-plugin",
-        pluginName: "test-cli-plugin",
-        backend: { id: "claude-cli", modelProvider: "anthropic", config: { command: "claude" } },
-        source: "test",
-      });
-    }
-    const caps = resolveWorkerPlacementCapabilities(
-      resolveWorkerPlacementSessionRuntime({
-        readSourceEntry: () => undefined,
-        cfg: {
-          auth: {
-            order: { anthropic: ["anthropic:claude-cli", "anthropic:api"] },
-            profiles: {
-              "anthropic:api": { provider: "anthropic", mode: "api_key" },
-              "anthropic:claude-cli": { provider: "claude-cli", mode: "oauth" },
-            },
-          },
-        },
-        entry: {
-          sessionId: "s-auth-direct",
-          updatedAt: 0,
-          providerOverride: "anthropic",
-          modelOverride: "opus-4.7",
-          authProfileOverride: "anthropic:api",
-        },
-        agentId: "main",
-        sessionKey: "agent:main:s-auth-direct",
-      }),
+    registerCliBackend("anthropic");
+    const caps = runtimeCapabilities(
+      {
+        providerOverride: "anthropic",
+        modelOverride: "opus-4.7",
+        authProfileOverride: "anthropic:api",
+      },
+      authConfig(["anthropic:claude-cli", "anthropic:api"]),
     );
     expect(caps.executionMode).toBe("worker-turn");
   });
 
   it("rejects when an explicit CLI auth profile overrides a direct-API auth order", () => {
-    // P1 reverse: with API-first auth order but an explicit CLI authProfileOverride,
-    // dispatch resolves a CLI provider. The guard must reject
-    // (model-runtime-aliases.test.ts:292-300 contract).
-    const registry = getActivePluginRegistry();
-    if (registry) {
-      registry.cliBackends.push({
-        pluginId: "test-cli-plugin",
-        pluginName: "test-cli-plugin",
-        backend: { id: "claude-cli", modelProvider: "anthropic", config: { command: "claude" } },
-        source: "test",
-      });
-    }
-    const caps = resolveWorkerPlacementCapabilities(
-      resolveWorkerPlacementSessionRuntime({
-        readSourceEntry: () => undefined,
-        cfg: {
-          auth: {
-            order: { anthropic: ["anthropic:api"] },
-            profiles: {
-              "anthropic:api": { provider: "anthropic", mode: "api_key" },
-              "anthropic:claude-cli": { provider: "claude-cli", mode: "oauth" },
-            },
-          },
-        },
-        entry: {
-          sessionId: "s-auth-cli",
-          updatedAt: 0,
-          providerOverride: "anthropic",
-          modelOverride: "opus-4.7",
-          authProfileOverride: "anthropic:claude-cli",
-        },
-        agentId: "main",
-        sessionKey: "agent:main:s-auth-cli",
-      }),
+    registerCliBackend("anthropic");
+    const caps = runtimeCapabilities(
+      {
+        providerOverride: "anthropic",
+        modelOverride: "opus-4.7",
+        authProfileOverride: "anthropic:claude-cli",
+      },
+      authConfig(["anthropic:api"]),
     );
     expect(caps.executionMode).toBeUndefined();
   });
 
   it("reports remote-exec capabilities for a registered harness via provider policy", () => {
-    registerAgentHarness({
-      id: "device-harness",
-      label: "device-harness",
-      cloudPlacement: {
-        mode: "remote-exec",
-        devicePlacement: {
-          requiredNodeCommands: ["runtime.exec-server.v1"],
-          consumesWorkerSlot: false,
-        },
-      },
-      supports: () => ({ supported: true }),
-      async runAttempt() {
-        throw new Error("not used");
-      },
-    });
+    registerHarness("device-harness");
 
-    const caps = resolveWorkerPlacementCapabilities(
-      resolveWorkerPlacementSessionRuntime({
-        readSourceEntry: () => undefined,
-        cfg: {
-          models: {
-            providers: {
-              "device-harness": {
-                baseUrl: "https://device-harness.example/v1",
-                models: [],
-                agentRuntime: { id: "device-harness" },
-              },
+    const caps = runtimeCapabilities(
+      {
+        providerOverride: "device-harness",
+        modelOverride: "model-x",
+      },
+      {
+        models: {
+          providers: {
+            "device-harness": {
+              baseUrl: "https://device-harness.example/v1",
+              models: [],
+              agentRuntime: { id: "device-harness" },
             },
           },
         },
-        entry: {
-          sessionId: "s3",
-          updatedAt: 0,
-          providerOverride: "device-harness",
-          modelOverride: "model-x",
-        },
-        agentId: "main",
-        sessionKey: "agent:main:s3",
-      }),
+      },
     );
     expect(caps.executionMode).toBe("remote-exec");
     expect(caps.devicePlacement).toEqual({
@@ -509,40 +434,12 @@ describe("worker placement runtime capability projection", () => {
   });
 
   it("resolves a registered auto harness placement capability instead of rejecting auto", () => {
-    // When no explicit runtime policy is set, the policy resolves to "auto".
-    // A registered harness that supports the model and advertises device
-    // placement must be selected — mirroring resolveEffectiveAgentRuntime —
-    // so a valid model change is not falsely rejected.
-    registerAgentHarness({
-      id: "auto-device-harness",
-      label: "auto-device-harness",
-      cloudPlacement: {
-        mode: "remote-exec",
-        devicePlacement: {
-          requiredNodeCommands: ["runtime.exec-server.v1"],
-          consumesWorkerSlot: false,
-        },
-      },
-      supports: () => ({ supported: true }),
-      async runAttempt() {
-        throw new Error("not used");
-      },
-    });
+    registerHarness("auto-device-harness");
 
-    const caps = resolveWorkerPlacementCapabilities(
-      resolveWorkerPlacementSessionRuntime({
-        readSourceEntry: () => undefined,
-        cfg: {},
-        entry: {
-          sessionId: "s4",
-          updatedAt: 0,
-          providerOverride: "auto-provider",
-          modelOverride: "auto-model",
-        },
-        agentId: "main",
-        sessionKey: "agent:main:s4",
-      }),
-    );
+    const caps = runtimeCapabilities({
+      providerOverride: "auto-provider",
+      modelOverride: "auto-model",
+    });
     expect(caps.executionMode).toBe("remote-exec");
     expect(caps.devicePlacement).toEqual({
       requiredNodeCommands: ["runtime.exec-server.v1"],
@@ -551,40 +448,12 @@ describe("worker placement runtime capability projection", () => {
   });
 
   it("falls back to built-in openclaw placement capabilities for an unclaimed auto model", () => {
-    // "auto" with no registered supporting harness falls back to the built-in
-    // openclaw harness (selection.ts auto_openclaw), which supports worker-turn
-    // placement. Rejecting it would block valid model switches for sessions
-    // with an active worker placement.
-    registerAgentHarness({
-      id: "unrelated-harness",
-      label: "unrelated-harness",
-      cloudPlacement: {
-        mode: "remote-exec",
-        devicePlacement: {
-          requiredNodeCommands: ["runtime.exec-server.v1"],
-          consumesWorkerSlot: false,
-        },
-      },
-      supports: () => ({ supported: false }),
-      async runAttempt() {
-        throw new Error("not used");
-      },
-    });
+    registerHarness("unrelated-harness", { supports: () => ({ supported: false }) });
 
-    const caps = resolveWorkerPlacementCapabilities(
-      resolveWorkerPlacementSessionRuntime({
-        readSourceEntry: () => undefined,
-        cfg: {},
-        entry: {
-          sessionId: "s5",
-          updatedAt: 0,
-          providerOverride: "unsupported-provider",
-          modelOverride: "unsupported-model",
-        },
-        agentId: "main",
-        sessionKey: "agent:main:s5",
-      }),
-    );
+    const caps = runtimeCapabilities({
+      providerOverride: "unsupported-provider",
+      modelOverride: "unsupported-model",
+    });
     expect(caps.executionMode).toBe("worker-turn");
     expect(caps.devicePlacement).toEqual({
       requiredNodeCommands: [],
@@ -593,40 +462,12 @@ describe("worker placement runtime capability projection", () => {
   });
 
   it("sessions.patch boundary: rejects an incompatible model change for an active worker-turn placement", async () => {
-    // An active worker-turn placement must reject a model whose effective
-    // runtime is a CLI harness with no cloud placement support. The harness
-    // claims the provider via autoSelection so resolveAutoAgentHarnessId
-    // returns it (not the openclaw fallback).
-    registerAgentHarness({
-      id: "claude-cli",
-      label: "claude-cli",
+    registerHarness("claude-cli", {
+      cloudPlacement: undefined,
       autoSelection: { providerIds: ["claude-cli"] },
-      supports: () => ({ supported: true }),
-      async runAttempt() {
-        throw new Error("not used");
-      },
     });
     const sessionId = "s6";
-    const placement = {
-      sessionId,
-      state: "active" as const,
-      executionMode: "worker-turn" as const,
-      generation: 1,
-      environmentId: "env-1",
-      runnerId: "runner-1",
-      runnerStatus: "available" as const,
-      recoveryError: null,
-      terminalReason: null,
-      terminalAtMs: null,
-      transitionGeneration: 1,
-      ownerId: "worker",
-      ownerEpoch: 1,
-      turnClaim: null,
-      workspace: null,
-      retirement: null,
-      createdAtMs: 0,
-      updatedAtMs: 0,
-    };
+    const placement = patchPlacement(sessionId);
     const context = {
       workerSessionPlacementService: {
         getMany: () => new Map([[sessionId, placement]]),
@@ -656,31 +497,8 @@ describe("worker placement runtime capability projection", () => {
   });
 
   it("sessions.patch boundary: allows an unclaimed auto model with openclaw fallback for an active worker-turn placement", async () => {
-    // An "auto" model with no registered supporting harness falls back to the
-    // built-in openclaw runtime, which supports worker-turn placement. The
-    // guard must not reject it — this is the compatibility regression fixed
-    // in this round (ClawSweeper P1).
     const sessionId = "s8";
-    const placement = {
-      sessionId,
-      state: "active" as const,
-      executionMode: "worker-turn" as const,
-      generation: 1,
-      environmentId: "env-1",
-      runnerId: "runner-1",
-      runnerStatus: "available" as const,
-      recoveryError: null,
-      terminalReason: null,
-      terminalAtMs: null,
-      transitionGeneration: 1,
-      ownerId: "worker",
-      ownerEpoch: 1,
-      turnClaim: null,
-      workspace: null,
-      retirement: null,
-      createdAtMs: 0,
-      updatedAtMs: 0,
-    };
+    const placement = patchPlacement(sessionId);
     let executionMode: "worker-turn" | "remote-exec" = "worker-turn";
     const context = {
       workerSessionPlacementService: {

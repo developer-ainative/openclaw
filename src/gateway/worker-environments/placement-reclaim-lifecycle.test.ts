@@ -127,6 +127,11 @@ describe("placement reclaim with provider-owned node teardown", () => {
         };
       });
       transport.invoke = nodeSupport.withWorkspaceDrain(invoke);
+      const releaseCalls = () =>
+        invoke.mock.calls.filter(
+          ([call]) =>
+            (call.params as NodeWorkerWorkspaceExecInput).quiescence?.action === "release",
+        );
       const transfer = nodeSupport.workspaceTransfer();
       transfer.closeAll = vi.fn(async () => {});
       transfer.prepareSync = vi.fn(async () => ({
@@ -231,11 +236,7 @@ describe("placement reclaim with provider-owned node teardown", () => {
       vi.mocked(harness.environments.startTunnel).mockClear();
       // SQLite workers compare cross-thread monotonic deadlines; fake only the provider timer.
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-      const request = {
-        sessionId: active.sessionId,
-        sessionKey: active.sessionKey,
-        agentId: active.agentId,
-      };
+      const request = REQUEST;
       const result = (
         operation === "recovery"
           ? coordinated.reconcileActive()
@@ -260,12 +261,7 @@ describe("placement reclaim with provider-owned node teardown", () => {
           expect(destroy).toHaveBeenCalledOnce();
           expect(tunnels.status(environmentId)).toBe("stopped");
           expect(service.get(environmentId)?.state).toBe("destroyed");
-          expect(
-            invoke.mock.calls.filter(
-              ([call]) =>
-                (call.params as NodeWorkerWorkspaceExecInput).quiescence?.action === "release",
-            ),
-          ).toEqual([]);
+          expect(releaseCalls()).toEqual([]);
           return;
         }
         if (failure === "reconciliation") {
@@ -276,12 +272,7 @@ describe("placement reclaim with provider-owned node teardown", () => {
             state: "draining",
             turnClaim: null,
           });
-          expect(
-            invoke.mock.calls.filter(
-              ([call]) =>
-                (call.params as NodeWorkerWorkspaceExecInput).quiescence?.action === "release",
-            ),
-          ).toHaveLength(1);
+          expect(releaseCalls()).toHaveLength(1);
           await expect(coordinated.reclaim(request)).resolves.toMatchObject({
             state: "reclaimed",
           });
@@ -327,12 +318,7 @@ describe("placement reclaim with provider-owned node teardown", () => {
         expect(service.get(environmentId)?.state).toBe("destroyed");
         expect(destroy).toHaveBeenCalledTimes(2);
         expect(harness.environments.startTunnel).toHaveBeenCalledOnce();
-        expect(
-          invoke.mock.calls.filter(
-            ([call]) =>
-              (call.params as NodeWorkerWorkspaceExecInput).quiescence?.action === "release",
-          ),
-        ).toEqual([]);
+        expect(releaseCalls()).toEqual([]);
       } finally {
         providerPending.resolve();
         vi.useRealTimers();
