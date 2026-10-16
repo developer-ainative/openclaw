@@ -27,72 +27,6 @@ describe("MCP stderr diagnostics", () => {
     logDebug.mockClear();
   });
 
-  it("reports sustained newline-free progress without waiting for an idle gap", () => {
-    vi.useFakeTimers();
-    const probe = createStderrProbe();
-    try {
-      for (let index = 0; index < 3; index++) {
-        probe.stderr.write("loading ");
-        vi.advanceTimersByTime(index === 2 ? 50 : 100);
-      }
-      expect(logDebug.mock.calls).toEqual([["bundle-mcp:probe: stderr output omitted"]]);
-    } finally {
-      probe.detachStderr?.();
-    }
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("keeps incomplete UTF-8 bytes across a progress flush", () => {
-    vi.useFakeTimers();
-    const probe = createStderrProbe();
-    try {
-      const bytes = Buffer.from("loading 你");
-      probe.stderr.write(bytes.subarray(0, -1));
-      vi.advanceTimersByTime(250);
-      expect(logDebug.mock.calls).toEqual([["bundle-mcp:probe: stderr output omitted"]]);
-      probe.stderr.write(bytes.subarray(-1));
-      probe.stderr.write("\n");
-      expect(logDebug.mock.calls).toEqual([
-        ["bundle-mcp:probe: stderr output omitted"],
-        ["bundle-mcp:probe: stderr output omitted"],
-      ]);
-    } finally {
-      probe.detachStderr?.();
-    }
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("reports truncation without copying the UTF-8-safe bounded tail", () => {
-    const probe = createStderrProbe();
-    try {
-      probe.stderr.write(`xx😀${"y".repeat(4000)}`);
-      probe.stderr.write("y".repeat(4189));
-      probe.stderr.write("\n");
-      probe.detachStderr?.();
-      expect(logDebug.mock.calls).toEqual([
-        ["bundle-mcp:probe: [stderr line truncated] stderr output omitted"],
-      ]);
-    } finally {
-      probe.detachStderr?.();
-    }
-  });
-
-  it("omits message and tool content from newline and final stderr records", () => {
-    const probe = createStderrProbe();
-    try {
-      probe.stderr.write("private-message-marker\rprivate-tool-argument-marker\n");
-      probe.stderr.write("private-tool-result-marker");
-      probe.detachStderr?.();
-      expect(logDebug.mock.calls).toEqual([
-        ["bundle-mcp:probe: stderr output omitted"],
-        ["bundle-mcp:probe: stderr output omitted"],
-        ["bundle-mcp:probe: stderr output omitted"],
-      ]);
-    } finally {
-      probe.detachStderr?.();
-    }
-  });
-
   it("keeps diagnostics attached through forced disposal", async () => {
     vi.useFakeTimers();
     const probe = createStderrProbe();
@@ -116,12 +50,12 @@ describe("MCP stderr diagnostics", () => {
     }
   });
 
-  it("reports a real child's unterminated shutdown stderr without copying it", async () => {
+  it("drains a real child's shutdown stderr with one content-free activity notice", async () => {
     const probe = createStderrProbe([
       "-e",
       `process.stdin.resume();
        process.stdin.on("end", () => {
-         const message = Buffer.from("shutdown 你好 private-message-marker private-tool-marker");
+         const message = Buffer.from("shutdown 你好 private-message-marker private-tool-argument-marker private-tool-result-marker");
          process.stderr.write(message.subarray(0, 10));
          setImmediate(() => process.stderr.end(message.subarray(10)));
        });`,
