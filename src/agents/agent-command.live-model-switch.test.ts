@@ -1132,9 +1132,9 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
     state.resolvedSessionKeyMock = undefined;
     state.persistSessionEntryMock.mockImplementation(async (...args: unknown[]) => {
       const params = args[0] as {
-        sessionStore?: Record<string, unknown>;
+        sessionStore?: Record<string, SessionEntry>;
         sessionKey?: string;
-        entry?: unknown;
+        entry?: SessionEntry;
         shouldPersist?: (entry: unknown) => boolean;
       };
       const current =
@@ -1149,6 +1149,7 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
       }
       if (params.sessionStore && params.sessionKey && params.entry) {
         params.sessionStore[params.sessionKey] = params.entry;
+        (state.sessionStoreMock ??= params.sessionStore)[params.sessionKey] = params.entry;
         return params.entry;
       }
       return current;
