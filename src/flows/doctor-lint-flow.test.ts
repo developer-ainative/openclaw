@@ -38,40 +38,37 @@ describe("runDoctorLintChecks", () => {
       onlyIds: ["a"],
     });
 
-    expect(result.checksRun).toBe(1);
-    expect(result.checksSkipped).toBe(1);
+    expect(result).toMatchObject({ checksRun: 1, checksSkipped: 1 });
     expect(result.findings.map((finding) => finding.checkId)).toEqual(["a"]);
   });
 
   it("reports conflicting selectors for a registered health check", async () => {
-    const checkId = "plugin/example/critical";
+    const ids = ["plugin/example/first", "plugin/example/second"];
     let detections = 0;
     const existingChecks = listHealthChecks();
-    registerHealthCheck(
-      check(checkId, async () => {
-        detections += 1;
-        return [{ checkId, severity: "error", message: "critical failure" }];
-      }),
-    );
+    for (const id of ids) {
+      registerHealthCheck(
+        check(id, async () => {
+          detections += 1;
+          return [{ checkId: id, severity: "error", message: "critical failure" }];
+        }),
+      );
+    }
 
     try {
-      const selectors = new Set([checkId]);
-      const result = await runDoctorLintChecks(ctx, {
-        onlyIds: selectors,
-        skipIds: selectors,
-      });
+      const selectors = new Set(ids);
+      const result = await runDoctorLintChecks(ctx, { onlyIds: selectors, skipIds: selectors });
 
       expect(detections).toBe(0);
-      expect(result.checksRun).toBe(0);
-      expect(result.checksSkipped).toBe(1);
-      expect(result.findings).toEqual([
-        {
+      expect(result).toMatchObject({ checksRun: 0, checksSkipped: 2 });
+      expect(result.findings).toEqual(
+        ids.map((id) => ({
           checkId: "core/doctor/lint-selection",
           severity: "error",
-          message: `Health check ${checkId} cannot be selected by --only and excluded by --skip.`,
-          path: checkId,
-        },
-      ]);
+          message: `Health check ${id} cannot be selected by --only and excluded by --skip.`,
+          path: id,
+        })),
+      );
       expect(exitCodeFromFindings(result.findings)).toBe(1);
     } finally {
       clearHealthChecksForTest();
@@ -79,27 +76,6 @@ describe("runDoctorLintChecks", () => {
         registerHealthCheck(existingCheck);
       }
     }
-  });
-
-  it("retains every overlap diagnostic when exclusion removes all selected checks", async () => {
-    const ids = ["plugin/example/first", "plugin/example/second"];
-    const result = await runDoctorLintChecks(ctx, {
-      checks: ids.map((id) => check(id, async () => [])),
-      onlyIds: ids,
-      skipIds: ids,
-    });
-
-    expect(result.checksRun).toBe(0);
-    expect(result.checksSkipped).toBe(2);
-    expect(result.findings).toEqual(
-      ids.map((id) => ({
-        checkId: "core/doctor/lint-selection",
-        severity: "error",
-        message: `Health check ${id} cannot be selected by --only and excluded by --skip.`,
-        path: id,
-      })),
-    );
-    expect(exitCodeFromFindings(result.findings)).toBe(1);
   });
 
   it("keeps unknown-only diagnostics without treating partial overlap as an error", async () => {
@@ -118,8 +94,7 @@ describe("runDoctorLintChecks", () => {
       skipIds: [skippedId, "plugin/future/ignored"],
     });
 
-    expect(result.checksRun).toBe(1);
-    expect(result.checksSkipped).toBe(1);
+    expect(result).toMatchObject({ checksRun: 1, checksSkipped: 1 });
     expect(detections).toEqual([selectedId]);
     expect(result.findings).toEqual([
       {
@@ -163,12 +138,11 @@ describe("runDoctorLintChecks", () => {
     expect(exitCodeFromFindings(result.findings)).toBe(0);
   });
 
-  it.each([
-    new OpenClawStateLeaseAcquisitionError("state lease fixture", {
+  it("retains held-lease failures as errors", async () => {
+    const error = new OpenClawStateLeaseAcquisitionError("state lease fixture", {
       kind: "held",
       holder: { owner: "another-owner", epoch: 1 },
-    }),
-  ])("retains ordinary, operation and storage failures as errors: %s", async (error) => {
+    });
     const result = await runDoctorLintChecks(ctx, {
       checks: [
         check("boom", async () => {

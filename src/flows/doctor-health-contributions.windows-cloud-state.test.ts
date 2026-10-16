@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -211,8 +210,7 @@ describe.skipIf(process.platform !== "win32")("Doctor native Windows OneDrive fl
         { ...ctx, mode: "fix", dryRun: true },
         { checks, dryRun: true },
       );
-      expect(repair.warnings).toEqual([]);
-      expect(repair.changes).toEqual([]);
+      expect(repair).toMatchObject({ warnings: [], changes: [] });
       expect(repair.config).toEqual(cfg);
       expect(
         repair.effects.filter((effect) => effect.action === "would-recommend-moving-state-dir"),
@@ -229,39 +227,11 @@ describe.skipIf(process.platform !== "win32")("Doctor native Windows OneDrive fl
           : [],
       );
       const after = readPreservedFiles(preservedFiles, sqliteShmFiles);
-      assert.equal(after.length, before.length, `${placement}: snapshot file count`);
-      for (const [index, expected] of before.entries()) {
-        const label = `${placement}: ${path.relative(home, expected.file)}`;
-        const actual = after[index];
-        assert.ok(actual, `${label}: missing snapshot`);
-        assert.equal(actual.file === expected.file, true, `${label}: file`);
-        assert.equal(actual.exists, expected.exists, `${label}: exists`);
-        assert.equal(actual.mode, expected.mode, `${label}: mode`);
-        assert.equal(actual.size, expected.size, `${label}: size`);
-        assert.equal(
-          actual.bytes === undefined,
-          expected.bytes === undefined,
-          `${label}: bytes present`,
-        );
-        if (actual.bytes !== undefined && expected.bytes !== undefined) {
-          if (!actual.bytes.equals(expected.bytes)) {
-            let offset = 0;
-            const limit = Math.min(actual.bytes.length, expected.bytes.length);
-            while (offset < limit && actual.bytes[offset] === expected.bytes[offset]) {
-              offset += 1;
-            }
-            assert.fail(
-              `${label}: bytes ${JSON.stringify({
-                expectedLength: expected.bytes.length,
-                actualLength: actual.bytes.length,
-                expectedSha256: createHash("sha256").update(expected.bytes).digest("hex"),
-                actualSha256: createHash("sha256").update(actual.bytes).digest("hex"),
-                firstDifferentOffset: offset,
-              })}`,
-            );
-          }
-        }
-      }
+      assert.deepStrictEqual(
+        after,
+        before,
+        `${placement}: files, modes, sizes and bytes preserved`,
+      );
       expect(cfg).toEqual({ agents: { entries: { main: {} } } });
       expect(env[cloudVariable]).toBe(placement === "ambient-env-only" ? undefined : cloudRoot);
       expect(fs.existsSync(stateDir)).toBe(!missing);

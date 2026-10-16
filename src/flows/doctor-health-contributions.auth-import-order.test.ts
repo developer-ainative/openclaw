@@ -24,6 +24,7 @@ import {
 } from "../test-utils/openclaw-test-state.js";
 import {
   createDoctorHealthFlowContext,
+  createDoctorPrompterFixture,
   resolveDoctorHealthContributions,
 } from "./doctor-health-contributions.test-support.js";
 
@@ -53,20 +54,16 @@ const { recordAuthProfileMigrationImported } = (globalThis as Record<PropertyKey
 };
 
 function makePrompter(shouldRepair: boolean): DoctorPrompter {
+  const prompter = createDoctorPrompterFixture(false);
   return {
-    confirm: vi.fn(async () => false),
+    ...prompter,
     confirmAutoFix: vi.fn(async () => shouldRepair),
-    confirmAggressiveAutoFix: vi.fn(async () => false),
-    confirmRuntimeRepair: vi.fn(async () => false),
-    select: vi.fn(async (_params, fallback) => fallback),
     shouldRepair,
-    shouldForce: false,
     repairMode: {
+      ...prompter.repairMode,
       shouldRepair,
-      shouldForce: false,
       nonInteractive: false,
       canPrompt: true,
-      updateInProgress: false,
     },
   };
 }
@@ -75,14 +72,8 @@ function makeLegacyConfig(): OpenClawConfig {
   return {
     auth: {
       profiles: {
-        "openai:bravo": {
-          provider: "openai",
-          mode: "api_key",
-        },
-        "openai-codex:bravo": {
-          provider: "openai-codex",
-          mode: "oauth",
-        },
+        "openai:bravo": { provider: "openai", mode: "api_key" },
+        "openai-codex:bravo": { provider: "openai-codex", mode: "oauth" },
       },
       order: { "openai-codex": ["openai-codex:bravo"] },
     },
@@ -117,11 +108,7 @@ async function writeLegacyCredentialStore(state: OpenClawTestState): Promise<str
     `${JSON.stringify({
       version: 1,
       profiles: {
-        "openai:bravo": {
-          type: "api_key",
-          provider: "openai",
-          key: "existing-key",
-        },
+        "openai:bravo": { type: "api_key", provider: "openai", key: "existing-key" },
         "openai-codex:bravo": {
           type: "oauth",
           provider: "openai-codex",
