@@ -2,25 +2,9 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, test } from "vitest";
-import {
-  checkChangelogLayout,
-  findChangelogSection,
-  findReleaseChangelog,
-  isReleaseChangelogPath,
-  loadChangelogCollection,
-  loadReleaseChangelog,
-  splitChangelog,
-  writeReleaseChangelog,
-} from "../../scripts/lib/release-changelog.mjs";
-import {
-  checkReleaseDocsMirrors,
-  flattenReleaseDocs,
-  parseReleaseDocsMirror,
-  releaseDocsNavigation,
-  renderReleaseDocsMirror,
-} from "../../scripts/lib/release-docs-mirror.mjs";
+import * as changelog from "../../scripts/lib/release-changelog.mjs";
+import * as docs from "../../scripts/lib/release-docs-mirror.mjs";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -29,24 +13,24 @@ const current =
 const old = "## 2026.8.1\n\nOld notes without a contribution record.\n";
 const entry = "CHANGELOG/2026.9.4.md";
 const recordFile = "CHANGELOG/records/2026.9.4.md";
-function files() {
+function fixture(content: string | null = `# Changelog\n\n${current}${old}`, split = false) {
   const rootDir = tempDirs.make("release-changelog-test-");
   const file = (name: string) => path.join(rootDir, name);
-  return {
+  const f = {
     rootDir,
     file,
     read: (name: string) => fs.readFileSync(file(name), "utf8"),
     write: (name: string, text: string) => fs.writeFileSync(file(name), text),
-    load: (version = "2026.9.4", ref?: string) => loadReleaseChangelog({ rootDir, version, ref }),
+    load: (version = "2026.9.4", ref?: string) =>
+      changelog.loadReleaseChangelog({ rootDir, version, ref }),
     save: (section: string, version = "2026.9.4") =>
-      writeReleaseChangelog({ rootDir, version, section }),
+      changelog.writeReleaseChangelog({ rootDir, version, section }),
   };
-}
-function fixture(content = `# Changelog\n\n${current}${old}`, split = false) {
-  const f = files();
-  f.write("CHANGELOG.md", content);
+  if (content !== null) {
+    f.write("CHANGELOG.md", content);
+  }
   if (split) {
-    splitChangelog(f);
+    changelog.splitChangelog(f);
   }
   return f;
 }
@@ -55,9 +39,9 @@ test("mechanical split preserves every section and authentic record, including C
   for (const section of [current, current.replaceAll("\n", "\r\n")]) {
     const f = fixture(`# Changelog\n\n${section}${old}`);
     const before = f.read("CHANGELOG.md");
-    assert.deepEqual(splitChangelog({ ...f, check: true }), counts);
+    assert.deepEqual(changelog.splitChangelog({ ...f, check: true }), counts);
     assert.equal(f.read("CHANGELOG.md"), before);
-    splitChangelog(f);
+    changelog.splitChangelog(f);
     const release = f.load("v2026.9.4");
     assert.equal(release.section, section);
     assert.equal(
@@ -65,7 +49,7 @@ test("mechanical split preserves every section and authentic record, including C
       section.slice(section.indexOf("### Complete")),
     );
     assert.equal(f.load("2026.8.1").record, null);
-    assert.deepEqual(checkChangelogLayout(f), { releases: 2, records: 1 });
+    assert.deepEqual(changelog.checkChangelogLayout(f), { releases: 2, records: 1 });
   }
 });
 
@@ -81,7 +65,7 @@ test("legacy and split immutable Git reads are independent of working-tree chang
   git("add", "CHANGELOG.md");
   git("commit", "-qm", "legacy");
   const legacy = git("rev-parse", "HEAD");
-  splitChangelog(f);
+  changelog.splitChangelog(f);
   git("add", "CHANGELOG.md", "CHANGELOG");
   git("commit", "-qm", "split");
   const split = git("rev-parse", "HEAD");
@@ -94,20 +78,19 @@ test("legacy and split immutable Git reads are independent of working-tree chang
 test("duplicate historical sections are retained together but never silently selected", () => {
   const f = fixture(`# Changelog\n\n${old}${old}`);
   assert.throws(() => f.load("2026.8.1"), /Ambiguous/u);
-  assert.equal(splitChangelog(f).duplicates, 1);
+  assert.equal(changelog.splitChangelog(f).duplicates, 1);
   assert.equal(f.read("CHANGELOG/2026.8.1.md"), old + old);
-  assert.equal((loadChangelogCollection(f).match(/^## /gmu) ?? []).length, 2);
-  assert.throws(() => findReleaseChangelog({ ...f, version: "2026.8.1" }), /Ambiguous/u);
+  assert.equal((changelog.loadChangelogCollection(f).match(/^## /gmu) ?? []).length, 2);
+  assert.throws(() => changelog.findReleaseChangelog({ ...f, version: "2026.8.1" }), /Ambiguous/u);
   assert.throws(() => f.save(old, "2026.8.1"), /Ambiguous/u);
-  checkChangelogLayout(f);
+  changelog.checkChangelogLayout(f);
 });
 
 test("initial generation updates its record, protects mirrors and refuses legacy writes", () => {
   const f = fixture();
   assert.throws(() => f.save(current), /require split/u);
-  splitChangelog(f);
-  const updated = current.replace("PR #12", "PR #13");
-  f.save(updated);
+  changelog.splitChangelog(f);
+  f.save(current.replace("PR #12", "PR #13"));
   assert.match(f.load().record ?? "", /PR #13/u);
   assert.equal(f.read("CHANGELOG/2026.8.1.md"), old);
   const frozenRecord = f.read(recordFile);
@@ -116,7 +99,7 @@ test("initial generation updates its record, protects mirrors and refuses legacy
     '<!-- openclaw-docs-mirror-v1 {"version":"2026.9.4"} -->\n## 2026.9.4\n\nDocs prose.\n',
   );
   assert.equal(f.load().format, "docs-mirror");
-  checkChangelogLayout(f);
+  changelog.checkChangelogLayout(f);
   assert.throws(() => f.save(current), /cannot overwrite/u);
   assert.equal(f.read(recordFile), frozenRecord);
 });
@@ -136,66 +119,65 @@ test("missing entries, conflicts, path traversal and symlinks fail at the owner"
     const damaged = fixture(undefined, true);
     damage(damaged, damaged.read(recordFile));
     assert.throws(
-      () => loadChangelogCollection({ ...damaged, recordsOnly: true }),
+      () => changelog.loadChangelogCollection({ ...damaged, recordsOnly: true }),
       /contribution record|Contribution record|mismatched/u,
     );
   }
   const f = fixture(undefined, true);
-  assert.equal(findReleaseChangelog({ ...f, version: "2026.1.1" }), null);
+  assert.equal(changelog.findReleaseChangelog({ ...f, version: "2026.1.1" }), null);
   assert.throws(() => f.load("2026.1.1"), /Missing/u);
   assert.throws(() => f.load("../2026.9.4"), /Invalid/u);
   f.write("CHANGELOG.md", current);
   assert.throws(() => f.load(), /Conflicting/u);
   f.write("CHANGELOG.md", "# Changelog\n");
   fs.symlinkSync(f.file("CHANGELOG.md"), f.file("CHANGELOG/2026.1.1.md"));
-  assert.throws(() => findReleaseChangelog({ ...f, version: "2026.9.4" }), /symlink/u);
+  assert.throws(() => changelog.findReleaseChangelog({ ...f, version: "2026.9.4" }), /symlink/u);
 });
 
 test("Unreleased fallback and path classification preserve candidate boundaries", () => {
   const section = "## 2026.9.5 (Unreleased)\n\nUpcoming notes.\n";
   const f = fixture(`# Changelog\n\n${section}${old}`);
-  assert.equal(findChangelogSection(section, "Unreleased"), section);
-  splitChangelog(f);
+  assert.equal(changelog.findChangelogSection(section, "Unreleased"), section);
+  changelog.splitChangelog(f);
   assert.equal(f.load("Unreleased").version, "2026.9.5");
-  assert.equal(isReleaseChangelogPath(recordFile, { version: "v2026.9.4" }), true);
-  assert.equal(isReleaseChangelogPath("CHANGELOG/2026.9.3.md", { version: "2026.9.4" }), false);
-  assert.equal(isReleaseChangelogPath("CHANGELOG/arbitrary.md"), false);
+  assert.equal(changelog.isReleaseChangelogPath(recordFile, { version: "v2026.9.4" }), true);
+  assert.equal(
+    changelog.isReleaseChangelogPath("CHANGELOG/2026.9.3.md", { version: "2026.9.4" }),
+    false,
+  );
+  assert.equal(changelog.isReleaseChangelogPath("CHANGELOG/arbitrary.md"), false);
 });
 
 describe("release docs mirrors", () => {
-  const mirrorCli = fileURLToPath(
-    new URL("../../scripts/render-release-changelog.mjs", import.meta.url),
-  );
+  const mirrorCli = path.join(import.meta.dirname, "../../scripts/render-release-changelog.mjs");
   const version = "2026.9.4";
   const source = `docs/releases/${version}.md`;
 
   function mirrorFixture() {
-    const f = files();
+    const f = fixture(null);
     for (const dir of ["docs/releases", "CHANGELOG/records"]) {
       fs.mkdirSync(f.file(dir), { recursive: true });
     }
     f.write(
       source,
-      `---\ntitle: "Release title"\n---\n\n# Release title\n\n${releaseDocsNavigation(version).docs}\n\nExact prose.\n`,
+      `---\ntitle: "Release title"\n---\n\n# Release title\n\n${docs.releaseDocsNavigation(version).docs}\n\nExact prose.\n`,
     );
     const options = { ...f, version, sources: [source] };
+    const command = [mirrorCli, "--root", f.rootDir];
     return {
       ...options,
-      render: (sources = options.sources) => renderReleaseDocsMirror({ ...options, sources }),
-      check: () => checkReleaseDocsMirrors(options),
+      render: (sources = options.sources) => docs.renderReleaseDocsMirror({ ...options, sources }),
+      check: () => docs.checkReleaseDocsMirrors(options),
       cli: (...args: string[]) =>
-        spawnSync(process.execPath, [mirrorCli, "--root", f.rootDir, ...args], {
-          encoding: "utf8",
-        }),
+        spawnSync(process.execPath, [...command, ...args], { encoding: "utf8" }),
     };
   }
 
   it("retains prose, credits, tables, images and code while flattening wrappers and links", () => {
-    const code = '```md\n<Accordion title="example">\n[local](/do-not-change)\n```';
     const preserved = [
       "- Exact credit [#42](https://github.com/openclaw/openclaw/pull/42). Thanks @alice, @steipete.",
       "| A | B |\n| --- | --- |\n| exact | cells |",
-      code,
+      '```md\n<Accordion title="example">\n[local](/do-not-change)\n```',
       "`<Widget> [inline](/unchanged)` and `<Note>\n[split](/unchanged) </Note>`.",
     ];
     const input = [
@@ -210,7 +192,7 @@ describe("release docs mirrors", () => {
       "</details>\n</Accordion>\n</AccordionGroup>\n<Warning>\nKeep the warning.\n</Warning>\n",
       '[ref]: /install/node "Keep title"',
     ];
-    const result = flattenReleaseDocs(input.join("\n"), source);
+    const result = docs.flattenReleaseDocs(input.join("\n"), source);
     for (const text of [
       ...preserved,
       "##### Keep **this** wording",
@@ -235,14 +217,14 @@ describe("release docs mirrors", () => {
     expect(result).toContain("[Part](https://docs.openclaw.ai/releases/part) - Exact navigation.");
     expect(result.indexOf("### Landing")).toBeLessThan(result.indexOf("### Part"));
     expect(result).toContain("Final complete list.");
-    const metadata = parseReleaseDocsMirror(result);
+    const metadata = docs.parseReleaseDocsMirror(result);
+    const digest = metadata?.sourceDigest;
     expect(metadata?.sources).toEqual([source, other]);
     const reversed = f.render([other, source]);
-    expect(parseReleaseDocsMirror(reversed)?.sourceDigest).not.toEqual(metadata?.sourceDigest);
+    expect(docs.parseReleaseDocsMirror(reversed)?.sourceDigest).not.toEqual(digest);
     fs.appendFileSync(f.file(source), "\n");
-    expect(parseReleaseDocsMirror(f.render([source, other]))?.sourceDigest).not.toEqual(
-      metadata?.sourceDigest,
-    );
+    const changed = f.render([source, other]);
+    expect(docs.parseReleaseDocsMirror(changed)?.sourceDigest).not.toEqual(digest);
   });
 
   it("checks only marked entries and rejects byte drift, invalid markers and missing sources", () => {
@@ -270,7 +252,7 @@ describe("release docs mirrors", () => {
       "</details>",
       '<Note title="custom text">\nBody\n</Note>',
     ]) {
-      expect(() => flattenReleaseDocs(`# Title\n\n${body}`, source)).toThrow();
+      expect(() => docs.flattenReleaseDocs(`# Title\n\n${body}`, source)).toThrow();
     }
     fs.symlinkSync(f.file("../outside.md"), f.file("docs/escape.md"));
     expect(() => f.render(["docs/escape.md"])).toThrow();
