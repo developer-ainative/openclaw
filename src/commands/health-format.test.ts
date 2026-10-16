@@ -51,6 +51,28 @@ const createHealthSummary = (
   ...params,
 });
 
+const channelSummary = (id: string, label: string, account: ChannelAccountHealthSummary) =>
+  createHealthSummary({
+    channels: { [id]: account },
+    channelOrder: [id],
+    channelLabels: { [id]: label },
+  });
+const telegramAccount = (accountId: string, username: string, elapsedMs: number) => ({
+  accountId,
+  configured: true,
+  probe: { ok: true, elapsedMs, bot: { username } },
+});
+const ingressPressure = (channelId: string, accountId: string, overrides = {}) => ({
+  channelId,
+  accountId,
+  laneCount: 1,
+  pendingCount: 56,
+  claimedCount: 0,
+  blockedCount: 55,
+  oldestReceivedAt: 90_000,
+  ...overrides,
+});
+
 function createMultiAccountHealthSummary(
   secondary: Partial<ChannelAccountHealthSummary>,
   primaryOverrides: Partial<ChannelAccountHealthSummary> = {},
@@ -71,68 +93,34 @@ function createMultiAccountHealthSummary(
     linked: true,
     ...secondary,
   };
-  return createHealthSummary({
-    channels: {
-      matrix: {
-        ...primary,
-        accounts: {
-          [primary.accountId]: primary,
-          [secondaryAccount.accountId]: secondaryAccount,
-        },
-      },
-    },
-    channelOrder: ["matrix"],
-    channelLabels: { matrix: "Matrix" },
+  return channelSummary("matrix", "Matrix", {
+    ...primary,
+    accounts: { [primary.accountId]: primary, [secondaryAccount.accountId]: secondaryAccount },
   });
 }
 
 describe("formatHealthChannelLines", () => {
   it("keeps the named startup error after removing terminal controls", () => {
     const error = "Legacy exec approvals exist at /tmp/synthetic/exec-approvals.json.";
-    const summary = createHealthSummary({
-      channels: {
-        telegram: {
-          accountId: "default",
-          configured: true,
-          running: false,
-          healthState: "not-running",
-          lastError: `\u001b[31m${error}\u001b[0m\n`,
-        },
-      },
-      channelOrder: ["telegram"],
-      channelLabels: { telegram: "Telegram" },
+    const summary = channelSummary("telegram", "Telegram", {
+      accountId: "default",
+      configured: true,
+      running: false,
+      healthState: "not-running",
+      lastError: `\u001b[31m${error}\u001b[0m\n`,
     });
     expect(formatHealthChannelLines(summary)).toEqual([`Telegram: not-running (${error}\\n)`]);
   });
 
   it("formats per-account probe timings", () => {
-    const summary = createHealthSummary({
-      channels: {
-        telegram: {
-          accountId: "main",
-          configured: true,
-          probe: { ok: true, elapsedMs: 196, bot: { username: "pinguini_ugi_bot" } },
-          accounts: {
-            main: {
-              accountId: "main",
-              configured: true,
-              probe: { ok: true, elapsedMs: 196, bot: { username: "pinguini_ugi_bot" } },
-            },
-            flurry: {
-              accountId: "flurry",
-              configured: true,
-              probe: { ok: true, elapsedMs: 190, bot: { username: "flurry_ugi_bot" } },
-            },
-            poe: {
-              accountId: "poe",
-              configured: true,
-              probe: { ok: true, elapsedMs: 188, bot: { username: "poe_ugi_bot" } },
-            },
-          },
-        },
+    const main = telegramAccount("main", "pinguini_ugi_bot", 196);
+    const summary = channelSummary("telegram", "Telegram", {
+      ...main,
+      accounts: {
+        main,
+        flurry: telegramAccount("flurry", "flurry_ugi_bot", 190),
+        poe: telegramAccount("poe", "poe_ugi_bot", 188),
       },
-      channelOrder: ["telegram"],
-      channelLabels: { telegram: "Telegram" },
     });
 
     expect(formatHealthChannelLines(summary, { accountMode: "all" })).toStrictEqual([
@@ -158,33 +146,26 @@ describe("formatHealthChannelLines", () => {
     ],
     ["passive healthy state without a probe", { healthState: "healthy" }, "healthy"],
   ])("formats %s", (_name, account, expected) => {
-    const summary = createHealthSummary({
-      channels: {
-        test: {
-          accountId: "default",
-          configured: true,
-          ...account,
-        },
-      },
-      channelOrder: ["test"],
-      channelLabels: { test: "Test" },
+    const summary = channelSummary("test", "Test", {
+      accountId: "default",
+      configured: true,
+      ...account,
     });
 
     expect(formatHealthChannelLines(summary)).toStrictEqual([`Test: ${expected}`]);
   });
 
-  it.each([["auth stabilizing", { healthState: "healthy", statusState: "unstable" }]])(
-    "surfaces secondary account state %s in default and verbose health output",
-    (expected, state) => {
-      const summary = createMultiAccountHealthSummary(state);
-
-      for (const accountMode of ["default", "all"] as const) {
-        expect(formatHealthChannelLines(summary, { accountMode })).toStrictEqual([
-          `Matrix: ${expected}`,
-        ]);
-      }
-    },
-  );
+  it("surfaces secondary auth stabilization in default and verbose health output", () => {
+    const summary = createMultiAccountHealthSummary({
+      healthState: "healthy",
+      statusState: "unstable",
+    });
+    for (const accountMode of ["default", "all"] as const) {
+      expect(formatHealthChannelLines(summary, { accountMode })).toStrictEqual([
+        "Matrix: auth stabilizing",
+      ]);
+    }
+  });
 
   it.each([
     {
@@ -259,21 +240,18 @@ describe("formatHealthChannelLines", () => {
     ]);
   });
 
-  it.each([["disabled", { enabled: false }]])(
-    "does not promote stale failures from an intentionally %s account",
-    (_reason, inactive) => {
-      const summary = createMultiAccountHealthSummary({
-        healthState: "blocked",
-        probe: { ok: false, error: "stale old failure" },
-        ...inactive,
-      });
+  it("does not promote stale failures from an intentionally disabled account", () => {
+    const summary = createMultiAccountHealthSummary({
+      healthState: "blocked",
+      probe: { ok: false, error: "stale old failure" },
+      enabled: false,
+    });
 
-      expect(formatHealthChannelLines(summary)).toStrictEqual(["Matrix: ok (12ms)"]);
-      expect(formatHealthChannelLines(summary, { accountMode: "all" })).toStrictEqual([
-        "Matrix: ok (main:main:12ms)",
-      ]);
-    },
-  );
+    expect(formatHealthChannelLines(summary)).toStrictEqual(["Matrix: ok (12ms)"]);
+    expect(formatHealthChannelLines(summary, { accountMode: "all" })).toStrictEqual([
+      "Matrix: ok (main:main:12ms)",
+    ]);
+  });
 
   it("surfaces a failed sibling probe over the selected account's passive healthy state", () => {
     const summary = createMultiAccountHealthSummary({
@@ -317,7 +295,7 @@ describe("formatHealthChannelLines", () => {
   });
 
   it("bounds combined plugin warnings without counting hidden errors", () => {
-    const summary = createHealthSummary({ channels: {}, channelOrder: [], channelLabels: {} });
+    const summary = createHealthSummary();
     summary.plugins = {
       loaded: [],
       errors: [
@@ -381,17 +359,7 @@ describe("formatDeliveryQueueHealthLine", () => {
     const summary = createHealthSummary();
     summary.deliveryQueues = {
       failed: [],
-      ingressPressure: [
-        {
-          channelId: "telegram",
-          accountId: "ops",
-          laneCount: 1,
-          pendingCount: 56,
-          claimedCount: 0,
-          blockedCount: 55,
-          oldestReceivedAt: 90_000,
-        },
-      ],
+      ingressPressure: [ingressPressure("telegram", "ops")],
     };
 
     expect(formatDeliveryQueueHealthLine(summary, 7_290_000)).toBe(
@@ -404,15 +372,13 @@ describe("formatDeliveryQueueHealthLine", () => {
     summary.deliveryQueues = {
       failed: [{ queueName: "outbound", count: 2, oldestFailedAt: 90_000 }],
       ingressPressure: [
-        {
-          channelId: "line",
-          accountId: "default",
+        ingressPressure("line", "default", {
           laneCount: 2,
           pendingCount: 3,
           claimedCount: 1,
           blockedCount: 2,
           oldestReceivedAt: 3_690_000,
-        },
+        }),
       ],
     };
 

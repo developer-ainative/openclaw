@@ -1,4 +1,3 @@
-// Health command tests cover gateway health probes, JSON output, and status formatting.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../cli/daemon-cli/diagnostic-readiness.js", () => ({
@@ -23,6 +22,9 @@ import { healthCommand, healthCommandNonExiting } from "./health.js";
 import { createTestRuntime } from "./test-runtime-config-helpers.js";
 
 const runtime = createTestRuntime();
+const textOutput = () => stripAnsi(runtime.log.mock.calls.map(([line]) => String(line)).join("\n"));
+const runHealth = (options: Parameters<typeof healthCommand>[0] = {}) =>
+  healthCommand({ json: false, timeoutMs: 5000, config: {}, ...options }, runtime);
 
 const defaultSessions: HealthSummary["sessions"] = {
   path: "/tmp/sessions.json",
@@ -45,27 +47,35 @@ const createMainAgentSummary = (sessions = defaultSessions) => ({
 });
 
 const createHealthSummary = (
-  params: {
-    channels: HealthSummary["channels"];
-    channelOrder: string[];
-    channelLabels: HealthSummary["channelLabels"];
-    sessions?: HealthSummary["sessions"];
-  } = { channels: {}, channelOrder: [], channelLabels: {} },
+  params: Partial<
+    Pick<HealthSummary, "channels" | "channelOrder" | "channelLabels" | "sessions">
+  > = {},
 ): HealthSummary => {
   const sessions = params.sessions ?? defaultSessions;
   return {
     ok: true,
     ts: Date.now(),
     durationMs: 5,
-    channels: params.channels,
-    channelOrder: params.channelOrder,
-    channelLabels: params.channelLabels,
+    channels: {},
+    channelOrder: [],
+    channelLabels: {},
     heartbeatSeconds: 60,
     defaultAgentId: "main",
     agents: [createMainAgentSummary(sessions)],
     sessions,
+    ...params,
   };
 };
+
+const channelFixture = (elapsedMs: number, authAgeMs: number) => ({
+  channels: {
+    whatsapp: { accountId: "default", linked: true, authAgeMs },
+    telegram: { accountId: "default", configured: true, probe: { ok: true, elapsedMs } },
+    discord: { accountId: "default", configured: false },
+  },
+  channelOrder: ["whatsapp", "telegram", "discord"],
+  channelLabels: { whatsapp: "WhatsApp", telegram: "Telegram", discord: "Discord" },
+});
 
 const callGatewayMock = vi.fn();
 const listReadOnlyChannelPluginsForConfigMock = vi.fn(
@@ -121,11 +131,7 @@ vi.mock("../channels/plugins/read-only.js", () => ({
 }));
 
 function requireFirstRuntimeLog(): string {
-  const [call] = runtime.log.mock.calls;
-  if (!call) {
-    throw new Error("expected health command log output");
-  }
-  const [message] = call;
+  const message = runtime.log.mock.calls[0]?.[0];
   if (typeof message !== "string") {
     throw new Error("expected health command log output");
   }
@@ -166,21 +172,7 @@ describe("healthCommand", () => {
       recent: [{ key: "+1555", updatedAt: Date.now(), age: 0 }],
     };
     const snapshot = createHealthSummary({
-      channels: {
-        whatsapp: { accountId: "default", linked: true, authAgeMs: 5000 },
-        telegram: {
-          accountId: "default",
-          configured: true,
-          probe: { ok: true, elapsedMs: 1 },
-        },
-        discord: { accountId: "default", configured: false },
-      },
-      channelOrder: ["whatsapp", "telegram", "discord"],
-      channelLabels: {
-        whatsapp: "WhatsApp",
-        telegram: "Telegram",
-        discord: "Discord",
-      },
+      ...channelFixture(1, 5000),
       sessions: agentSessions,
     });
     snapshot.plugins = {
@@ -223,7 +215,7 @@ describe("healthCommand", () => {
     const original = structuredClone(snapshot);
     callGatewayMock.mockResolvedValueOnce(snapshot);
 
-    await healthCommand({ json: true, timeoutMs: 5000, config: {} }, runtime);
+    await runHealth({ json: true });
 
     expect(callGatewayMock).toHaveBeenCalledWith(
       expect.objectContaining({ method: "health", sharedStateMode: "read-only" }),
@@ -238,9 +230,9 @@ describe("healthCommand", () => {
 
     runtime.log.mockClear();
     callGatewayMock.mockResolvedValueOnce(snapshot);
-    await healthCommand({ json: false, timeoutMs: 5000, config: {} }, runtime);
+    await runHealth();
 
-    const output = stripAnsi(runtime.log.mock.calls.map((call) => String(call[0])).join("\n"));
+    const output = textOutput();
     expect(output).toContain("Gateway check duration: 5ms");
     expect(output).toContain(`Session store (main): ${parsed.sessions.path}`);
     expect(output).toContain(
@@ -254,22 +246,19 @@ describe("healthCommand", () => {
     );
   });
 
-  it.each([{ everyMs: 691_265_001, expected: "1w 1d 1m 5s 1ms" }])(
-    "preserves configured duration precision in heartbeat: $everyMs ms",
-    async ({ everyMs, expected }) => {
-      const snapshot = createHealthSummary();
-      const agent = createMainAgentSummary();
-      agent.heartbeat = { ...agent.heartbeat, every: `${everyMs}ms`, everyMs };
-      snapshot.agents = [agent];
-      snapshot.heartbeatSeconds = Math.round(everyMs / 1_000);
-      callGatewayMock.mockResolvedValueOnce(snapshot);
+  it("preserves configured duration precision in heartbeat", async () => {
+    const everyMs = 691_265_001;
+    const snapshot = createHealthSummary();
+    const agent = createMainAgentSummary();
+    agent.heartbeat = { ...agent.heartbeat, every: `${everyMs}ms`, everyMs };
+    snapshot.agents = [agent];
+    snapshot.heartbeatSeconds = Math.round(everyMs / 1_000);
+    callGatewayMock.mockResolvedValueOnce(snapshot);
 
-      await healthCommand({ json: false, timeoutMs: 1000, config: {} }, runtime);
+    await runHealth({ timeoutMs: 1000 });
 
-      const output = stripAnsi(runtime.log.mock.calls.map((call) => String(call[0])).join("\n"));
-      expect(output).toContain(`Heartbeat interval: ${expected} (main)`);
-    },
-  );
+    expect(textOutput()).toContain("Heartbeat interval: 1w 1d 1m 5s 1ms (main)");
+  });
 
   it.each([
     { configured: undefined, available: false },
@@ -313,7 +302,7 @@ describe("healthCommand", () => {
 
       await healthCommand({ config: { diagnostics: { flags: ["health"] } } }, runtime);
 
-      const output = stripAnsi(runtime.log.mock.calls.map((call) => String(call[0])).join("\n"));
+      const output = textOutput();
       expect(output).toContain(`configured=${configured ?? "unknown"} tokenSource=secretref`);
       if (available) {
         expect(logSelfId).toHaveBeenCalledWith(expect.objectContaining({ account }));
@@ -357,9 +346,9 @@ describe("healthCommand", () => {
       { id: "matrix", config: { listAccountIds: () => ["main", "alerts"] } },
     ]);
 
-    await healthCommand({ json: false, timeoutMs: 1000, config: {} }, runtime);
+    await runHealth({ timeoutMs: 1000 });
 
-    const output = stripAnsi(runtime.log.mock.calls.map((call) => String(call[0])).join("\n"));
+    const output = textOutput();
     expect(output).toContain("Matrix: blocked");
     expect(output).not.toContain("Matrix: ok");
   });
@@ -396,7 +385,7 @@ describe("healthCommand", () => {
         runtime,
       );
 
-      const output = stripAnsi(runtime.log.mock.calls.map((call) => String(call[0])).join("\n"));
+      const output = textOutput();
       expect(output).toContain(
         `Session store (alpha): ${storePath} (2 entries)\n- agent:alpha:first`,
       );
@@ -421,9 +410,9 @@ describe("healthCommand", () => {
     };
     callGatewayMock.mockResolvedValueOnce(snapshot);
 
-    await healthCommand({ json: false, timeoutMs: 1000, config: {} }, runtime);
+    await runHealth({ timeoutMs: 1000 });
 
-    const output = stripAnsi(runtime.log.mock.calls.map((call) => String(call[0])).join("\n"));
+    const output = textOutput();
     expect(output).toContain("Gateway event loop: degraded for 3m");
     expect(output).toContain("p99=1200ms");
   });
@@ -433,9 +422,9 @@ describe("healthCommand", () => {
     snapshot.configReload = { hotReloadStatus: "disabled" };
     callGatewayMock.mockResolvedValueOnce(snapshot);
 
-    await healthCommand({ json: false, timeoutMs: 5000, config: {} }, runtime);
+    await runHealth();
 
-    const output = stripAnsi(runtime.log.mock.calls.map((c) => String(c[0])).join("\n"));
+    const output = textOutput();
     expect(output).toContain(
       "Config hot reload: disabled (watcher retries exhausted; restart the gateway to restore it)",
     );
@@ -448,26 +437,19 @@ describe("healthCommand", () => {
       { key: "fresh", updatedAt: gatewayNow, age: 0 },
       { key: "foo", updatedAt: null, age: null },
     ];
+    const fixture = channelFixture(7, 5 * 60_000);
     const snapshot = createHealthSummary({
+      ...fixture,
       channels: {
-        whatsapp: { accountId: "default", linked: true, authAgeMs: 5 * 60_000 },
+        ...fixture.channels,
         telegram: {
-          accountId: "default",
-          configured: true,
+          ...fixture.channels.telegram,
           probe: {
-            ok: true,
-            elapsedMs: 7,
+            ...fixture.channels.telegram.probe,
             bot: { username: "bot" },
             webhook: { url: "https://example.com/h" },
           },
         },
-        discord: { accountId: "default", configured: false },
-      },
-      channelOrder: ["whatsapp", "telegram", "discord"],
-      channelLabels: {
-        whatsapp: "WhatsApp",
-        telegram: "Telegram",
-        discord: "Discord",
       },
       sessions: {
         path: "/tmp/sessions.json",
@@ -493,7 +475,7 @@ describe("healthCommand", () => {
     }
 
     expect(runtime.exit).not.toHaveBeenCalled();
-    const output = stripAnsi(runtime.log.mock.calls.map((c) => String(c[0])).join("\n"));
+    const output = textOutput();
     expect(output).toContain("- main (1m ago)\n- fresh (0m ago)\n- foo (no activity)");
     expect(output).toMatch(/WhatsApp: linked/i);
     expect(runtime.log.mock.calls.slice(0, 3)).toEqual([

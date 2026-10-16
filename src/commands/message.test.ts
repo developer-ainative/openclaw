@@ -1,12 +1,11 @@
-// Message command tests cover CLI message sending, environment handling, and runtime dependency wiring.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelPlugin } from "../channels/plugins/types.plugin.js";
 import type { CliDeps } from "../cli/deps.js";
 import type { MessageActionResult } from "../infra/outbound/message-action-contracts.js";
-import type { RuntimeEnv } from "../runtime.js";
 import { createCanonicalAgentConfigFixture } from "../test-utils/config-roster.js";
 import { captureEnv } from "../test-utils/env.js";
 import { messageCommand } from "./message.js";
+import { createThrowingTestRuntime } from "./test-runtime-config-helpers.js";
 
 type ResetPluginRuntimeStateForTest =
   typeof import("../plugins/runtime.js").resetPluginRuntimeStateForTest;
@@ -17,23 +16,9 @@ let resetPluginRuntimeStateForTest: ResetPluginRuntimeStateForTest;
 let setActivePluginRegistry: SetActivePluginRegistry;
 let createTestRegistry: CreateTestRegistry;
 
-type RunMessageActionParams = {
-  cfg?: unknown;
-  action: string;
-  broadcastAccountPlan?: {
-    accountId: string;
-    candidateChannels: string[];
-    secretChannels: string[];
-  };
-  params: Record<string, unknown>;
-  agentId?: string;
-  senderIsOwner?: boolean;
-  conversationReadOrigin?: "delegated" | "direct-operator";
-  gateway?: {
-    clientName?: string;
-    mode?: string;
-  };
-};
+type RunMessageActionParams = Parameters<
+  typeof import("../infra/outbound/message-action-runner.js").runMessageAction
+>[0];
 
 function readOnlyMessageActionCall(): RunMessageActionParams {
   expect(runMessageActionMock).toHaveBeenCalledOnce();
@@ -58,36 +43,19 @@ vi.mock("../config/plugin-auto-enable.js", () => ({
 }));
 
 const resolveCommandConfigWithSecrets = vi.hoisted(() =>
-  vi.fn(async ({ config }: { config: unknown }) => ({
-    resolvedConfig: config,
-    effectiveConfig: config,
-    diagnostics: [] as string[],
-  })),
-);
-
-vi.mock("../cli/command-config-resolution.js", () => ({
-  resolveCommandConfigWithSecrets: async (opts: {
-    autoEnable?: boolean;
-    config: unknown;
-    env?: NodeJS.ProcessEnv;
-    runtime?: { log: (message: string) => void };
-  }) => {
-    const result = await resolveCommandConfigWithSecrets(opts);
-    for (const entry of result.diagnostics ?? []) {
-      opts.runtime?.log(`[secrets] ${entry}`);
-    }
-    const effectiveConfig =
-      opts.autoEnable === true
-        ? applyPluginAutoEnable({
-            config: result.resolvedConfig,
-            env: opts.env ?? process.env,
-          }).config
-        : result.effectiveConfig;
+  vi.fn(async (opts: { autoEnable?: boolean; config: unknown; env?: NodeJS.ProcessEnv }) => {
     return {
-      ...result,
-      effectiveConfig,
+      resolvedConfig: opts.config,
+      effectiveConfig:
+        opts.autoEnable === true
+          ? applyPluginAutoEnable({ config: opts.config, env: opts.env ?? process.env }).config
+          : opts.config,
+      diagnostics: [],
     };
-  },
+  }),
+);
+vi.mock("../cli/command-config-resolution.js", () => ({
+  resolveCommandConfigWithSecrets,
 }));
 
 const getScopedChannelsCommandSecretTargets = vi.hoisted(() =>
@@ -127,13 +95,7 @@ beforeAll(async () => {
   ({ createTestRegistry } = await import("../test-utils/channel-plugins.js"));
 });
 
-const runtime: RuntimeEnv = {
-  log: vi.fn(),
-  error: vi.fn(),
-  exit: vi.fn(() => {
-    throw new Error("exit");
-  }),
-};
+const runtime = createThrowingTestRuntime();
 
 beforeEach(() => {
   resetPluginRuntimeStateForTest();
@@ -157,16 +119,17 @@ afterEach(() => {
   resetPluginRuntimeStateForTest();
 });
 
+const pluginMeta = (id: string) => ({
+  id,
+  label: id,
+  selectionLabel: id,
+  docsPath: `/channels/${id}`,
+  blurb: "test",
+});
 function createAccountPlugin(id: "slack" | "telegram", accountIds: string[]): ChannelPlugin {
   return {
     id,
-    meta: {
-      id,
-      label: id,
-      selectionLabel: id,
-      docsPath: `/channels/${id}`,
-      blurb: "test",
-    },
+    meta: pluginMeta(id),
     capabilities: { chatTypes: ["direct", "group"], media: true },
     config: {
       listAccountIds: () => accountIds,
@@ -184,13 +147,7 @@ function createLegacySingleAccountPlugin(params: {
 }): ChannelPlugin {
   return {
     id: params.id,
-    meta: {
-      id: params.id,
-      label: params.id,
-      selectionLabel: params.id,
-      docsPath: `/channels/${params.id}`,
-      blurb: "test",
-    },
+    meta: pluginMeta(params.id),
     capabilities: { chatTypes: ["group"] },
     config: {
       listAccountIds: () => ["default"],
@@ -199,14 +156,13 @@ function createLegacySingleAccountPlugin(params: {
   };
 }
 
-const makeDeps = (overrides: Partial<CliDeps> = {}): CliDeps => ({
+const makeDeps = (): CliDeps => ({
   whatsapp: vi.fn(),
   telegram: vi.fn(),
   discord: vi.fn(),
   slack: vi.fn(),
   signal: vi.fn(),
   imessage: vi.fn(),
-  ...overrides,
 });
 
 function createTelegramSecretRawConfig() {
@@ -531,25 +487,24 @@ describe("messageCommand", () => {
     expect(json.sentBeforeError).toBe(true);
   });
 
-  it.each([
-    ["rejected poll", "poll", { ok: false, error: "Poll rejected" }, "Poll rejected"],
-  ] as const)("reports %s truthfully in JSON output", async (_name, action, payload, expected) => {
+  it("reports rejected polls truthfully in JSON output", async () => {
+    const payload = { ok: false, error: "Poll rejected" };
     runMessageActionMock.mockResolvedValueOnce({
-      kind: action === "poll" ? action : "action",
+      kind: "poll",
       channel: "telegram",
-      action,
+      action: "poll",
       to: "123456",
       handledBy: "plugin",
       payload,
       dryRun: false,
-    } as MessageActionResult);
+    });
 
     await runMessageCommand({ action });
 
     const json = JSON.parse(String(vi.mocked(runtime.log).mock.calls[0]?.[0]));
     expect(json).toMatchObject({
       ok: false,
-      error: { type: "cli_error", message: expected },
+      error: { type: "cli_error", message: "Poll rejected" },
     });
     expect(json.payload).toEqual(payload);
     expect(json).not.toHaveProperty("deliveryStatus");

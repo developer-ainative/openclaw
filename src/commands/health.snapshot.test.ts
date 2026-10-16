@@ -1,5 +1,3 @@
-// Health snapshot tests cover channel, session, runtime, and gateway health snapshot construction.
-import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTempDirTracker } from "../../test/helpers/temp-dir.js";
@@ -30,11 +28,6 @@ type TelegramHealthAccount = {
   accountId: string;
   token: string;
   configured: boolean;
-  config: {
-    proxy?: string;
-    network?: Record<string, unknown>;
-    apiRoot?: string;
-  };
 };
 
 type DiscordHealthAccount = {
@@ -52,69 +45,14 @@ type IMessageHealthAccount = {
   configured: boolean;
 };
 
-function getTelegramChannelConfig(cfg: Record<string, unknown>) {
-  const channels = cfg.channels as Record<string, unknown> | undefined;
-  return (channels?.telegram as Record<string, unknown> | undefined) ?? {};
-}
-
-function listTelegramAccountIdsForTest(cfg: Record<string, unknown>): string[] {
-  const telegram = getTelegramChannelConfig(cfg);
-  const accounts = telegram.accounts as Record<string, unknown> | undefined;
-  const ids: string[] = [];
-  for (const accountId of Object.keys(accounts ?? {})) {
-    if (accountId) {
-      ids.push(accountId);
-    }
-  }
-  return ids.length > 0 ? ids : ["default"];
-}
-
-function readTokenFromFile(tokenFile: unknown): string {
-  if (typeof tokenFile !== "string" || !tokenFile.trim()) {
-    return "";
-  }
-  try {
-    return fs.readFileSync(tokenFile, "utf8").trim();
-  } catch {
-    return "";
-  }
-}
-
 function resolveTelegramAccountForTest(params: {
   cfg: Record<string, unknown>;
   accountId?: string | null;
 }): TelegramHealthAccount {
-  const telegram = getTelegramChannelConfig(params.cfg);
-  const accounts = (telegram.accounts as Record<string, Record<string, unknown>> | undefined) ?? {};
+  const channels = params.cfg.channels as Record<string, { botToken?: string }> | undefined;
   const accountId = params.accountId?.trim() || "default";
-  const channelConfig = { ...telegram };
-  delete (channelConfig as { accounts?: unknown }).accounts;
-  const merged = {
-    ...channelConfig,
-    ...accounts[accountId],
-  };
-  const tokenFromConfig =
-    typeof merged.botToken === "string" && merged.botToken.trim() ? merged.botToken.trim() : "";
-  const token =
-    tokenFromConfig ||
-    readTokenFromFile(merged.tokenFile) ||
-    (accountId === "default" ? (process.env.TELEGRAM_BOT_TOKEN?.trim() ?? "") : "");
-  return {
-    accountId,
-    token,
-    configured: token.length > 0,
-    config: {
-      ...(typeof merged.proxy === "string" && merged.proxy.trim()
-        ? { proxy: merged.proxy.trim() }
-        : {}),
-      ...(merged.network && typeof merged.network === "object" && !Array.isArray(merged.network)
-        ? { network: merged.network as Record<string, unknown> }
-        : {}),
-      ...(typeof merged.apiRoot === "string" && merged.apiRoot.trim()
-        ? { apiRoot: merged.apiRoot.trim() }
-        : {}),
-    },
-  };
+  const token = channels?.telegram?.botToken?.trim() ?? "";
+  return { accountId, token, configured: token.length > 0 };
 }
 
 function buildTelegramHealthSummary(snapshot: {
@@ -135,75 +73,11 @@ function buildTelegramHealthSummary(snapshot: {
   };
 }
 
-async function probeTelegramAccountForTest(
-  account: TelegramHealthAccount,
-  timeoutMs: number,
-): Promise<Record<string, unknown>> {
-  const started = Date.now();
-  const apiRoot = account.config.apiRoot?.trim()?.replace(/\/+$/, "") || "https://api.telegram.org";
-  const base = `${apiRoot}/bot${account.token}`;
-
-  try {
-    const meRes = await fetch(`${base}/getMe`, { signal: AbortSignal.timeout(timeoutMs) });
-    const meJson = (await meRes.json()) as {
-      ok?: boolean;
-      description?: string;
-      result?: { id?: number; username?: string };
-    };
-    if (!meRes.ok || !meJson.ok) {
-      return {
-        ok: false,
-        status: meRes.status,
-        error: meJson.description ?? `getMe failed (${meRes.status})`,
-        elapsedMs: Date.now() - started,
-      };
-    }
-
-    let webhook: { url?: string | null; hasCustomCert?: boolean | null } | undefined;
-    try {
-      const webhookRes = await fetch(`${base}/getWebhookInfo`, {
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      const webhookJson = (await webhookRes.json()) as {
-        ok?: boolean;
-        result?: { url?: string; has_custom_certificate?: boolean };
-      };
-      if (webhookRes.ok && webhookJson.ok) {
-        webhook = {
-          url: webhookJson.result?.url ?? null,
-          hasCustomCert: webhookJson.result?.has_custom_certificate ?? null,
-        };
-      }
-    } catch {
-      // ignore webhook errors in probe flow
-    }
-
-    return {
-      ok: true,
-      status: null,
-      error: null,
-      elapsedMs: Date.now() - started,
-      bot: {
-        id: meJson.result?.id ?? null,
-        username: meJson.result?.username ?? null,
-      },
-      ...(webhook ? { webhook } : {}),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      status: null,
-      error: error instanceof Error ? error.message : String(error),
-      elapsedMs: Date.now() - started,
-    };
-  }
-}
-
 function createTelegramHealthPlugin(): HealthTestPlugin {
   return {
     ...createChannelTestPluginBase({ id: "telegram", label: "Telegram" }),
     config: {
-      listAccountIds: (cfg) => listTelegramAccountIdsForTest(cfg as Record<string, unknown>),
+      listAccountIds: () => ["default"],
       resolveAccount: (cfg, accountId) =>
         resolveTelegramAccountForTest({ cfg: cfg as Record<string, unknown>, accountId }),
       inspectAccount: (cfg, accountId) =>
@@ -213,10 +87,7 @@ function createTelegramHealthPlugin(): HealthTestPlugin {
     status: {
       buildChannelSummary: ({ snapshot }) => buildTelegramHealthSummaryForTest(snapshot),
       probeAccount: async ({ account, timeoutMs }) =>
-        await (probeTelegramAccountForTestOverride ?? probeTelegramAccountForTest)(
-          account as TelegramHealthAccount,
-          timeoutMs,
-        ),
+        await probeTelegramAccountForTestOverride?.(account as TelegramHealthAccount, timeoutMs),
     },
   };
 }
@@ -430,26 +301,21 @@ describe("collectGatewayHealthSnapshot", () => {
         channelAccounts: {},
       },
     });
-    type RuntimeStateFields = {
-      running?: boolean;
-      connected?: boolean;
-      lastConnectedAt?: number;
-      healthState?: string;
-      probe?: { ok?: boolean; bot?: { username?: string } };
-    };
-    const telegram = snap.channels.telegram as RuntimeStateFields & {
-      accounts?: Record<string, RuntimeStateFields>;
-    };
-
-    expect(telegram.running).toBe(true);
-    expect(telegram.connected).toBe(true);
-    expect(telegram.lastConnectedAt).toBe(123);
-    expect(telegram.healthState).toBe("reconnecting");
-    expect(telegram.probe?.bot?.username).toBe("runtime_bot");
-    expect(telegram.accounts?.default?.running).toBe(true);
-    expect(telegram.accounts?.default?.connected).toBe(true);
-    expect(telegram.accounts?.default?.healthState).toBe("reconnecting");
-    expect(telegram.accounts?.default?.probe?.ok).toBe(true);
+    expect(snap.channels.telegram).toMatchObject({
+      running: true,
+      connected: true,
+      lastConnectedAt: 123,
+      healthState: "reconnecting",
+      probe: { bot: { username: "runtime_bot" } },
+      accounts: {
+        default: {
+          running: true,
+          connected: true,
+          healthState: "reconnecting",
+          probe: { ok: true },
+        },
+      },
+    });
   });
 
   it("merges inspected account metadata with runtime state before building health summaries", async () => {
@@ -471,34 +337,14 @@ describe("collectGatewayHealthSnapshot", () => {
         channelAccounts: {},
       },
     });
-    const discord = snap.channels.discord as {
-      configured?: boolean;
-      running?: boolean;
-      connected?: boolean;
-      tokenSource?: string;
-      tokenStatus?: string;
-      accounts?: Record<
-        string,
-        {
-          configured?: boolean;
-          running?: boolean;
-          connected?: boolean;
-          tokenSource?: string;
-          tokenStatus?: string;
-        }
-      >;
+    const expected = {
+      configured: true,
+      running: true,
+      connected: true,
+      tokenSource: "config",
+      tokenStatus: "available",
     };
-
-    expect(discord.configured).toBe(true);
-    expect(discord.running).toBe(true);
-    expect(discord.connected).toBe(true);
-    expect(discord.tokenSource).toBe("config");
-    expect(discord.tokenStatus).toBe("available");
-    expect(discord.accounts?.default?.configured).toBe(true);
-    expect(discord.accounts?.default?.running).toBe(true);
-    expect(discord.accounts?.default?.connected).toBe(true);
-    expect(discord.accounts?.default?.tokenSource).toBe("config");
-    expect(discord.accounts?.default?.tokenStatus).toBe("available");
+    expect(snap.channels.discord).toMatchObject({ ...expected, accounts: { default: expected } });
   });
 
   it("redacts base URL credentials returned by channel summary hooks", async () => {
@@ -520,13 +366,8 @@ describe("collectGatewayHealthSnapshot", () => {
     healthPluginsForTest = [plugin];
 
     const snap = await getHealthSnapshot({ probe: false, includeSensitive: false });
-    const discord = snap.channels.discord as {
-      baseUrl?: string;
-      accounts?: Record<string, { baseUrl?: string }>;
-    };
-
-    expect(discord.baseUrl).toBe("https://chat.example.test/?token=***");
-    expect(discord.accounts?.default?.baseUrl).toBe("https://chat.example.test/?token=***");
+    const expected = { baseUrl: "https://chat.example.test/?token=***" };
+    expect(snap.channels.discord).toMatchObject({ ...expected, accounts: { default: expected } });
   });
 
   it("preserves plugin-derived configured state for unavailable SecretRef credentials", async () => {
@@ -557,26 +398,12 @@ describe("collectGatewayHealthSnapshot", () => {
         channelAccounts: {},
       },
     });
-    const discord = snap.channels.discord as {
-      configured?: boolean;
-      tokenSource?: string;
-      tokenStatus?: string;
-      accounts?: Record<
-        string,
-        {
-          configured?: boolean;
-          tokenSource?: string;
-          tokenStatus?: string;
-        }
-      >;
+    const expected = {
+      configured: true,
+      tokenSource: "config",
+      tokenStatus: "configured_unavailable",
     };
-
-    expect(discord.configured).toBe(true);
-    expect(discord.tokenSource).toBe("config");
-    expect(discord.tokenStatus).toBe("configured_unavailable");
-    expect(discord.accounts?.default?.configured).toBe(true);
-    expect(discord.accounts?.default?.tokenSource).toBe("config");
-    expect(discord.accounts?.default?.tokenStatus).toBe("configured_unavailable");
+    expect(snap.channels.discord).toMatchObject({ ...expected, accounts: { default: expected } });
   });
 
   it("omits secret runtime fields and raw probe payloads from non-sensitive health snapshots", async () => {
@@ -610,35 +437,16 @@ describe("collectGatewayHealthSnapshot", () => {
         channelAccounts: {},
       },
     });
-    const telegram = snap.channels.telegram as {
-      connected?: boolean;
-      lastConnectedAt?: number;
-      probe?: unknown;
-      channelAccessToken?: string;
-      channelSecret?: string;
-      webhookUrl?: string;
-      accounts?: Record<
-        string,
-        {
-          connected?: boolean;
-          lastConnectedAt?: number;
-          probe?: unknown;
-          channelAccessToken?: string;
-          channelSecret?: string;
-          webhookUrl?: string;
-        }
-      >;
-    };
-
+    const telegram = snap.channels.telegram!;
     expect(telegram.connected).toBe(true);
     expect(telegram.lastConnectedAt).toBe(123);
     expect(telegram.probe).toBeUndefined();
-    expect(telegram.channelAccessToken).toBeUndefined();
-    expect(telegram.channelSecret).toBeUndefined();
-    expect(telegram.webhookUrl).toBeUndefined();
+    expect(telegram["channelAccessToken"]).toBeUndefined();
+    expect(telegram["channelSecret"]).toBeUndefined();
+    expect(telegram["webhookUrl"]).toBeUndefined();
     expect(telegram.accounts?.default?.connected).toBe(true);
     expect(telegram.accounts?.default?.probe).toBeUndefined();
-    expect(telegram.accounts?.default?.channelAccessToken).toBeUndefined();
+    expect(telegram.accounts?.default?.["channelAccessToken"]).toBeUndefined();
   });
 
   it("keeps redacted failed probes in non-sensitive health snapshots", async () => {
@@ -649,59 +457,32 @@ describe("collectGatewayHealthSnapshot", () => {
       timeoutMs: 25,
       includeSensitive: false,
     });
-    const imessage = snap.channels.imessage as {
-      configured?: boolean;
-      probe?: {
-        ok?: boolean;
-        error?: string;
-        privateApi?: unknown;
-      };
-      accounts?: Record<
-        string,
-        {
-          probe?: {
-            ok?: boolean;
-            error?: string;
-            privateApi?: unknown;
-          };
-        }
-      >;
+    const imessage = snap.channels.imessage!;
+    const expectedProbe = {
+      ok: false,
+      error:
+        "imsg cannot access ~/Library/Messages/chat.db. Grant Full Disk Access to the Gateway/launcher process and restart Gateway.",
     };
-
     expect(imessage.configured).toBe(true);
-    expect(imessage.probe).toEqual({
-      ok: false,
-      error:
-        "imsg cannot access ~/Library/Messages/chat.db. Grant Full Disk Access to the Gateway/launcher process and restart Gateway.",
-    });
-    expect(imessage.probe?.privateApi).toBeUndefined();
-    expect(imessage.accounts?.default?.probe).toEqual({
-      ok: false,
-      error:
-        "imsg cannot access ~/Library/Messages/chat.db. Grant Full Disk Access to the Gateway/launcher process and restart Gateway.",
-    });
-    expect(imessage.accounts?.default?.probe?.privateApi).toBeUndefined();
+    expect(imessage.probe).toEqual(expectedProbe);
+    expect(imessage.accounts?.default?.probe).toEqual(expectedProbe);
   });
 
   it("omits generic failed probe errors from non-sensitive health snapshots", async () => {
     testConfig = { channels: { telegram: { botToken: "bad-token" } } };
     vi.stubEnv("DISCORD_BOT_TOKEN", "");
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        throw new Error("network down with private diagnostic");
-      }),
-    );
+    probeTelegramAccountForTestOverride = async () => ({
+      ok: false,
+      status: null,
+      error: "network down with private diagnostic",
+      elapsedMs: 0,
+    });
 
     const snap = await getHealthSnapshot({
       timeoutMs: 25,
       includeSensitive: false,
     });
-    const telegram = snap.channels.telegram as {
-      configured?: boolean;
-      probe?: unknown;
-      accounts?: Record<string, { probe?: unknown }>;
-    };
+    const telegram = snap.channels.telegram!;
 
     expect(telegram.configured).toBe(true);
     expect(telegram.probe).toBeUndefined();

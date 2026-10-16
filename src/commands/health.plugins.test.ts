@@ -24,6 +24,16 @@ let collectGatewayHealthSnapshot: typeof import("../gateway/health/collector.js"
 let startPluginServices: typeof import("../plugins/services.test-support.js").startPluginServices;
 let pluginServicesHandle: PluginServicesHandle | undefined;
 let inventoryPlugins: ChannelPlugin[] = [];
+const collect = (options: Partial<Parameters<typeof collectGatewayHealthSnapshot>[0]> = {}) =>
+  collectGatewayHealthSnapshot({ audience: "admin", timeoutMs: 10, probe: false, ...options });
+const serviceEntry = (id: string, start: () => void, serviceId = id) => ({
+  pluginId: "service-plugin",
+  pluginName: "Service Plugin",
+  id,
+  service: { id: serviceId, start },
+  source: "test",
+  origin: "workspace" as const,
+});
 
 describe("collectGatewayHealthSnapshot plugin state", () => {
   beforeAll(async () => {
@@ -41,19 +51,11 @@ describe("collectGatewayHealthSnapshot plugin state", () => {
       listReadOnlyChannelPluginsForConfig: () => inventoryPlugins,
     }));
 
-    const [pluginsRuntime, degradedState, channelTestUtils, health, pluginServices] =
-      await Promise.all([
-        import("../plugins/runtime.js"),
-        import("../plugins/runtime-degraded-state.js"),
-        import("../test-utils/channel-plugins.js"),
-        import("../gateway/health/collector.js"),
-        import("../plugins/services.test-support.js"),
-      ]);
-    setActivePluginRegistry = pluginsRuntime.setActivePluginRegistry;
-    setActiveDegradedPlugins = degradedState.setActiveDegradedPlugins;
-    createTestRegistry = channelTestUtils.createTestRegistry;
-    collectGatewayHealthSnapshot = health.collectGatewayHealthSnapshot;
-    startPluginServices = pluginServices.startPluginServices;
+    ({ setActivePluginRegistry } = await import("../plugins/runtime.js"));
+    ({ setActiveDegradedPlugins } = await import("../plugins/runtime-degraded-state.js"));
+    ({ createTestRegistry } = await import("../test-utils/channel-plugins.js"));
+    ({ collectGatewayHealthSnapshot } = await import("../gateway/health/collector.js"));
+    ({ startPluginServices } = await import("../plugins/services.test-support.js"));
   });
 
   beforeEach(() => {
@@ -116,11 +118,7 @@ describe("collectGatewayHealthSnapshot plugin state", () => {
       },
     ]);
 
-    const snap = await collectGatewayHealthSnapshot({
-      audience: "admin",
-      timeoutMs: 10,
-      probe: false,
-    });
+    const snap = await collect();
 
     expect(Value.Check(SnapshotSchema.properties.health, snap)).toBe(true);
     expect(snap.sessions.path).toBe(
@@ -185,8 +183,7 @@ describe("collectGatewayHealthSnapshot plugin state", () => {
       ],
     };
     setActivePluginRegistry(registry);
-    const snap = await collectGatewayHealthSnapshot({
-      audience: "admin",
+    const snap = await collect({
       timeoutMs: 1000,
       probe: true,
       runtimeSnapshot: {
@@ -223,11 +220,7 @@ describe("collectGatewayHealthSnapshot plugin state", () => {
     setActivePluginRegistry({
       ...registry,
       ...createTestRegistry([
-        {
-          pluginId: "healthy-owner",
-          plugin: inventoryPlugins[0],
-          source: "test",
-        },
+        { pluginId: "healthy-owner", plugin: inventoryPlugins[0], source: "test" },
       ]),
       plugins: registry.plugins,
     });
@@ -258,35 +251,14 @@ describe("collectGatewayHealthSnapshot plugin state", () => {
         }),
       ],
       services: [
-        {
-          pluginId: "service-plugin",
-          pluginName: "Service Plugin",
-          id: "broken",
-          service: {
-            id: " broken ",
-            start: brokenStart,
-          },
-          source: "test",
-          origin: "workspace" as const,
-        },
-        {
-          pluginId: "service-plugin",
-          pluginName: "Service Plugin",
-          id: "healthy-sibling",
-          service: { id: "healthy-sibling", start: siblingStart },
-          source: "test",
-          origin: "workspace" as const,
-        },
+        serviceEntry("broken", brokenStart, " broken "),
+        serviceEntry("healthy-sibling", siblingStart),
       ],
     };
     setActivePluginRegistry(registry);
 
     pluginServicesHandle = await startPluginServices({ registry, config: {} });
-    const failed = await collectGatewayHealthSnapshot({
-      audience: "admin",
-      timeoutMs: 10,
-      probe: false,
-    });
+    const failed = await collect();
 
     expect(Value.Check(SnapshotSchema.properties.health, failed)).toBe(true);
     expect(siblingStart).toHaveBeenCalledOnce();
@@ -303,19 +275,11 @@ describe("collectGatewayHealthSnapshot plugin state", () => {
 
     await pluginServicesHandle.stop();
     pluginServicesHandle = undefined;
-    const stopped = await collectGatewayHealthSnapshot({
-      audience: "admin",
-      timeoutMs: 10,
-      probe: false,
-    });
+    const stopped = await collect();
     expect(stopped.plugins?.errors).toEqual(failed.plugins?.errors);
 
     pluginServicesHandle = await startPluginServices({ registry, config: {} });
-    const recovered = await collectGatewayHealthSnapshot({
-      audience: "admin",
-      timeoutMs: 10,
-      probe: false,
-    });
+    const recovered = await collect();
     expect(brokenStart).toHaveBeenCalledTimes(2);
     expect(siblingStart).toHaveBeenCalledTimes(2);
     expect(recovered.plugins?.errors).toEqual([]);
