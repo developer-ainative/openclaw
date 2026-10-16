@@ -2,6 +2,7 @@ import { getObserver } from "@solidjs/signals";
 import { insert, type JSX } from "@solidjs/web";
 import {
   createEffect,
+  createMemo,
   createRoot,
   getOwner,
   onCleanup,
@@ -13,11 +14,13 @@ import {
 import { useApplication, useOptionalApplication } from "../lib/reactive/context.ts";
 import { createParkedProjection } from "../lib/reactive/parked-projection.ts";
 import { projectSource } from "../lib/reactive/projection.ts";
-import { defineSolidBridge, type SolidBridgeElement } from "../lit/solid-bridge.ts";
+import { defineSolidBridge, type SolidBridgeElement } from "../lib/solid-bridge.ts";
 import { PluginView } from "../plugins/control-ui-view.solid.tsx";
 import { appSidebarProperties, type AppSidebarProps } from "./app-sidebar-base.ts";
 import { AppSidebarOwner } from "./app-sidebar-owner.tsx";
+import { createSessionPullRequestIndicators } from "./app-sidebar-session-pr-indicators.ts";
 import { createSidebarScroll } from "./sidebar-context-controller.ts";
+import { createSidebarNavigationCatalog } from "./sidebar-navigation-catalog.ts";
 import { createSidebarPeople } from "./sidebar-people.ts";
 
 export { AppSidebarOwner } from "./app-sidebar-owner.tsx";
@@ -50,7 +53,9 @@ function disconnectSidebarOwner(host: HTMLElement): void {
 function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Element {
   host.style.display = "contents";
   const context = useApplication();
-  const owner = sidebarOwners.get(host) ?? new AppSidebarOwner(props, context, host);
+  const catalog = createSidebarNavigationCatalog(context, () => props.navigationView, host);
+  const owner = sidebarOwners.get(host) ?? new AppSidebarOwner(catalog, props, context, host);
+  owner.navigationCatalog = catalog;
   owner.bindInputs(props, context);
   const scroll = createSidebarScroll(owner);
   const projection = projectSource(owner, {
@@ -62,6 +67,18 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
     Object.values(props);
     return projection.read();
   }));
+  const prepared = createMemo(
+    () => {
+      projection.revision();
+      Object.values(props);
+      // Snapshot capture keeps observing Pages after its navigation view closes.
+      void catalog.dashboards;
+      // Synchronous owners release boot snapshots and restore query state before row consumers read.
+      owner.prepareRender();
+      return owner;
+    },
+    { equals: false },
+  );
   const presentationRevision = createParkedProjection(
     () => {
       Object.values(props);
@@ -90,8 +107,15 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
     owner.sessionData,
     owner.sessionOrganizer,
     owner.people,
-    owner.navigationCatalog,
   ].forEach(observe);
+  owner.sessionPullRequests = createSessionPullRequestIndicators({
+    getConnected: () => prepared().isConnected && props.connected,
+    getPresented: () => props.navigationVisible,
+    getRows: () => prepared().readSessionPullRequestRows(),
+    getSelectedAgentId: () => prepared().selectedAgentIdForSessions(),
+    getGateway: () => prepared().sessionDataContext?.gateway,
+    getSessions: () => prepared().sessionDataContext?.sessions,
+  });
   const solidOwner = getOwner();
   const mountDefaultView = (target: HTMLElement) =>
     runWithOwner(solidOwner, () =>
@@ -124,10 +148,7 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
   const content = hostView.renderSidebar(Sessions, scroll);
   createEffect(
     () => {
-      projection.revision();
-      // Props remain on the bridge's live object; source changes refresh its subscriptions.
-      Object.values(props);
-      owner.prepareRender();
+      prepared();
       people.capture();
       scroll.capture();
     },
@@ -136,6 +157,19 @@ function AppSidebarContent(props: AppSidebarProps, host: HTMLElement): JSX.Eleme
         owner.commitRender();
         people.syncRendered();
         scroll.restore();
+        // The projection owns the display deadline; this mounted view owns its timer.
+        const deadline = owner.sessionProjection.subtitleDeadline;
+        if (owner.isConnected && Number.isFinite(deadline)) {
+          const timer = globalThis.setTimeout(
+            () => {
+              owner.sessionProjection.invalidate();
+              owner.requestUpdate();
+            },
+            Math.max(0, deadline - Date.now()),
+          );
+          return () => globalThis.clearTimeout(timer);
+        }
+        return undefined;
       }),
   );
   onSettled(() => {
