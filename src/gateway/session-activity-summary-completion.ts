@@ -8,7 +8,7 @@ export type SessionActivitySummaryCompletion = {
 };
 
 export type PendingSessionActivitySummaryCompletion = SessionActivitySummaryCompletion & {
-  terminal: boolean;
+  markTerminal(): void;
   offer(summary: SessionActivitySummary): Promise<SessionEntry | undefined> | undefined;
 };
 
@@ -20,10 +20,13 @@ export function beginActivitySummaryCompletion(owner: {
   let summary: SessionActivitySummary | undefined;
   let settle: ((entry: SessionEntry | undefined) => void) | undefined;
   let closed = false;
+  let terminal = false;
   const completion: PendingSessionActivitySummaryCompletion = {
-    terminal: false,
+    markTerminal() {
+      terminal = true;
+    },
     offer(value) {
-      if (closed || !completion.terminal) {
+      if (closed || !terminal) {
         return undefined;
       }
       summary = value;
