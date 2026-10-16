@@ -1,6 +1,5 @@
 import path from "node:path";
-import { expectDefined } from "@openclaw/normalization-core";
-import { expect, it, type Mock, type vi } from "vitest";
+import { expect, it, type vi, type Mock } from "vitest";
 import type {
   AgentDeletionJournalCleanupPath,
   AgentDeletionJournalEntry,
@@ -47,31 +46,24 @@ export function mergeAgentConfig(cfg: unknown, opts: unknown): MockConfig {
     model?: string | null;
     identity?: MockIdentity;
   }) ?? { agentId: "" };
-  const list = getAgentList(config);
   const agentId = params.agentId ?? "";
-  const index = list.findIndex((entry) => entry.id === agentId);
-  const base = index >= 0 ? expectDefined(list[index], "existing agent entry") : { id: agentId };
-  const nextEntry: MockAgentEntry = {
+  const base = config.agents?.entries?.[agentId];
+  const nextEntry: Omit<MockAgentEntry, "id"> = {
     ...base,
     ...(params.name ? { name: params.name } : {}),
     ...(params.workspace ? { workspace: params.workspace } : {}),
     ...(params.agentDir ? { agentDir: params.agentDir } : {}),
     ...(params.model ? { model: params.model } : {}),
-    ...(params.identity ? { identity: { ...base.identity, ...params.identity } } : {}),
+    ...(params.identity ? { identity: { ...base?.identity, ...params.identity } } : {}),
   };
   if (params.model === null) {
     delete nextEntry.model;
-  }
-  if (index >= 0) {
-    list[index] = nextEntry;
-  } else {
-    list.push(nextEntry);
   }
   return {
     ...config,
     agents: {
       ...config.agents,
-      entries: Object.fromEntries(list.map(({ id, ...entry }) => [id, entry])),
+      entries: { ...config.agents?.entries, [agentId]: nextEntry },
     },
   };
 }
@@ -107,9 +99,7 @@ export function createEnoentError() {
 }
 
 export function createErrnoError(code: string) {
-  const err = new Error(code) as NodeJS.ErrnoException;
-  err.code = code;
-  return err;
+  return Object.assign(new Error(code), { code });
 }
 
 export function deletionJournal(
@@ -227,16 +217,15 @@ export function registerAgentCreationCommitTests(fixture: {
       relativePath: "IDENTITY.md",
     });
     expect(write.data).toBe(
-      [
-        "# IDENTITY.md - Agent Identity",
-        "",
-        "- Name: Fancy Agent",
-        "- Emoji: 🤖",
-        "- Avatar: https://example.com/avatar.png",
-        "",
-      ].join("\n"),
+      "# IDENTITY.md - Agent Identity\n\n- Name: Fancy Agent\n- Emoji: 🤖\n- Avatar: https://example.com/avatar.png\n",
     );
   });
+}
+
+export function expectUncalled(...callbacks: unknown[]) {
+  for (const callback of callbacks) {
+    expect(callback).not.toHaveBeenCalled();
+  }
 }
 
 export function makeFileStat(params?: {

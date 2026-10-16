@@ -95,6 +95,30 @@ for (const storage of ["local", "remote"] as const) {
         return calls[0] as HandlerCall;
       }
 
+      function getFile(name: string) {
+        return invokeAgentFilesHandler("agents.files.get", { agentId: "main", name });
+      }
+      function setFile(
+        name: string,
+        content: string,
+        preconditions: { expectedHash?: string; expectedMissing?: boolean } = {},
+      ) {
+        return invokeAgentFilesHandler("agents.files.set", {
+          agentId: "main",
+          name,
+          content,
+          ...preconditions,
+        });
+      }
+      function saveDraft(editor: AgentFilesState, name: string) {
+        return saveAgentFile(
+          editor,
+          "main",
+          name,
+          expectDefined(agentFileValues(editor, "draft")[name], "editor draft"),
+        );
+      }
+
       function readMemory(): string {
         return fs.readFileSync(path.join(storageDir, "MEMORY.md"), "utf8");
       }
@@ -107,21 +131,13 @@ for (const storage of ["local", "remote"] as const) {
         async ({ character, bytesPerCharacter }) => {
           const name = "AGENTS.md";
           const accepted = character.repeat((2 * 1024 * 1024) / bytesPerCharacter);
-          const saved = await invokeAgentFilesHandler("agents.files.set", {
-            agentId: "main",
-            name,
-            content: accepted,
-          });
+          const saved = await setFile(name, accepted);
           expect(saved.ok).toBe(true);
           expect(fs.readFileSync(path.join(storageDir, name), "utf8")).toBe(accepted);
 
-          await expect(
-            invokeAgentFilesHandler("agents.files.set", {
-              agentId: "main",
-              name,
-              content: `${accepted}x`,
-            }).then(({ ok }) => ok),
-          ).rejects.toThrow("Workspace document exceeds its write bound");
+          await expect(setFile(name, `${accepted}x`).then(({ ok }) => ok)).rejects.toThrow(
+            "Workspace document exceeds its write bound",
+          );
           expect(fs.readFileSync(path.join(storageDir, name), "utf8")).toBe(accepted);
         },
       );
@@ -140,10 +156,7 @@ for (const storage of ["local", "remote"] as const) {
           broadcast.mockImplementation(() => {
             publishedContent = fs.readFileSync(path.join(storageDir, name), "utf8");
           });
-          const result = await invokeAgentFilesHandler("agents.files.set", {
-            agentId: "main",
-            name,
-            content: replacement,
+          const result = await setFile(name, replacement, {
             expectedHash: hashContent(conflict ? "stale" : original),
           });
 
@@ -200,23 +213,9 @@ for (const storage of ["local", "remote"] as const) {
         setAgentFileValues(first, "draft", { [name]: "# Memory\n- first operator\n" });
         setAgentFileValues(second, "draft", { [name]: "# Memory\n- second operator\n" });
 
-        expect(
-          await saveAgentFile(
-            first,
-            "main",
-            name,
-            expectDefined(agentFileValues(first, "draft")[name], "first editor draft"),
-          ),
-        ).toBe(true);
+        expect(await saveDraft(first, name)).toBe(true);
         expect(readMemory()).toBe(agentFileValues(first, "draft")[name]);
-        expect(
-          await saveAgentFile(
-            second,
-            "main",
-            name,
-            expectDefined(agentFileValues(second, "draft")[name], "second editor draft"),
-          ),
-        ).toBe(false);
+        expect(await saveDraft(second, name)).toBe(false);
         expect(second.agentFileConflict).toBe(name);
         expect(agentFileValues(second, "draft")[name]).toBe("# Memory\n- second operator\n");
         expect(readMemory()).toBe("# Memory\n- first operator\n");
@@ -246,11 +245,7 @@ for (const storage of ["local", "remote"] as const) {
           expect(agentFileValues(editor, "draft")["MEMORY.md"]).toBe("unsaved new memory");
           expect(fs.existsSync(path.join(storageDir, "MEMORY.md"))).toBe(false);
 
-          const result = await invokeAgentFilesHandler("agents.files.set", {
-            agentId: "main",
-            name: "MEMORY.md",
-            content: "explicit blind write",
-          });
+          const result = await setFile("MEMORY.md", "explicit blind write");
           expect(result.ok).toBe(true);
           expect(readMemory()).toBe("explicit blind write");
         },
@@ -274,10 +269,7 @@ for (const storage of ["local", "remote"] as const) {
           let expectedHash = hashContent("# Memory\n");
           if (variant === "stale") {
             fs.writeFileSync(path.join(storageDir, name), "# Memory\n");
-            const opened = await invokeAgentFilesHandler("agents.files.get", {
-              agentId: "main",
-              name,
-            });
+            const opened = await getFile(name);
             expect(opened.ok).toBe(true);
             const openedHash = (opened.payload as { file: { hash: string } }).file.hash;
             expect(openedHash).toBe(expectedHash);
@@ -290,12 +282,7 @@ for (const storage of ["local", "remote"] as const) {
               : variant === "expected-present"
                 ? { expectedMissing: false }
                 : { expectedHash };
-          const call = await invokeAgentFilesHandler("agents.files.set", {
-            agentId: "main",
-            name,
-            content: "# Memory\n- operator note\n",
-            ...preconditions,
-          });
+          const call = await setFile(name, "# Memory\n- operator note\n", preconditions);
           expect(call).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
           if (variant === "stale" || variant === "gone") {
             expect(call.error?.details).toEqual({
@@ -320,12 +307,11 @@ for (const storage of ["local", "remote"] as const) {
           fs.writeFileSync(path.join(storageDir, "MEMORY.md"), "# Memory\n");
           const expectedHash = hashContent("# Memory\n");
 
-          const call = await invokeAgentFilesHandler("agents.files.set", {
-            agentId: "main",
-            name: "MEMORY.md",
-            content: "# Memory\n- operator note\n",
-            ...(hashCase === "uppercase" ? { expectedHash: expectedHash.toUpperCase() } : {}),
-          });
+          const call = await setFile(
+            "MEMORY.md",
+            "# Memory\n- operator note\n",
+            hashCase === "uppercase" ? { expectedHash: expectedHash.toUpperCase() } : {},
+          );
 
           expect(call.ok).toBe(true);
           expect((call.payload as { file: { hash?: string } }).file.hash).toBe(
@@ -340,18 +326,8 @@ for (const storage of ["local", "remote"] as const) {
         const expectedHash = hashContent("# Memory\n");
 
         const [first, second] = await Promise.all([
-          invokeAgentFilesHandler("agents.files.set", {
-            agentId: "main",
-            name: "MEMORY.md",
-            content: "# Memory\n- first operator\n",
-            expectedHash,
-          }),
-          invokeAgentFilesHandler("agents.files.set", {
-            agentId: "main",
-            name: "MEMORY.md",
-            content: "# Memory\n- second operator\n",
-            expectedHash,
-          }),
+          setFile("MEMORY.md", "# Memory\n- first operator\n", { expectedHash }),
+          setFile("MEMORY.md", "# Memory\n- second operator\n", { expectedHash }),
         ]);
 
         const calls = [first, second];

@@ -1,15 +1,10 @@
-// Read-only workspace browsing tests cover listing, pagination, previews,
-// and the traversal/link-escape negatives that guard the workspace boundary.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { agentsWorkspaceHandlers } from "./agents-workspace.js";
 
-const hoisted = vi.hoisted(() => ({
-  listAgentIds: vi.fn(),
-  resolveAgentWorkspaceDir: vi.fn(),
-}));
+const hoisted = vi.hoisted(() => ({ listAgentIds: vi.fn(), resolveAgentWorkspaceDir: vi.fn() }));
 
 vi.mock("../../agents/agent-scope.js", async () => {
   const actual = await vi.importActual<typeof import("../../agents/agent-scope.js")>(
@@ -63,6 +58,14 @@ function expectError(calls: ReturnType<typeof createResponder>["calls"]): Record
   return calls[0]?.error as Record<string, any>;
 }
 
+function listWorkspace(params: Record<string, unknown> = {}) {
+  return invokeWorkspaceHandler("agents.workspace.list", { agentId: "main", ...params });
+}
+
+async function expectFileError(filePath: string, details: Record<string, unknown>) {
+  expect(expectError(await getWorkspaceFile(filePath)).details).toMatchObject(details);
+}
+
 function writeWorkspaceFile(root: string, filePath: string, content: string | Buffer) {
   const resolved = path.join(root, filePath);
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
@@ -92,14 +95,10 @@ describe("agents.workspace RPC handlers", () => {
   });
 
   it("lists the workspace root with directories first and integer timestamps", async () => {
-    const payload = expectOkPayload(
-      await invokeWorkspaceHandler("agents.workspace.list", { agentId: "main" }),
-    );
+    const payload = expectOkPayload(await listWorkspace());
 
-    expect(payload.path).toBe("");
+    expect(payload).toMatchObject({ path: "", totalEntries: 3, offset: 0 });
     expect(payload.parentPath).toBeUndefined();
-    expect(payload.totalEntries).toBe(3);
-    expect(payload.offset).toBe(0);
     expect(
       payload.entries.map((entry: Record<string, unknown>) => [entry.path, entry.kind]),
     ).toEqual([
@@ -118,21 +117,13 @@ describe("agents.workspace RPC handlers", () => {
     const directory = "..notes";
     writeWorkspaceFile(workspaceRoot, `${directory}/index.ts`, "export const ok = true;\n");
     writeWorkspaceFile(workspaceRoot, `${directory}/util.ts`, "export const util = 1;\n");
-    const root = expectOkPayload(
-      await invokeWorkspaceHandler("agents.workspace.list", { agentId: "main" }),
-    );
+    const root = expectOkPayload(await listWorkspace());
     const selected = root.entries.find(
       (entry: Record<string, unknown>) => entry.name === directory,
     );
-    const payload = expectOkPayload(
-      await invokeWorkspaceHandler("agents.workspace.list", {
-        agentId: "main",
-        path: selected.path,
-      }),
-    );
+    const payload = expectOkPayload(await listWorkspace({ path: selected.path }));
 
-    expect(payload.path).toBe(directory);
-    expect(payload.parentPath).toBe("");
+    expect(payload).toMatchObject({ path: directory, parentPath: "" });
     expect(payload.entries.map((entry: Record<string, unknown>) => entry.path)).toEqual([
       `${directory}/index.ts`,
       `${directory}/util.ts`,
@@ -142,30 +133,23 @@ describe("agents.workspace RPC handlers", () => {
   });
 
   it("rejects unknown agents", async () => {
-    const error = expectError(
-      await invokeWorkspaceHandler("agents.workspace.list", { agentId: "ghost" }),
-    );
+    const error = expectError(await listWorkspace({ agentId: "ghost" }));
     expect(error.message).toContain('agent "ghost" not found');
   });
 
   it("rejects traversal outside the workspace for list and get", async () => {
-    const listError = expectError(
-      await invokeWorkspaceHandler("agents.workspace.list", { agentId: "main", path: "../" }),
-    );
+    const listError = expectError(await listWorkspace({ path: "../" }));
     expect(listError.details).toMatchObject({ type: "workspace_path_invalid" });
 
-    const getError = expectError(await getWorkspaceFile("../outside.txt"));
-    expect(getError.details).toMatchObject({ type: "workspace_path_invalid" });
+    await expectFileError("../outside.txt", { type: "workspace_path_invalid" });
 
-    const nestedTraversal = expectError(await getWorkspaceFile("src/../../outside.txt"));
-    expect(nestedTraversal.details).toMatchObject({ type: "workspace_path_invalid" });
+    await expectFileError("src/../../outside.txt", { type: "workspace_path_invalid" });
   });
 
   it.each(["/etc/passwd", "C:\\Windows\\System32\\drivers\\etc\\hosts"])(
     "rejects absolute workspace paths: %s",
     async (filePath) => {
-      const error = expectError(await getWorkspaceFile(filePath));
-      expect(error.details).toMatchObject({ path: filePath, type: "workspace_path_invalid" });
+      await expectFileError(filePath, { path: filePath, type: "workspace_path_invalid" });
     },
   );
 
@@ -175,11 +159,7 @@ describe("agents.workspace RPC handlers", () => {
     fs.symlinkSync(outsidePath, path.join(workspaceRoot, "linked.txt"));
 
     try {
-      const error = expectError(await getWorkspaceFile("linked.txt"));
-      expect(error.details).toMatchObject({
-        path: "linked.txt",
-        type: "workspace_file_not_found",
-      });
+      await expectFileError("linked.txt", { path: "linked.txt", type: "workspace_file_not_found" });
     } finally {
       fs.rmSync(outsidePath, { force: true });
     }
@@ -191,16 +171,10 @@ describe("agents.workspace RPC handlers", () => {
     fs.symlinkSync(outsideDir, path.join(workspaceRoot, "linked-dir"), "dir");
 
     try {
-      const listError = expectError(
-        await invokeWorkspaceHandler("agents.workspace.list", {
-          agentId: "main",
-          path: "linked-dir",
-        }),
-      );
+      const listError = expectError(await listWorkspace({ path: "linked-dir" }));
       expect(listError.details).toMatchObject({ type: "workspace_path_not_found" });
 
-      const getError = expectError(await getWorkspaceFile("linked-dir/secret.txt"));
-      expect(getError.details).toMatchObject({ type: "workspace_file_not_found" });
+      await expectFileError("linked-dir/secret.txt", { type: "workspace_file_not_found" });
     } finally {
       fs.rmSync(outsideDir, { recursive: true, force: true });
     }
@@ -212,8 +186,7 @@ describe("agents.workspace RPC handlers", () => {
     fs.linkSync(outsidePath, path.join(workspaceRoot, "shared.txt"));
 
     try {
-      const error = expectError(await getWorkspaceFile("shared.txt"));
-      expect(error.details).toMatchObject({ type: "workspace_file_not_found" });
+      await expectFileError("shared.txt", { type: "workspace_file_not_found" });
     } finally {
       fs.rmSync(outsidePath, { force: true });
     }
@@ -244,8 +217,7 @@ describe("agents.workspace RPC handlers", () => {
       Buffer.concat([Buffer.from("SQLite format 3\0"), Buffer.alloc(64, 7)]),
     );
 
-    const error = expectError(await getWorkspaceFile("disguised.png"));
-    expect(error.details).toMatchObject({
+    await expectFileError("disguised.png", {
       path: "disguised.png",
       type: "workspace_file_unsupported",
     });
@@ -254,8 +226,7 @@ describe("agents.workspace RPC handlers", () => {
   it("reports oversized text files with the preview cap", async () => {
     writeWorkspaceFile(workspaceRoot, "large.log", "x".repeat(260 * 1024));
 
-    const error = expectError(await getWorkspaceFile("large.log"));
-    expect(error.details).toMatchObject({
+    await expectFileError("large.log", {
       maxBytes: 256 * 1024,
       path: "large.log",
       size: 260 * 1024,
@@ -266,8 +237,7 @@ describe("agents.workspace RPC handlers", () => {
   it("reports oversized images with the image preview cap", async () => {
     writeWorkspaceFile(workspaceRoot, "large.png", Buffer.alloc(5 * 1024 * 1024 + 1));
 
-    const error = expectError(await getWorkspaceFile("large.png"));
-    expect(error.details).toMatchObject({
+    await expectFileError("large.png", {
       maxBytes: 5 * 1024 * 1024,
       path: "large.png",
       size: 5 * 1024 * 1024 + 1,

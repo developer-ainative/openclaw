@@ -18,6 +18,7 @@ import {
   deletionJournal,
   expectRespondErrorContaining,
   expectRespondOk,
+  expectUncalled,
 } from "./agents-mutate.test-support.js";
 
 type AgentDeleteRecoveryHarness = {
@@ -89,9 +90,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
       expect(handle.abort).not.toHaveBeenCalled();
       expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeDefined();
       expect(EMBEDDED_RUN_WAITERS.has(sessionId)).toBe(false);
-      expect(mocks.beginAgentDeletionRetire).not.toHaveBeenCalled();
-      expect(mocks.writeConfigFile).not.toHaveBeenCalled();
-      expect(mocks.movePathToTrash).not.toHaveBeenCalled();
+      expectUncalled(mocks.beginAgentDeletionRetire, mocks.writeConfigFile, mocks.movePathToTrash);
     } finally {
       prepareStop.mockRestore();
       clearActiveEmbeddedRun(sessionId, handle, sessionKey);
@@ -127,13 +126,10 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
       );
       preparation.resolve({ stop, startBeforeDrain: false });
       await vi.runAllTimersAsync();
-      expect(handle.abort).not.toHaveBeenCalled();
-      expect(stop).not.toHaveBeenCalled();
+      expectUncalled(handle.abort, stop);
       expect(resolveEmbeddedAgentRunProgressState(sessionId)).toBeDefined();
       expect(EMBEDDED_RUN_WAITERS.has(sessionId)).toBe(false);
-      expect(mocks.beginAgentDeletionRetire).not.toHaveBeenCalled();
-      expect(mocks.writeConfigFile).not.toHaveBeenCalled();
-      expect(mocks.movePathToTrash).not.toHaveBeenCalled();
+      expectUncalled(mocks.beginAgentDeletionRetire, mocks.writeConfigFile, mocks.movePathToTrash);
     } finally {
       preparation.resolve({ stop, startBeforeDrain: false });
       await vi.runAllTimersAsync();
@@ -355,8 +351,7 @@ export function registerAgentDeleteDrainRecoveryTests(harness: AgentDeleteRecove
       "/journal/agent/openclaw-agent.sqlite",
       "test-agent",
     );
-    expect(mocks.movePathToTrash).not.toHaveBeenCalled();
-    expect(mocks.deleteWorkspaceState).not.toHaveBeenCalled();
+    expectUncalled(mocks.movePathToTrash, mocks.deleteWorkspaceState);
     expect(mocks.beginAgentDeletionFinish).toHaveBeenCalledOnce();
   });
 }
@@ -437,8 +432,7 @@ export function registerAgentDeleteRollbackTests(harness: AgentDeleteRecoveryHar
     const { promise } = makeCall("agents.delete", { agentId: "test-agent" });
 
     await expect(promise).rejects.toThrow("approval rollback failed");
-    expect(mocks.beginAgentDeletionRollback).not.toHaveBeenCalled();
-    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
+    expectUncalled(mocks.beginAgentDeletionRollback, mocks.writeConfigFile);
   });
 
   it("keeps deletion fenced when config persistence succeeds before reporting failure", async () => {
