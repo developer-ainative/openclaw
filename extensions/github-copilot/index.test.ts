@@ -273,18 +273,59 @@ describe("github-copilot plugin", () => {
         env: { COPILOT_GITHUB_TOKEN: "github-source-token" },
       }),
     ).rejects.toMatchObject({ name: "UnresolvedSecretInputError" });
+    const streamFn = vi.fn();
+    const model = { id: "claude-sonnet-5", provider: "github-copilot", api: "openai-responses" };
+    for (const wrap of [provider.wrapStreamFn, provider.wrapSimpleCompletionStreamFn]) {
+      const wrapped = wrap?.({ config, streamFn } as never);
+      expect(() => wrapped?.(model as never, { messages: [] }, {})).toThrow(
+        expect.objectContaining({ name: "UnresolvedSecretInputError" }),
+      );
+    }
+    expect(streamFn).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns only credentials from runtime auth and sends identity through stream wrappers", async () => {
+    const provider = registerProviderWithPluginConfig({});
+    mocks.resolveCopilotRuntimeAuth.mockResolvedValue({
+      apiKey: "github-source-token",
+      baseUrl: "https://api.individual.githubcopilot.com",
+    });
+
+    // Runtime auth output is sealed and registered as a secret, so identity
+    // values returned there would be masked wherever redaction runs.
     await expect(
       provider.prepareRuntimeAuth({
-        config,
+        config: {},
         env: {},
         provider: "github-copilot",
-        modelId: "claude-sonnet-5",
-        model: { id: "claude-sonnet-5", provider: "github-copilot" },
+        modelId: "gpt-5.4-mini",
+        model: { id: "gpt-5.4-mini", provider: "github-copilot" },
         apiKey: "github-source-token",
         authMode: "token",
       } as never),
-    ).rejects.toMatchObject({ name: "UnresolvedSecretInputError" });
-    expect(fetchMock).not.toHaveBeenCalled();
+    ).resolves.toEqual({
+      apiKey: "github-source-token",
+      baseUrl: "https://api.individual.githubcopilot.com",
+    });
+
+    const streamFn = vi.fn();
+    const wrapped = provider.wrapSimpleCompletionStreamFn?.({ config: {}, streamFn } as never);
+    void wrapped?.(
+      {
+        id: "gpt-5.4-mini",
+        provider: "github-copilot",
+        api: "openai-completions",
+        headers: { "X-Custom": "kept" },
+      } as never,
+      { messages: [] },
+      {},
+    );
+    expect(streamFn.mock.calls[0]?.[2]?.headers).toMatchObject({
+      "Openai-Organization": "github-copilot",
+      "Copilot-Integration-Id": "copilot-developer-cli",
+      "X-Custom": "kept",
+    });
   });
 
   it("isolates live catalog results by the configured integration header", async () => {
